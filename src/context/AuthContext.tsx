@@ -1,6 +1,7 @@
 import React, { createContext, useState, useContext, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { jwtDecode } from "jwt-decode";
+import { API_BASE_URL } from "../constants/api";
 
 type AuthContextType = {
   token: string | null;
@@ -29,7 +30,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   async function checkAuthentication() {
     try {
-      const response = await fetch(`https://api.klaay.dev/me`, {
+      const response = await fetch(`${API_BASE_URL}/me`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -100,7 +101,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
               },
             },
           };
-      const response = await fetch(`https://api.klaay.dev/authenticate`, {
+      const response = await fetch(`${API_BASE_URL}/authenticate`, {
         method: "POST",
         headers: {
           "Content-Type": "application/vnd.api+json",

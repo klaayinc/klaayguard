@@ -3,6 +3,8 @@ import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuth } from "../../context/AuthContext";
 import { MdLogout } from "react-icons/md";
+import { API_BASE_URL } from "../../constants/api";
+
 export const Home = () => {
   const navigate = useNavigate();
   const { token, logout } = useAuth();
@@ -79,7 +81,7 @@ export const Home = () => {
 
   async function fetchConfiguration() {
     try {
-      const response = await fetch(`https://api.klaay.dev/klaayguard/config`, {
+      const response = await fetch(`${API_BASE_URL}/klaayguard/config`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -119,7 +121,7 @@ export const Home = () => {
       );
 
       console.log("Formatted data to post:", formattedData);
-      const response = await fetch(`https://api.klaay.dev/klaayguard/data`, {
+      const response = await fetch(`${API_BASE_URL}/klaayguard/data`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,
