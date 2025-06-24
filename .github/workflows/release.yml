@@ -71,8 +71,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VITE_API_BASE_URL: ${{ matrix.buildType == 'dev' && 'http://localhost:3000' || '' }}
         with:
-          tagName: app-v__VERSION__ # the action automatically replaces __VERSION__ with the app version.
-          releaseName: "App v__VERSION__"
+          tagName: ${{ matrix.buildType }}-app-v__VERSION__ # Prefix tag with build type
+          releaseName: "${{ matrix.buildType }} App v__VERSION__" # Prefix release name with build type
           releaseBody: "See the assets to download this version and install."
           releaseDraft: true
           prerelease: false
