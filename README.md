@@ -17,7 +17,17 @@ A lightweight desktop application built with Tauri and [your tech stack, e.g., R
 - [Tauri CLI](https://tauri.app/v1/guides/getting-started/prerequisites)
 - [Tauri Prerequisites](https://v1.tauri.app/v1/guides/getting-started/prerequisites/)
 
-## Building Klaayguard for Kiln/Earthenware development
+## Downloading a precompiled dev build (Mac)
+
+1. navigate to https://github.com/klaayinc/klaayguard/releases
+
+2. look for the most recent "dev" release
+
+3. download the appropriate package, this will probably be klaay_XXX_aarch64.dmg for apple silicon macs
+
+4. install the package
+
+## Compile dev build (Linux)
 1. clone the repo:
    ```bash
    git clone https://github.com/klaayinc/klaayguard.git
