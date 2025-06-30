@@ -4,6 +4,11 @@ use runas::Command as SudoCommand;
 use reqwest::blocking::get;
 use std::fs::File;
 use std::io::copy;
+use std::io::Error;
+
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
+
 
 // Progress callback type
 pub type ProgressCallback = dyn Fn(&str, &str);
@@ -77,12 +82,24 @@ fn configure_osquery_repo(package_manager: &LinuxPackageManager) -> Result<()> {
                 })
                 .and_then(|s| {
                     if s.success() {
-                    Command::new("sudo")
-                            .args(&[
-                                "add-apt-repository",
-                                "deb [arch=amd64 signed-by=/etc/apt/keyrings/osquery.asc] https://pkg.osquery.io/deb deb main",
-                            ])
-                        .status()
+                        let content = "deb [arch=amd64 signed-by=/etc/apt/keyrings/osquery.asc] https://pkg.osquery.io/deb deb main";
+
+                        let mut tee = Command::new("sudo")
+                            .arg("tee")
+                            .arg("/etc/apt/sources.list.d/osquery.list")
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::null())
+                            .spawn()?;
+
+                        if let Some(mut stdin) = tee.stdin.take() {
+                            use std::io::Write;
+
+                            stdin.write_all(content.as_bytes())?
+                        }
+
+                        let status = tee.wait()?;
+
+                        Ok(status)
                     } else {
                         Ok(s)
                     }
@@ -379,8 +396,19 @@ pub fn install_osquery_with_progress(progress: Option<&ProgressCallback>) -> Res
         if let Some(cb) = progress { cb("installing", &format!("Attempt {} of {} to install osquery", attempts, max_attempts)); }
         let osquery_install_status = match package_manager {
             LinuxPackageManager::Apt => Command::new("sudo")
-                .args(&["apt", "install", "-y", "osquery"])
-                .status(),
+                .args(&["apt", "update"])
+                .status()
+                .and_then(|s| {
+                    if s.success() {
+                        let status = Command::new("sudo")
+                        .args(&["apt", "install", "-y", "osquery"])
+                        .status()?;
+
+                        Ok(status)
+                    } else {
+                        Ok(s)
+                    }
+                }),
             LinuxPackageManager::Dnf => Command::new("sudo")
                 .args(&["yum", "install", "-y", "osquery"])
                 .status(),
