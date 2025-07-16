@@ -3,6 +3,7 @@ use osquery::install;
 use serde_json::Value;
 use std::collections::HashMap;
 use tauri::Manager;
+use tauri_plugin_updater::UpdaterExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -57,13 +58,10 @@ async fn execute_query(table_names: Vec<String>) -> Result<HashMap<String, Value
     for table_name in table_names {
         // Configure the command
         let mut cmd = Command::new("osqueryi");
-        
-        cmd.args(&[
-            "--json",
-            &format!("SELECT * FROM {}", table_name),
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+
+        cmd.args(&["--json", &format!("SELECT * FROM {}", table_name)])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         // Windows-specific: Hide console window
         #[cfg(windows)]
@@ -87,13 +85,14 @@ async fn execute_query(table_names: Vec<String>) -> Result<HashMap<String, Value
         let stdout_str = String::from_utf8(output.stdout)
             .map_err(|e| format!("Invalid UTF-8 output for table {}: {}", table_name, e))?;
 
-        let parsed_result: Value = serde_json::from_str(&stdout_str)
-            .map_err(|e| format!(
-                "Failed to parse JSON for table {} (content: '{}'): {}", 
-                table_name, 
-                stdout_str.trim(), 
+        let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
+            format!(
+                "Failed to parse JSON for table {} (content: '{}'): {}",
+                table_name,
+                stdout_str.trim(),
                 e
-            ))?;
+            )
+        })?;
 
         all_results.insert(table_name, parsed_result);
     }
@@ -110,6 +109,30 @@ async fn check_osquery() -> Result<bool, String> {
 async fn install_osquery() -> Result<(), String> {
     install::install_osquery().map_err(|e| e.to_string())
 }
+
+async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
+    if let Some(update) = app.updater()?.check().await? {
+      let mut downloaded = 0;
+  
+      // alternatively we could also call update.download() and update.install() separately
+      update
+        .download_and_install(
+          |chunk_length, content_length| {
+            downloaded += chunk_length;
+            println!("downloaded {downloaded} from {content_length:?}");
+          },
+          || {
+            println!("download finished");
+          },
+        )
+        .await?;
+  
+      println!("update installed");
+      app.restart();
+    }
+  
+    Ok(())
+  }
 
 fn install_osquery_with_progress<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Result<(), String> {
     // For now, just call the regular install function
@@ -168,7 +191,14 @@ async fn record_installation_error(_error_message: String) -> Result<(), String>
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                update(handle).await.unwrap_or_else(|e| {
+                    eprintln!("Failed to check for updates: {}", e);
+                });
+            });
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
             window.on_window_event(move |event| {

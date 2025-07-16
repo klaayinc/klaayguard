@@ -213,7 +213,7 @@ pub fn is_osquery_installed() -> bool {
 
 #[cfg(target_os = "windows")]
 pub fn install_osquery_with_progress(progress: Option<&ProgressCallback>) -> Result<()> {
-    use std::os::windows::process::CommandExt;
+    use std::{os::windows::process::CommandExt, process::Command};
     use log::{info, warn, error};
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     if let Some(cb) = progress { cb("checking", "Preparing osquery installation on Windows"); }
@@ -280,6 +280,8 @@ iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/in
     let max_attempts = 3;
     let mut last_error = None;
     while attempts < max_attempts {
+        use std::process::Command;
+
         attempts += 1;
         info!("Attempt {} of {} to install osquery", attempts, max_attempts);
         if let Some(cb) = progress { cb("installing", &format!("Attempt {} of {} to install osquery", attempts, max_attempts)); }
