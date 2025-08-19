@@ -53,7 +53,7 @@ jobs:
         run: yarn install # change this to npm, pnpm or bun depending on which one you use.
 
       - name: Import Apple Developer Certificate
-        if: ${{ matrix.platform == "macos-latest" }}
+        if: ${{ matrix.platform == 'macos-latest' }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -69,7 +69,7 @@ jobs:
           security find-identity -v -p codesigning build.keychain
 
       - name: Verify Certificate
-        if: ${{ matrix.platform == "macos-latest" }}
+        if: ${{ matrix.platform == 'macos-latest' }}
         run: |
           CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Apple Development")
           CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
