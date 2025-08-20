@@ -32,9 +32,6 @@ jobs:
             runner: windows-latest
             args: ""
 
-    # Only run prod builds on main; dev builds run on any triggering branch
-    if: ${{ github.ref == 'refs/heads/main' || matrix.build == 'dev' }}
-
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
