@@ -2,7 +2,7 @@ import React, { createContext, useState, useContext, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { jwtDecode } from "jwt-decode";
 import { invoke } from "@tauri-apps/api/core";
-import { API_BASE_URL } from "../constants/api";
+import { useApiEnv } from "./ApiEnvContext";
 
 type AuthContextType = {
   token: string | null;
@@ -23,6 +23,7 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => {
+  const { baseUrl } = useApiEnv();
   const navigate = useNavigate();
   const [token, setToken] = useState<string | null>(null);
   const [error, setError] = useState<string>("");
@@ -48,7 +49,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   async function checkAuthentication() {
     try {
-      const response = await fetch(`${API_BASE_URL}/me`, {
+  const response = await fetch(`${baseUrl}/me`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -119,7 +120,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
               },
             },
           };
-      const response = await fetch(`${API_BASE_URL}/authenticate`, {
+  const response = await fetch(`${baseUrl}/authenticate`, {
         method: "POST",
         headers: {
           "Content-Type": "application/vnd.api+json",

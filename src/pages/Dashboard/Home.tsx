@@ -3,11 +3,12 @@ import { useNavigate } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuth } from "../../context/AuthContext";
 import { MdLogout } from "react-icons/md";
-import { API_BASE_URL } from "../../constants/api";
+import { useApiEnv } from "../../context/ApiEnvContext";
 
 export const Home = () => {
   const navigate = useNavigate();
   const { token, logout } = useAuth();
+  const { baseUrl } = useApiEnv();
   const [osqueryInstalled, setOsqueryInstalled] = useState<boolean | null>(
     null
   );
@@ -76,7 +77,7 @@ export const Home = () => {
 
   async function fetchConfiguration() {
     try {
-      const response = await fetch(`${API_BASE_URL}/klaayguard/config`, {
+  const response = await fetch(`${baseUrl}/klaayguard/config`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -120,7 +121,7 @@ export const Home = () => {
       );
 
       console.log("Formatted data to post:", formattedData);
-      const response = await fetch(`${API_BASE_URL}/klaayguard/data`, {
+  const response = await fetch(`${baseUrl}/klaayguard/data`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${token}`,

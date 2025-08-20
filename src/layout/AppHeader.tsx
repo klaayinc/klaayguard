@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import ApiEnvToggle from "../components/common/ApiEnvToggle";
 
 // import { Link } from "react-router";
 
@@ -27,6 +28,9 @@ const AppHeader: React.FC = () => {
           className={`flex items-center justify-between w-full gap-4 px-5  lg:flex shadow-theme-md sm:justify-start lg:px-0 lg:shadow-none`}
         >
           <p className="text-left">Datalyst</p>
+          <div className="ml-auto">
+            <ApiEnvToggle />
+          </div>
         </div>
       </div>
     </header>

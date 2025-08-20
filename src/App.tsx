@@ -5,10 +5,12 @@ import { AuthProvider } from "./context/AuthContext";
 import { ToastContainer } from "react-toastify";
 import AccountSetup from "./pages/AuthPages/AccountSetup";
 import Setup from "./pages/Setup/Setup";
+import DevModeBanner from "./components/common/DevModeBanner";
 
 export default function App() {
   return (
     <BrowserRouter>
+  <DevModeBanner />
       <ToastContainer />
       <AuthProvider>
         <Routes>

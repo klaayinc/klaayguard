@@ -1,6 +1,7 @@
 import React from "react";
 import GridShape from "../../components/common/GridShape";
 import ThemeTogglerTwo from "../../components/common/ThemeTogglerTwo";
+import ApiEnvToggle from "../../components/common/ApiEnvToggle";
 
 export default function AuthLayout({
   children,
@@ -22,7 +23,8 @@ export default function AuthLayout({
             </div>
           </div>
         </div>
-        <div className="fixed z-50 hidden bottom-6 right-6 sm:block">
+        <div className="fixed z-50 hidden bottom-6 right-6 sm:flex sm:flex-col sm:items-end sm:gap-2">
+          <ApiEnvToggle />
           <ThemeTogglerTwo />
         </div>
       </div>

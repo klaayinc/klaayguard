@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from "react";
 import { useAuth } from "../../context/AuthContext";
 import { notify } from "../../utils/utils";
-import { Location, useLocation, useNavigate } from "react-router-dom";
-import { API_BASE_URL } from "../../constants/api";
+import { Location, useLocation } from "react-router-dom";
+import { useApiEnv } from "../../context/ApiEnvContext";
 
 interface Account {
   id: string;
@@ -19,6 +19,7 @@ interface AccountSelectorProps {
 export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
   selectedAccountId,
 }) => {
+  const { baseUrl } = useApiEnv();
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<string | undefined>(
@@ -28,7 +29,7 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
 
   const { token, authenticateUser } = useAuth();
   const location = useLocation();
-  const navigate = useNavigate();
+  // const navigate = useNavigate();
 
   const { username, password } = originLocation?.state || {};
 
@@ -51,7 +52,7 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
     const fetchAccounts = async () => {
       setLoading(true);
       try {
-        const res = await fetch(`${API_BASE_URL}/accounts`, {
+  const res = await fetch(`${baseUrl}/accounts`, {
           method: "GET",
           headers: {
             Authorization: `Bearer ${token}`,
