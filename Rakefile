@@ -44,7 +44,7 @@ OSQUERYI_PATH = File.join(DIR_SIDECAR, "osqueryi")
 
 file OSQUERYI_PATH => [OSQUERYD_PATH] do
     sh "cp #{OSQUERYD_PATH} #{OSQUERYI_PATH}-aarch64-apple-darwin"
-    sh "cp #{OSQUERYD_PATH} #{OSQUERYI_PATH}-amd64-apple-darwin"
+    sh "cp #{OSQUERYD_PATH} #{OSQUERYI_PATH}-x86_64-apple-darwin"
 end
 
 task :clean do
