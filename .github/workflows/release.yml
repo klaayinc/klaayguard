@@ -33,6 +33,7 @@ jobs:
           #   args: ""
 
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
