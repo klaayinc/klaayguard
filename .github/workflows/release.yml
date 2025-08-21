@@ -16,17 +16,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        build: [dev, prod]
+        platform: [macos-arm, macos-x64]
         include:
-          - platform: "macos-latest" # for Arm based macs (M1 and above).
+          - platform: macos-arm # for Arm based macs (M1 and above).
+            runner: macos-latest
             args: "--target aarch64-apple-darwin --bundles app"
-          - platform: "macos-latest" # for Intel based macs.
+          - platform: macos-x64 # for Intel based macs.
+            runner: macos-latest
             args: "--target x86_64-apple-darwin"
-          - platform: "ubuntu-22.04" # for Tauri v1 you could replace this with ubuntu-20.04.
+          - platform: ubuntu # for Tauri v1 you could replace this with ubuntu-20.04.
+            runner: ubuntu-22.04
             args: ""
-          - platform: "windows-latest"
+          - platform: windows
+            runner: windows-latest
             args: ""
 
-    runs-on: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,10 +45,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.runner == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
-      - name: install dependencies (ubuntu only)
-        if: matrix.platform == 'ubuntu-22.04' # This must match the platform value defined above.
+      - name: (Ubuntu) install dependencies
+        if: ${{ matrix.runner == 'ubuntu-22.04' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.0-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
@@ -52,8 +58,8 @@ jobs:
       - name: install frontend dependencies
         run: yarn install # change this to npm, pnpm or bun depending on which one you use.
 
-      - name: Import Apple Developer Certificate
-        if: ${{ matrix.platform == 'macos-latest' }}
+      - name: (Mac) Import Apple Developer Certificate
+        if: ${{ matrix.runner == 'macos-latest' }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -68,8 +74,8 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
           security find-identity -v -p codesigning build.keychain
 
-      - name: Verify Certificate
-        if: ${{ matrix.platform == 'macos-latest' }}
+      - name: (Mac) Verify Certificate
+        if: ${{ matrix.runner == 'macos-latest' }}
         run: |
           CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
           CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
@@ -79,15 +85,15 @@ jobs:
 
       - uses: tauri-apps/tauri-action@v0
         env:
+          VITE_API_BASE_URL: ${{ matrix.build == 'prod' && 'https://api.klaay.com' || 'https://api.klaay.dev' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # APPLE_CERTIFICATE: ${{ secrets.APPLE_SIGNING_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_SIGNING_CERTIFICATE_PASSWORD }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
         with:
-          tagName: app-v__VERSION__ # the action automatically replaces \_\_VERSION\_\_ with the app version.
-          releaseName: "App v__VERSION__"
+          tagName: ${{ matrix.build == 'prod' && 'app-v__VERSION__' || 'app-v__VERSION__-dev' }} # the action automatically replaces __VERSION__ with the app version.
+          releaseName: ${{ matrix.build == 'prod' && 'App v__VERSION__' || 'App v__VERSION__ (dev)' }}
           releaseBody: "See the assets to download this version and install."
           releaseDraft: true
           prerelease: false

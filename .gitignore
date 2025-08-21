@@ -25,3 +25,7 @@ dist-ssr
 *.sw?
 
 .env
+tmp
+src-tauri/vendor/*
+!src-tauri/vendor/.keep
+!/src-tauri/vendor/licenses
