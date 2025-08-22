@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build: [dev, prod]
+        build: [development, staging, production]
         platform: [macos-arm, macos-x64]
         include:
           - platform: macos-arm # for Arm based macs (M1 and above).
@@ -25,6 +25,14 @@ jobs:
           - platform: macos-x64 # for Intel based macs.
             runner: macos-latest
             args: "--target x86_64-apple-darwin"
+
+          - build: development
+            api_url: "http://localhost:3000"
+          - build: staging
+            api_url: "https://api.klaay.dev"
+          - build: production
+            api_url: "https://api.klaay.com"
+
           # - platform: ubuntu # for Tauri v1 you could replace this with ubuntu-20.04.
           #   runner: ubuntu-22.04
           #   args: ""
@@ -86,7 +94,7 @@ jobs:
 
       - uses: tauri-apps/tauri-action@v0
         env:
-          VITE_API_BASE_URL: ${{ matrix.build == 'prod' && 'https://api.klaay.com' || 'https://api.klaay.dev' }}
+          VITE_API_BASE_URL: ${{ matrix.api_url }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -96,8 +104,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
         with:
-          tagName: ${{ matrix.build == 'prod' && 'app-v__VERSION__' || 'app-v__VERSION__-dev' }} # the action automatically replaces __VERSION__ with the app version.
-          releaseName: ${{ matrix.build == 'prod' && 'App v__VERSION__' || 'App v__VERSION__ (dev)' }}
+          tagName: app-v__VERSION__-${{ matrix.build }}
+          releaseName: 'App v__VERSION__ (${{ matrix.build }})' 
           releaseBody: "See the assets to download this version and install."
           releaseDraft: true
           prerelease: false
