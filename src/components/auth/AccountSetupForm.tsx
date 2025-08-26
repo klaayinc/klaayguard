@@ -32,15 +32,6 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
 
   const { username, password } = originLocation?.state || {};
 
-  const [inputValue, setInputValue] = useState("");
-  const [showDropdown, setShowDropdown] = useState(false);
-
-  const filteredAccounts = inputValue
-    ? accounts.filter((account) =>
-        account.attributes.name.toLowerCase().includes(inputValue.toLowerCase())
-      )
-    : accounts;
-
   useEffect(() => {
     if (location.state) {
       setOriginLocation(location);
@@ -59,8 +50,9 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
         });
         if (!res.ok) throw new Error("Failed to fetch accounts");
         const data = await res.json();
-        setAccounts(data.data); // <-- Fix: use data.data
+        setAccounts(data.data);
       } catch (err) {
+        console.error("Error fetching accounts:", err);
         setAccounts([]);
       } finally {
         setLoading(false);
@@ -68,6 +60,10 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
     };
     fetchAccounts();
   }, [token]);
+
+  const handleAccountSelect = (accountId: string) => {
+    setSelected(accountId);
+  };
 
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -87,6 +83,10 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
     }
   };
 
+  const getInitials = (name: string) => {
+    return name.charAt(0).toUpperCase();
+  };
+
   return (
     <div className="flex flex-col flex-1 items-center px-8">
       <div className="flex flex-col justify-center flex-1 w-full max-w-md mx-auto">
@@ -94,52 +94,53 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
           <h2 className="text-2xl font-bold mb-6 text-center">
             Select Account
           </h2>
-          <div className="mb-6">
-            <label className="block mb-2 font-medium">Account</label>
-            {loading ? (
-              <p>Loading accounts...</p>
-            ) : (
-              <div className="relative">
-                <input
-                  type="text"
-                  className="border px-3 py-2 rounded w-full"
-                  placeholder="Type to search accounts..."
-                  value={
-                    selected
-                      ? accounts.find((a) => a.id === selected)?.attributes
-                          .name || inputValue
-                      : inputValue
-                  }
-                  onChange={(e) => {
-                    setInputValue(e.target.value);
-                    setSelected(undefined);
-                    setShowDropdown(true);
-                  }}
-                  onFocus={() => setShowDropdown(true)}
-                  onBlur={() => setTimeout(() => setShowDropdown(false), 100)}
-                />
-                {showDropdown && filteredAccounts.length > 0 && (
-                  <ul className="absolute z-10 left-0 right-0 bg-white border rounded shadow max-h-48 overflow-auto mt-1">
-                    {filteredAccounts.map((account) => (
-                      <li
-                        key={account.id}
-                        className="px-3 py-2 hover:bg-blue-100 cursor-pointer"
-                        onMouseDown={() => {
-                          setSelected(account.id);
-                          setInputValue(account.attributes.name);
-                          setShowDropdown(false);
-                        }}
-                      >
+          <p className="text-sm text-gray-500 dark:text-gray-400 text-center mb-1">
+            Choose which account you'd like to access
+          </p>
+          <p className="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">
+            Welcome,
+          </p>
+
+          {loading ? (
+            <div className="text-center py-8">
+              <p className="text-gray-500 dark:text-gray-400">
+                Loading accounts...
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4 mb-6">
+              {accounts.map((account) => (
+                <div
+                  key={account.id}
+                  className={`p-4 border rounded-lg cursor-pointer transition-all duration-200 ${
+                    selected === account.id
+                      ? "border-blue-500 bg-blue-50 dark:bg-blue-900/20"
+                      : "border-gray-200 hover:border-gray-300 dark:border-gray-600 dark:hover:border-gray-500"
+                  }`}
+                  onClick={() => handleAccountSelect(account.id)}
+                >
+                  <div className="flex items-center space-x-3">
+                    <div className="w-10 h-10 bg-blue-500 rounded-full flex items-center justify-center">
+                      <span className="text-white font-semibold text-lg">
+                        {getInitials(account.attributes.name)}
+                      </span>
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="font-medium text-gray-900 dark:text-white">
                         {account.attributes.name}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
-          </div>
+                      </h3>
+                      <p className="text-sm text-gray-500 dark:text-gray-400">
+                        Account ID: {account.id}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
           <button
-            className="w-full bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700 transition disabled:opacity-50"
+            className="w-full bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed dark:bg-blue-600 dark:hover:bg-blue-700"
             disabled={!selected}
             type="submit"
           >

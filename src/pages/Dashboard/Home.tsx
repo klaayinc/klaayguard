@@ -5,6 +5,7 @@ import { useAuth } from "../../context/AuthContext";
 import { MdLogout } from "react-icons/md";
 import { API_BASE_URL } from "../../constants/api";
 import Button from "../../components/ui/button/Button";
+import { Spinner } from "../../components/ui/spinner/Spinner";
 
 export const Home = () => {
   const navigate = useNavigate();
@@ -33,6 +34,7 @@ export const Home = () => {
   const [queryResult, setQueryResult] = useState<DeepRecord | null>(null);
   const [error, setError] = useState("");
   const [selectedConfig, setSelectedConfig] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
 
   useEffect(() => {
     const getDeviceId = async () => {
@@ -144,6 +146,8 @@ export const Home = () => {
 
   async function execute_query(tableNames: string[]) {
     try {
+      setIsLoading(true);
+      setQueryResult(null); // Clear previous results immediately
       const response = await invoke<DeepRecord | null>("execute_query", {
         tableNames,
       });
@@ -154,6 +158,9 @@ export const Home = () => {
       setQueryResult(response);
     } catch (error) {
       console.error("Error executing query:", error);
+      setError("Error executing query");
+    } finally {
+      setIsLoading(false);
     }
   }
 
@@ -276,9 +283,28 @@ export const Home = () => {
       {error && <p className="text-red-500 mb-4">{error}</p>}
       <>
         <div className="overflow-x-auto bg-white shadow-md rounded-lg p-4 mb-6">
-          <h2 className="text-xl font-semibold text-gray-700 mb-2">
-            Configuration (Click to view data)
-          </h2>
+          <div className="flex justify-between items-center mb-2">
+            <h2 className="text-xl font-semibold text-gray-700">
+              Configuration (Click to view data)
+            </h2>
+            {selectedConfig && (
+              <Button
+                onClick={() => {
+                  setSelectedConfig(null);
+                  setQueryResult(null);
+                  // Execute query for all tables
+                  if (config) {
+                    const tableNames = config.data.map((item) => item.id);
+                    execute_query(tableNames);
+                  }
+                }}
+                variant="outline"
+                size="sm"
+              >
+                Show All
+              </Button>
+            )}
+          </div>
           <table className="table-auto w-full bg-white shadow-md rounded-lg mb-6">
             <thead className="sticky top-0 z-10 bg-gray-200">
               <tr className="text-gray-700">
@@ -307,7 +333,7 @@ export const Home = () => {
             <h2 className="text-xl font-semibold text-gray-700 mb-2">
               Query Result for: {selectedConfig}
             </h2>
-            {renderQueryResult()}
+            {isLoading ? <Spinner /> : queryResult ? renderQueryResult() : null}
           </div>
         )}
       </>
