@@ -268,7 +268,7 @@ export const Home = () => {
         </Button>
       </div>
       <h1 className="text-2xl font-bold text-center text-gray-800 mb-4">
-        Welcome to the Klaay Guard
+        Welcome to the KlaayGuard
       </h1>
       {deviceUUID && (
         <div className="bg-gray-50 border border-gray-200 rounded px-4 py-2 mb-4 mx-auto max-w-lg">
