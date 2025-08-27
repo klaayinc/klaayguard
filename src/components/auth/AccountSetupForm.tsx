@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useAuth } from "../../context/AuthContext";
 import { notify } from "../../utils/utils";
-import { Location, useLocation, useNavigate } from "react-router-dom";
+import { Location, useLocation } from "react-router-dom";
 import { API_BASE_URL } from "../../constants/api";
 
 interface Account {
@@ -28,7 +28,6 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
 
   const { token, authenticateUser } = useAuth();
   const location = useLocation();
-  const navigate = useNavigate();
 
   const { username, password } = originLocation?.state || {};
 
@@ -49,8 +48,8 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
           },
         });
         if (!res.ok) throw new Error("Failed to fetch accounts");
-        const data = await res.json();
-        setAccounts(data.data);
+        const { data } = await res.json();
+        setAccounts(data);
       } catch (err) {
         console.error("Error fetching accounts:", err);
         setAccounts([]);
@@ -83,9 +82,16 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
     }
   };
 
-  const getInitials = (name: string) => {
-    return name.charAt(0).toUpperCase();
-  };
+  const getInitials = (name: string) => name.charAt(0).toUpperCase();
+
+  const GrayText: React.FC<{
+    children: React.ReactNode;
+    className?: string;
+  }> = ({ children, className = "" }) => (
+    <p className={`text-sm text-gray-500 dark:text-gray-400 ${className}`}>
+      {children}
+    </p>
+  );
 
   return (
     <div className="flex flex-col flex-1 items-center px-8">
@@ -94,19 +100,13 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
           <h2 className="text-2xl font-bold mb-6 text-center">
             Select Account
           </h2>
-          <p className="text-sm text-gray-500 dark:text-gray-400 text-center mb-1">
+          <GrayText className="text-center mb-1">
             Choose which account you'd like to access
-          </p>
-          <p className="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">
-            Welcome,
-          </p>
+          </GrayText>
+          <GrayText className="text-center mb-6">Welcome,</GrayText>
 
           {loading ? (
-            <div className="text-center py-8">
-              <p className="text-gray-500 dark:text-gray-400">
-                Loading accounts...
-              </p>
-            </div>
+            <GrayText>Loading accounts...</GrayText>
           ) : (
             <div className="space-y-4 mb-6">
               {accounts.map((account) => (
@@ -129,9 +129,7 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
                       <h3 className="font-medium text-gray-900 dark:text-white">
                         {account.attributes.name}
                       </h3>
-                      <p className="text-sm text-gray-500 dark:text-gray-400">
-                        Account ID: {account.id}
-                      </p>
+                      <GrayText>Account ID: {account.id}</GrayText>
                     </div>
                   </div>
                 </div>

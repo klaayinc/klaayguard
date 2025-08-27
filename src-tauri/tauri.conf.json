@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "klaay",
+  "productName": "KlaayGuard",
   "version": "0.1.0",
   "identifier": "com.klaay.app",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "klaay",
+        "title": "KlaayGuard",
         "width": 800,
         "height": 600
       }

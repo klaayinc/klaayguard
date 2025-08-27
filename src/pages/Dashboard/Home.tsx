@@ -116,7 +116,6 @@ export const Home = () => {
         }
       );
 
-      console.log("Formatted data to post:", formattedData);
       const response = await fetch(`${API_BASE_URL}/klaayguard/data`, {
         method: "POST",
         headers: {
@@ -165,26 +164,21 @@ export const Home = () => {
   }
 
   const renderCellValue = (value: DeepRecord) => {
-    switch (true) {
-      case typeof value === "object":
-        return (
-          <pre className="text-xs max-w-[300px] overflow-x-auto">
-            {JSON.stringify(value, null, 2)}
-          </pre>
-        );
-      case typeof value === "string" && value.length > 100:
-        return <>{value.slice(0, 100)}...</>;
-      default:
-        return String(value);
+    if (typeof value === "object" && value !== null) {
+      return (
+        <pre className="text-xs max-w-[300px] overflow-x-auto">
+          {JSON.stringify(value, null, 2)}
+        </pre>
+      );
     }
+    if (typeof value === "string") {
+      return value.length > 100 ? `${value.slice(0, 100)}...` : value;
+    }
+    return String(value);
   };
 
-  const getCellTitle = (value: DeepRecord) => {
-    if (typeof value === "string") {
-      return value;
-    }
-    return undefined;
-  };
+  const getCellTitle = (value: DeepRecord): string | undefined =>
+    typeof value === "string" ? value : undefined;
 
   const renderQueryResult = () => {
     if (!queryResult || typeof queryResult !== "object") {
