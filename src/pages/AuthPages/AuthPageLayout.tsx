@@ -11,16 +11,8 @@ export default function AuthLayout({
     <div className="relative p-6 bg-white z-1 dark:bg-gray-900 sm:p-0">
       <div className="relative flex flex-col justify-center w-full h-screen sm:flex-row dark:bg-gray-900 sm:p-0">
         {children}
-        <div className="items-center w-full h-full sm:w-1/2 bg-brand-950 dark:bg-white/5 sm:grid">
-          <div className="relative flex items-center justify-center z-1">
-            {/* <!-- ===== Common Grid Shape Start ===== --> */}
-            <GridShape />
-            <div className="flex flex-col space-y-10 items-center max-w-xs">
-              <p className="text-center text-4xl text-white dark:text-white">
-                Klaay Guard
-              </p>
-            </div>
-          </div>
+        <div className="w-full h-full sm:w-1/2 bg-brand-950 dark:bg-white/5">
+          <GridShape />
         </div>
         <div className="fixed z-50 hidden bottom-6 right-6 sm:block">
           <ThemeTogglerTwo />

@@ -3,18 +3,11 @@ import { EyeCloseIcon, EyeIcon } from "../../icons";
 import Label from "../form/Label";
 import Input from "../form/input/InputField";
 import Button from "../ui/button/Button";
-// import { useNavigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 import { notify } from "../../utils/utils";
 
 export default function SignInForm() {
-  // const navigate = useNavigate();
-  const {
-    checkAuthentication,
-    // isAccountConfigRequired,
-    authenticateUser,
-    // error,
-  } = useAuth();
+  const { checkAuthentication, authenticateUser } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -50,20 +43,6 @@ export default function SignInForm() {
     try {
       if (!validateInputs()) return;
       await authenticateUser(email, password, "");
-
-      // if (!error) {
-      //   if (isAccountConfigRequired) {
-      //     notify("Account configuration required. Redirecting...", "info");
-      //     navigate("/account-setup", {
-      //       state: { username: email, password },
-      //     });
-      //   } else {
-      //     notify("Sign in successful.", "success");
-      //     navigate("/home");
-      //   }
-      // } else {
-      //   notify(error, "error");
-      // }
     } catch (error) {
       notify(new String(error).toString(), "error");
     } finally {

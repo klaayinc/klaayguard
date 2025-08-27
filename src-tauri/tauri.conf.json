@@ -1,11 +1,11 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "klaay",
+  "productName": "KlaayGuard",
   "version": "0.1.0",
   "identifier": "com.klaay.app",
   "build": {
     "beforeDevCommand": "yarn dev",
-    "devUrl": "http://192.168.141.160:1420",
+    "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "yarn build && rake",
     "frontendDist": "../dist"
   },
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "klaay",
+        "title": "KlaayGuard",
         "width": 800,
         "height": 600
       }
@@ -26,12 +26,8 @@
     "active": true,
     "createUpdaterArtifacts": true,
     "targets": "all",
-    "resources": [
-      "vendor/licenses/*"
-    ],
-    "externalBin": [
-      "vendor/osqueryi"
-    ],
+    "resources": ["vendor/licenses/*"],
+    "externalBin": ["vendor/osqueryi"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
