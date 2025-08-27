@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { useAuth } from "../../context/AuthContext";
 import { notify } from "../../utils/utils";
-import { Location, useLocation } from "react-router-dom";
+import { Location, useLocation, useNavigate } from "react-router-dom";
 import { API_BASE_URL } from "../../constants/api";
 
 interface Account {
@@ -28,6 +28,7 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
 
   const { token, authenticateUser } = useAuth();
   const location = useLocation();
+  const navigate = useNavigate();
 
   const { username, password } = originLocation?.state || {};
 
@@ -76,7 +77,13 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
     }
     try {
       await authenticateUser(username, password, selected);
-      // navigate("/home");
+      const selectedAccount = accounts.find((acc) => acc.id === selected);
+      navigate("/welcome", {
+        state: {
+          accountName: selectedAccount?.attributes.name,
+          accountId: selected,
+        },
+      });
     } catch (error) {
       notify(new String(error).toString(), "error");
     }

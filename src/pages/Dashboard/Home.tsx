@@ -1,15 +1,17 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { useAuth } from "../../context/AuthContext";
-import { MdLogout } from "react-icons/md";
+import { MdLogout, MdArrowBack } from "react-icons/md";
 import { API_BASE_URL } from "../../constants/api";
 import Button from "../../components/ui/button/Button";
 import { Spinner } from "../../components/ui/spinner/Spinner";
 
 export const Home = () => {
   const navigate = useNavigate();
+  const location = useLocation();
   const { token, logout } = useAuth();
+  const { accountName, accountId } = location.state || {};
 
   interface ConfigData {
     type: string;
@@ -245,6 +247,15 @@ export const Home = () => {
     navigate("/signin");
   };
 
+  const handleGoBack = () => {
+    navigate("/welcome", {
+      state: {
+        accountName,
+        accountId,
+      },
+    });
+  };
+
   const handleConfigRowClick = (tableName: string) => {
     setSelectedConfig(tableName);
     // Clear previous query result
@@ -255,8 +266,10 @@ export const Home = () => {
 
   return (
     <div className="home items-center relative p-6 bg-gray-100 min-h-screen">
-      {/* Logout Button */}
-      <div className="flex justify-end mb-4">
+      <div className="flex justify-between mb-4">
+        <Button onClick={handleGoBack} variant="outline" title="Go Back">
+          <MdArrowBack />
+        </Button>
         <Button onClick={handleLogout} variant="outline" title="Logout">
           <MdLogout />
         </Button>
