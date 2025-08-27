@@ -82,7 +82,7 @@ export const WelcomeScreen: React.FC = () => {
         <Button
           variant="outline"
           onClick={handleDataCollection}
-          className="bg-inherit border-none text-white hover:text-black"
+          className="bg-inherit border-none text-black"
         >
           Data collection
         </Button>
