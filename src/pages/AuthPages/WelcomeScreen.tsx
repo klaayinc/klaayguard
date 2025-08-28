@@ -43,20 +43,15 @@ export const WelcomeScreen: React.FC = () => {
   };
 
   return (
-    <div
-      className="min-h-screen flex flex-col items-center justify-center p-8"
-      style={{ backgroundColor: "#0B223D" }}
-    >
+    <div className="min-h-screen flex flex-col items-center justify-center p-8 bg-[#0B223D]">
       {/* Header with Klaay Logo */}
-      <div className="text-center mb-12">
-        <div className="flex items-center justify-center mb-4">
-          <img
-            src="/src/icons/KLAAY-LOGO-RGB_ICON.png"
-            alt="Klaay Logo"
-            className="w-16 h-16 mr-3"
-          />
-          <span className="text-white text-2xl font-bold">Klaay</span>
-        </div>
+      <div className="flex items-center justify-center mb-4 text-center">
+        <img
+          src="/src/icons/KLAAY-LOGO-RGB_ICON.png"
+          alt="Klaay Logo"
+          className="w-16 h-16 mr-3"
+        />
+        <span className="text-white text-2xl font-bold">KlaayGuard</span>
       </div>
 
       {/* Main Content */}

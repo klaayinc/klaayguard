@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { MdContentCopy, MdCheck } from "react-icons/md";
+import Button from "./button/Button";
 
 interface CopyableTextProps {
   text: string;
@@ -29,13 +30,9 @@ export const CopyableText: React.FC<CopyableTextProps> = ({
       <span>
         {label}: {text}
       </span>
-      <button
-        onClick={handleCopy}
-        className="text-blue-300 hover:text-blue-200 transition-colors"
-        title="Copy to clipboard"
-      >
+      <Button onClick={handleCopy} variant="outline" title="Copy to clipboard">
         {copied ? <MdCheck className="text-green-400" /> : <MdContentCopy />}
-      </button>
+      </Button>
     </div>
   );
 };
