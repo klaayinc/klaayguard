@@ -6,6 +6,7 @@ import { MdLogout, MdArrowBack } from "react-icons/md";
 import { API_BASE_URL } from "../../constants/api";
 import Button from "../../components/ui/button/Button";
 import { Spinner } from "../../components/ui/spinner/Spinner";
+import CopyableText from "../../components/ui/CopyableText";
 
 export const Home = () => {
   const navigate = useNavigate();
@@ -278,13 +279,12 @@ export const Home = () => {
         Welcome to the KlaayGuard
       </h1>
       {deviceUUID && (
-        <div className="bg-gray-50 border border-gray-200 rounded px-4 py-2 mb-4 mx-auto max-w-lg">
-          <p className="text-sm text-gray-700 text-center">
-            Device ID:{" "}
-            <span className="font-mono bg-gray-100 px-2 py-1 rounded">
-              {deviceUUID}
-            </span>
-          </p>
+        <div className="mb-4 mx-auto max-w-lg">
+          <CopyableText
+            text={deviceUUID}
+            label="Device ID"
+            className="text-center"
+          />
         </div>
       )}
       {error && <p className="text-red-500 mb-4">{error}</p>}
@@ -312,28 +312,42 @@ export const Home = () => {
               </Button>
             )}
           </div>
-          <table className="table-auto w-full bg-white shadow-md rounded-lg mb-6">
-            <thead className="sticky top-0 z-10 bg-gray-200">
-              <tr className="text-gray-700">
-                <th className="px-4 py-2">Type</th>
-                <th className="px-4 py-2">ID</th>
-              </tr>
-            </thead>
-            <tbody>
-              {config?.data?.map((item, index: number) => (
-                <tr
-                  key={index}
-                  className={`${
-                    index % 2 === 0 ? "bg-gray-100" : "bg-white"
-                  } hover:bg-blue-50 transition-colors cursor-pointer`}
-                  onClick={() => handleConfigRowClick(item.id)}
-                >
-                  <td className="border px-4 py-2">{item.type}</td>
-                  <td className="border px-4 py-2">{item.id}</td>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="sticky top-0 z-10 bg-gray-50">
+                <tr>
+                  <th
+                    scope="col"
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
+                  >
+                    Type
+                  </th>
+                  <th
+                    scope="col"
+                    className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"
+                  >
+                    ID
+                  </th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {config?.data?.map((item, index: number) => (
+                  <tr
+                    key={index}
+                    className="hover:bg-gray-50 transition-colors cursor-pointer"
+                    onClick={() => handleConfigRowClick(item.id)}
+                  >
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {item.type}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {item.id}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
         {selectedConfig && (
           <div className="overflow-x-auto bg-white shadow-md rounded-lg p-4 mb-6">
