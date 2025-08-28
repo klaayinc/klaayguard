@@ -279,7 +279,7 @@ export const Home = () => {
         Welcome to the KlaayGuard
       </h1>
       {deviceUUID && (
-        <div className="mb-4 mx-auto max-w-lg">
+        <div className="mb-6 mx-auto flex justify-center items-center max-w-lg border border-gray-300 rounded-md p-2 bg-white">
           <CopyableText
             text={deviceUUID}
             label="Device ID"
