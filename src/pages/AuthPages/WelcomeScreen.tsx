@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import CopyableText from "../../components/ui/CopyableText";
 import Button from "../../components/ui/button/Button";
+import klaayLogo from "../../icons/KLAAY-LOGO-RGB_ICON.png";
 
 export const WelcomeScreen: React.FC = () => {
   const navigate = useNavigate();
@@ -47,7 +48,7 @@ export const WelcomeScreen: React.FC = () => {
       {/* Header with Klaay Logo */}
       <div className="flex items-center justify-center mb-4 text-center">
         <img
-          src="/src/icons/KLAAY-LOGO-RGB_ICON.png"
+          src={klaayLogo}
           alt="Klaay Logo"
           className="w-16 h-16 mr-3"
         />

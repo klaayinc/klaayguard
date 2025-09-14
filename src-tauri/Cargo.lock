@@ -3,6 +3,27 @@
 version = 4
 
 [[package]]
+name = "KlaayGuard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "log",
+ "nix 0.26.4",
+ "osquery-rs",
+ "reqwest 0.11.27",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tauri-plugin-shell",
+ "tauri-plugin-updater",
+ "uuid",
+ "winapi",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2066,27 +2087,6 @@ dependencies = [
  "bitflags 2.9.0",
  "serde",
  "unicode-segmentation",
-]
-
-[[package]]
-name = "klaay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs 5.0.1",
- "log",
- "nix 0.26.4",
- "osquery-rs",
- "reqwest 0.11.27",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tauri-plugin-shell",
- "tauri-plugin-updater",
- "uuid",
- "winapi",
 ]
 
 [[package]]
