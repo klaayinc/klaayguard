@@ -1,8 +1,15 @@
+use chrono::Utc;
 use serde_json::Value;
-use std::{collections::HashMap};
-use tauri::{Manager};
+use std::{collections::HashMap, sync::Arc};
+use tauri::{Manager, State};
+use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
-use tauri_plugin_shell::{ShellExt};
+
+mod database;
+mod monitoring;
+mod wake_timer;
+
+use monitoring::MonitoringService;
 
 // will return a different id every call if you don't have a hardware id until
 // a build with https://github.com/osquery/osquery/pull/8616 is released
@@ -24,6 +31,81 @@ async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
         .ok_or_else(|| "Couldn't find device uuid".to_string())?;
 
     Ok(uuid.to_string())
+}
+
+#[tauri::command]
+async fn set_auth_token(
+    monitoring_service: State<'_, Arc<MonitoringService>>,
+    token: String,
+) -> Result<(), String> {
+    monitoring_service.set_auth_token(token).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_monitoring(
+    monitoring_service: State<'_, Arc<MonitoringService>>,
+) -> Result<(), String> {
+    monitoring_service
+        .start()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_monitoring(
+    monitoring_service: State<'_, Arc<MonitoringService>>,
+) -> Result<(), String> {
+    monitoring_service.stop().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_monitoring_status(
+    monitoring_service: State<'_, Arc<MonitoringService>>,
+) -> Result<String, String> {
+    let is_running = *monitoring_service.is_running.lock().await;
+    Ok(if is_running {
+        "Monitoring service is running".to_string()
+    } else {
+        "Monitoring service is stopped".to_string()
+    })
+}
+
+#[tauri::command]
+async fn get_sync_info(
+    monitoring_service: State<'_, Arc<MonitoringService>>,
+) -> Result<serde_json::Value, String> {
+    // Get sync information from the monitoring service
+    let info = monitoring_service
+        .get_sync_info()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(info)
+}
+
+#[tauri::command]
+async fn get_collection_status(
+    monitoring_service: State<'_, Arc<MonitoringService>>,
+) -> Result<serde_json::Value, String> {
+    // Get detailed collection status from the monitoring service
+    let is_running = *monitoring_service.is_running.lock().await;
+    let device_uuid = {
+        let uuid = monitoring_service.device_uuid.lock().await;
+        uuid.clone().unwrap_or_else(|| "unknown".to_string())
+    };
+
+    let status = serde_json::json!({
+        "is_running": is_running,
+        "device_uuid": device_uuid,
+        "last_collection": Utc::now().to_rfc3339(), // This would be tracked in a real implementation
+        "next_collection": (Utc::now() + chrono::Duration::minutes(15)).to_rfc3339(),
+        "collection_interval_minutes": 15,
+        "status": if is_running { "active" } else { "inactive" }
+    });
+
+    Ok(status)
 }
 
 #[tauri::command]
@@ -54,7 +136,7 @@ async fn execute_query(
                 "exit code {:?}: {}",
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr)
-            ))
+            ));
         }
 
         let stdout_str = String::from_utf8(output.stdout)
@@ -103,14 +185,34 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
+            let handle2 = app.handle().clone();
+
+            // Initialize monitoring service immediately
+            let api_base_url = std::env::var("VITE_API_BASE_URL")
+                .unwrap_or_else(|_| "https://api.klaay.dev".to_string());
+
+            // Create monitoring service immediately
+            let monitoring_service =
+                Arc::new(MonitoringService::new_simple(handle.clone(), api_base_url));
+            app.manage(monitoring_service.clone());
+
+            // Start monitoring service in background
             tauri::async_runtime::spawn(async move {
-                update(handle).await.unwrap_or_else(|e| {
+                if let Err(e) = monitoring_service.start().await {
+                    eprintln!("Failed to start monitoring service: {}", e);
+                }
+            });
+
+            tauri::async_runtime::spawn(async move {
+                update(handle2).await.unwrap_or_else(|e| {
                     eprintln!("Failed to check for updates: {}", e);
                 });
             });
+
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
             window.on_window_event(move |event| {
@@ -157,10 +259,20 @@ pub fn run() {
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .build(app)?;
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid,])
+        .invoke_handler(tauri::generate_handler![
+            execute_query,
+            get_device_uuid,
+            set_auth_token,
+            start_monitoring,
+            stop_monitoring,
+            get_monitoring_status,
+            get_sync_info,
+            get_collection_status
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
