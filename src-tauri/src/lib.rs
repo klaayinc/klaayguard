@@ -1,8 +1,11 @@
 use serde_json::Value;
-use std::{collections::HashMap};
-use tauri::{Manager};
+use std::collections::HashMap;
+use tauri::Manager;
+use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
-use tauri_plugin_shell::{ShellExt};
+
+#[cfg(target_os = "macos")]
+use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicy};
 
 // will return a different id every call if you don't have a hardware id until
 // a build with https://github.com/osquery/osquery/pull/8616 is released
@@ -54,7 +57,7 @@ async fn execute_query(
                 "exit code {:?}: {}",
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr)
-            ))
+            ));
         }
 
         let stdout_str = String::from_utf8(output.stdout)
@@ -105,6 +108,15 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Hide the app from the dock on macOS
+            #[cfg(target_os = "macos")]
+            unsafe {
+                let ns_app = NSApp();
+                ns_app.setActivationPolicy_(
+                    NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
+                );
+            }
+
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 update(handle).await.unwrap_or_else(|e| {
@@ -121,10 +133,9 @@ pub fn run() {
             });
 
             // Create tray menu
-            let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let show_i = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
             let hide_i = tauri::menu::MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&quit_i, &show_i, &hide_i])?;
+            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &hide_i])?;
 
             // Create tray icon
             tauri::tray::TrayIconBuilder::new()
@@ -139,9 +150,6 @@ pub fn run() {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.hide();
                         }
-                    }
-                    "quit" => {
-                        app.exit(0);
                     }
                     _ => {}
                 })
