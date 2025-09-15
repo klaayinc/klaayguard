@@ -26,7 +26,7 @@
     "active": true,
     "createUpdaterArtifacts": true,
     "targets": "all",
-    "resources": ["vendor/licenses/*", "resources/*"],
+    "resources": ["vendor/licenses/*"],
     "externalBin": ["vendor/osqueryi"],
     "icon": [
       "icons/32x32.png",
@@ -45,6 +45,9 @@
       "windows": {
         "installMode": "passive"
       }
+    },
+    "autostart": {
+      "enabled": true
     }
   }
 }

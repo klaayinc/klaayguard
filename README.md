@@ -171,19 +171,19 @@ yarn tauri build --target x86_64-unknown-linux-gnu
 
 ## 🚀 Automatic Startup on macOS
 
-KlaayGuard automatically configures itself to start on macOS login. This ensures continuous security monitoring without any manual configuration required.
+KlaayGuard automatically configures itself to start on macOS login using the Tauri autostart plugin. This ensures continuous security monitoring without any manual configuration required.
 
 ### Automatic Configuration
 
-- **No Setup Required**: The app automatically installs itself as a launch agent when first run
+- **No Setup Required**: The app automatically enables autostart when first run
 - **Always Active**: Auto-start cannot be disabled - this ensures continuous security monitoring
-- **Launch Agent**: Uses macOS launchd system for reliable background operation
+- **Tauri Plugin**: Uses the official Tauri autostart plugin for reliable operation
 - **User-Level Service**: Runs when the user is logged in (not system-wide)
 
 ### How It Works
 
-- **Automatic Installation**: Launch agent is installed automatically when the app starts
-- **Launch Agent Location**: `~/Library/LaunchAgents/KlaayGuard.plist`
+- **Plugin-Based**: Uses `tauri-plugin-autostart` for cross-platform autostart functionality
+- **Launch Agent**: Automatically creates and manages macOS launch agent
 - **Background Mode**: App starts in background with system tray access
 - **Keep Alive**: Launch agent ensures the app restarts if it crashes
 - **Automatic Updates**: Launch agent updates automatically when app is updated
@@ -192,7 +192,8 @@ KlaayGuard automatically configures itself to start on macOS login. This ensures
 
 - **Continuous Monitoring**: Ensures security monitoring is always active
 - **No User Intervention**: Prevents accidental disabling of security features
-- **Reliable Operation**: Uses macOS native launchd for robust background operation
+- **Reliable Operation**: Uses Tauri's proven autostart plugin for robust background operation
+- **Framework Integration**: Leverages Tauri's built-in capabilities instead of manual shell commands
 
 ## 📦 Docker Build (Alternative)
 
