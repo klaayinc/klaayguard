@@ -1,7 +1,6 @@
 use serde_json::Value;
 use std::collections::HashMap;
 use tauri::Manager;
-use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -76,26 +75,6 @@ async fn execute_query(
     Ok(all_results)
 }
 
-#[tauri::command]
-async fn enable_autostart(_app: tauri::AppHandle) -> Result<String, String> {
-    // The autostart plugin handles this automatically when enabled in config
-    // This is a placeholder command for future use if needed
-    Ok("Autostart is handled by the plugin configuration".to_string())
-}
-
-#[tauri::command]
-async fn disable_autostart(_app: tauri::AppHandle) -> Result<String, String> {
-    // The autostart plugin handles this automatically when enabled in config
-    // This is a placeholder command for future use if needed
-    Ok("Autostart is handled by the plugin configuration".to_string())
-}
-
-#[tauri::command]
-async fn is_autostart_enabled(_app: tauri::AppHandle) -> Result<bool, String> {
-    // The autostart plugin handles this automatically when enabled in config
-    // This is a placeholder command for future use if needed
-    Ok(true)
-}
 
 async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     if let Some(update) = app.updater()?.check().await? {
@@ -125,11 +104,14 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_autostart::init(MacosLauncher::LaunchAgent, None))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
-            
+
             tauri::async_runtime::spawn(async move {
                 update(handle).await.unwrap_or_else(|e| {
                     eprintln!("Failed to check for updates: {}", e);
@@ -186,7 +168,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid, enable_autostart, disable_autostart, is_autostart_enabled])
+        .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
