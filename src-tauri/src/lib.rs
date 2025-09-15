@@ -75,7 +75,6 @@ async fn execute_query(
     Ok(all_results)
 }
 
-
 async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     if let Some(update) = app.updater()?.check().await? {
         let mut downloaded = 0;
