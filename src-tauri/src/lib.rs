@@ -222,6 +222,13 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            // Hide the app from the dock on macOS for security monitoring
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                log::info!("KlaayGuard configured as background service - hidden from dock");
+            }
+
             // Check if we're already running as a regular process to prevent duplicates
             #[cfg(target_os = "macos")]
             {
@@ -346,13 +353,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid])
         .build(tauri::generate_context!())
         .expect("error building tauri application");
-
-    // Hide the app from the dock on macOS for security monitoring
-    #[cfg(target_os = "macos")]
-    {
-        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        log::info!("KlaayGuard configured as background service - hidden from dock");
-    }
 
     app.run(|_app_handle, _event| {});
 }
