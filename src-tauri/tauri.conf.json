@@ -45,6 +45,9 @@
       "windows": {
         "installMode": "passive"
       }
+    },
+    "autostart": {
+      "enabled": true
     }
   }
 }
