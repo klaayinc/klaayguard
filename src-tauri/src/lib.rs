@@ -229,6 +229,11 @@ pub fn run() {
 
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
+
+            // Hide the window on startup for background operation
+            window.hide().unwrap();
+            log::info!("KlaayGuard started in background mode - window hidden");
+
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     window_.hide().unwrap();
@@ -256,9 +261,12 @@ pub fn run() {
             tauri::tray::TrayIconBuilder::new()
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
+                        log::info!("Show window requested from system tray");
                         if let Some(window) = app.get_webview_window("main") {
                             if let Err(e) = window.show() {
                                 log::error!("Failed to show window: {}", e);
+                            } else {
+                                log::info!("Window shown successfully");
                             }
                             if let Err(e) = window.set_focus() {
                                 log::error!("Failed to focus window: {}", e);
@@ -266,9 +274,12 @@ pub fn run() {
                         }
                     }
                     "hide" => {
+                        log::info!("Hide window requested from system tray");
                         if let Some(window) = app.get_webview_window("main") {
                             if let Err(e) = window.hide() {
                                 log::error!("Failed to hide window: {}", e);
+                            } else {
+                                log::info!("Window hidden successfully");
                             }
                         }
                     }
