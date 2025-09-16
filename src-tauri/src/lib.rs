@@ -121,6 +121,17 @@ async fn install_launch_agent() -> Result<String, String> {
         let launch_agents_dir = home_dir.join("Library/LaunchAgents");
         let plist_path = launch_agents_dir.join("KlaayGuard.plist");
 
+        // Check if launch agent is already loaded
+        let output = std::process::Command::new("launchctl")
+            .args(&["list", "KlaayGuard"])
+            .output()
+            .map_err(|e| format!("Failed to check launch agent status: {}", e))?;
+
+        if output.status.success() {
+            // Launch agent is already loaded, no need to install again
+            return Ok("Launch agent already installed and running".to_string());
+        }
+
         // Create LaunchAgents directory if it doesn't exist
         fs::create_dir_all(&launch_agents_dir)
             .map_err(|e| format!("Failed to create LaunchAgents directory: {}", e))?;
@@ -210,6 +221,28 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Check if we're already running as a regular process to prevent duplicates
+            #[cfg(target_os = "macos")]
+            {
+                let output = std::process::Command::new("pgrep")
+                    .args(&["-f", "KlaayGuard"])
+                    .output();
+
+                if let Ok(output) = output {
+                    if output.status.success() {
+                        let pid_count = String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .filter(|line| !line.trim().is_empty())
+                            .count();
+
+                        // If there's already a KlaayGuard process running, exit this instance
+                        if pid_count > 0 {
+                            std::process::exit(0);
+                        }
+                    }
+                }
+            }
 
             tauri::async_runtime::spawn(async move {
                 update(handle).await.unwrap_or_else(|e| {
