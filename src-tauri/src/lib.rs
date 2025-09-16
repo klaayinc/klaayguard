@@ -13,7 +13,7 @@
 //! - System tray provides controlled access to app functionality
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::{collections::HashMap, fs};
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
@@ -108,6 +108,60 @@ async fn execute_query(
     Ok(all_results)
 }
 
+/// Installs a launch agent for automatic startup on macOS.
+///
+/// This function creates a launchd plist file in the user's LaunchAgents directory
+/// and loads it to ensure the app starts automatically on login. This is a mandatory
+/// security feature that cannot be disabled by users.
+#[tauri::command]
+async fn install_launch_agent() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+        let launch_agents_dir = home_dir.join("Library/LaunchAgents");
+        let plist_path = launch_agents_dir.join("KlaayGuard.plist");
+
+        // Create LaunchAgents directory if it doesn't exist
+        fs::create_dir_all(&launch_agents_dir)
+            .map_err(|e| format!("Failed to create LaunchAgents directory: {}", e))?;
+
+        // Get the current executable path
+        let current_exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to get current executable path: {}", e))?;
+
+        // Read the plist template and replace the executable path
+        let plist_content = include_str!("../resources/com.klaay.app.plist");
+        let plist_content = plist_content.replace(
+            "/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard",
+            &current_exe.to_string_lossy(),
+        );
+
+        // Write the plist file
+        fs::write(&plist_path, plist_content)
+            .map_err(|e| format!("Failed to write plist file: {}", e))?;
+
+        // Load the launch agent
+        let output = std::process::Command::new("launchctl")
+            .args(&["load", plist_path.to_str().unwrap()])
+            .output()
+            .map_err(|e| format!("Failed to load launch agent: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to load launch agent: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        Ok("Launch agent installed successfully".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Launch agent installation is only supported on macOS".to_string())
+    }
+}
+
 /// Handles automatic updates for security patches and bug fixes.
 ///
 /// This function checks for available updates and automatically downloads and installs them.
@@ -159,7 +213,6 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-
             let handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
@@ -168,7 +221,16 @@ pub fn run() {
                 });
             });
 
-            // Autostart is handled automatically by the plugin configuration
+            // Automatically install launch agent on macOS
+            #[cfg(target_os = "macos")]
+            {
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = install_launch_agent().await {
+                        eprintln!("Failed to install launch agent: {}", e);
+                    }
+                });
+            }
+
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
             window.on_window_event(move |event| {
