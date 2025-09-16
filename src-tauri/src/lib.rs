@@ -1,11 +1,31 @@
+//! KlaayGuard - Security Monitoring Application
+//!
+//! This application provides continuous security monitoring on edge devices.
+//! Key security features:
+//! - Runs as background service (hidden from dock on macOS)
+//! - No quit option in system tray to prevent easy termination
+//! - Automatic updates for security patches
+//! - System tray interface for minimal user interaction
+//!
+//! Security Design:
+//! - App cannot be easily terminated by end users
+//! - Background operation ensures continuous monitoring
+//! - System tray provides controlled access to app functionality
+
 use serde_json::Value;
 use std::collections::HashMap;
 use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 
-// will return a different id every call if you don't have a hardware id until
-// a build with https://github.com/osquery/osquery/pull/8616 is released
+/// Retrieves the device UUID for security monitoring identification.
+///
+/// This function queries the system_info table using osquery to get a unique
+/// device identifier. The UUID is used for tracking and reporting security events
+/// to the central monitoring system.
+///
+/// Note: Will return a different ID every call if you don't have a hardware ID until
+/// a build with https://github.com/osquery/osquery/pull/8616 is released
 #[tauri::command]
 async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
     let tables = vec!["system_info".to_string()];
@@ -26,6 +46,19 @@ async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
     Ok(uuid.to_string())
 }
 
+/// Executes osquery commands to gather system information for security monitoring.
+///
+/// This function runs osquery queries against specified tables and returns the results
+/// as JSON. It's used by the security monitoring system to collect data about the
+/// current state of the device.
+///
+/// # Arguments
+/// * `app` - Tauri app handle for accessing shell functionality
+/// * `table_names` - Vector of osquery table names to query
+///
+/// # Returns
+/// * `Ok(HashMap<String, Value>)` - Query results keyed by table name
+/// * `Err(String)` - Error message if query execution fails
 #[tauri::command]
 async fn execute_query(
     app: tauri::AppHandle,
@@ -45,7 +78,7 @@ async fn execute_query(
             .shell()
             .sidecar("osqueryi")
             .unwrap()
-            .args(&["--json", &format!("SELECT * FROM {}", table_name)]);
+            .args(["--json", &format!("SELECT * FROM {}", table_name)]);
 
         let output = cmd.output().await.map_err(|e| e.to_string())?;
 
@@ -75,6 +108,11 @@ async fn execute_query(
     Ok(all_results)
 }
 
+/// Handles automatic updates for security patches and bug fixes.
+///
+/// This function checks for available updates and automatically downloads and installs them.
+/// The app will restart after a successful update to ensure the latest security patches
+/// are active.
 async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     if let Some(update) = app.updater()?.check().await? {
         let mut downloaded = 0;
@@ -99,9 +137,21 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
     Ok(())
 }
 
+/// Main entry point for the KlaayGuard security monitoring application.
+///
+/// This function initializes the Tauri application with security-focused configuration:
+/// - Hides the app from the dock on macOS for background operation
+/// - Creates a system tray with limited options (no quit functionality)
+/// - Sets up automatic updates for security patches
+/// - Configures window behavior to prevent accidental closure
+///
+/// Security Features:
+/// - Background operation prevents easy termination
+/// - System tray provides controlled access
+/// - Automatic updates ensure latest security patches
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -109,6 +159,7 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+
             let handle = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
@@ -127,47 +178,79 @@ pub fn run() {
                 }
             });
 
-            // Create tray menu
-            let quit_i = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let show_i = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
-            let hide_i = tauri::menu::MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&quit_i, &show_i, &hide_i])?;
+            // Create tray menu with security-focused options (no quit option)
+            let show_i = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)
+                .map_err(|e| {
+                    log::error!("Failed to create 'Show' menu item: {}", e);
+                    e
+                })?;
+            let hide_i = tauri::menu::MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)
+                .map_err(|e| {
+                    log::error!("Failed to create 'Hide' menu item: {}", e);
+                    e
+                })?;
+            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &hide_i]).map_err(|e| {
+                log::error!("Failed to create system tray menu: {}", e);
+                e
+            })?;
 
-            // Create tray icon
+            // Create tray icon with security monitoring tooltip
             tauri::tray::TrayIconBuilder::new()
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                            if let Err(e) = window.show() {
+                                log::error!("Failed to show window: {}", e);
+                            }
+                            if let Err(e) = window.set_focus() {
+                                log::error!("Failed to focus window: {}", e);
+                            }
                         }
                     }
                     "hide" => {
                         if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.hide();
+                            if let Err(e) = window.hide() {
+                                log::error!("Failed to hide window: {}", e);
+                            }
                         }
-                    }
-                    "quit" => {
-                        app.exit(0);
                     }
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| match event {
                     tauri::tray::TrayIconEvent::Enter { .. } => {
-                        tray.set_tooltip(Some("Klaay Guard".to_string())).unwrap();
+                        if let Err(e) =
+                            tray.set_tooltip(Some("KlaayGuard - Security Monitoring".to_string()))
+                        {
+                            log::error!("Failed to set tooltip: {}", e);
+                        }
                     }
                     tauri::tray::TrayIconEvent::Leave { .. } => {
-                        tray.set_tooltip(Some("")).unwrap();
+                        if let Err(e) = tray.set_tooltip(Some("".to_string())) {
+                            log::error!("Failed to clear tooltip: {}", e);
+                        }
                     }
                     _ => {}
                 })
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .build(app)?;
+                .build(app)
+                .map_err(|e| {
+                    log::error!("Failed to create system tray icon: {}", e);
+                    e
+                })?;
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error building tauri application");
+
+    // Hide the app from the dock on macOS for security monitoring
+    #[cfg(target_os = "macos")]
+    {
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        log::info!("KlaayGuard configured as background service - hidden from dock");
+    }
+
+    app.run(|_app_handle, _event| {});
 }
