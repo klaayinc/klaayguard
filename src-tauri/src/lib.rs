@@ -156,6 +156,10 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Hide the app from the dock on macOS for security monitoring
@@ -171,11 +175,14 @@ pub fn run() {
             }
 
             let handle = app.handle().clone();
+
             tauri::async_runtime::spawn(async move {
                 update(handle).await.unwrap_or_else(|e| {
                     eprintln!("Failed to check for updates: {}", e);
                 });
             });
+
+            // Autostart is handled automatically by the plugin configuration
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
             window.on_window_event(move |event| {
@@ -248,7 +255,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid,])
+        .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

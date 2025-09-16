@@ -7,6 +7,7 @@
 ## 🎯 Purpose
 
 KlaayGuard automatically:
+
 - Installs and manages osquery on Windows, macOS, and Linux
 - Collects system security data (processes, network connections, installed software, etc.)
 - Reports data to `https://api.klaay.dev` every 15 minutes
@@ -26,6 +27,7 @@ KlaayGuard automatically:
 4. install the package
 
 ## Compile dev build (Linux)
+
 1. clone the repo:
    ```bash
    git clone https://github.com/klaayinc/klaayguard.git
@@ -33,6 +35,7 @@ KlaayGuard automatically:
    ```
 
 ### Prerequisites
+
 ```bash
 # Install Node.js (v22+ recommended)
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
@@ -51,6 +54,7 @@ npm install -g yarn
 ```
 
 ### Setup & Development
+
 ```bash
 # Clone and setup
 git clone https://github.com/klaayinc/klaayguard.git
@@ -67,6 +71,7 @@ yarn tauri dev
 ```
 
 ### Build for Production
+
 ```bash
 # Build for current platform
 yarn tauri build
@@ -81,25 +86,30 @@ yarn tauri build --target x86_64-unknown-linux-gnu  # Linux
 ## 🏗️ Multi-Platform Support
 
 ### Windows
+
 - **Target**: `x86_64-pc-windows-msvc`
 - **osquery**: Installed via Chocolatey package manager
 - **Features**: System tray, background monitoring
 
 ### macOS
+
 - **Targets**: `aarch64-apple-darwin` (Apple Silicon), `x86_64-apple-darwin` (Intel)
 - **osquery**: Installed via official PKG installer
-- **Features**: System tray, background monitoring
+- **Features**: System tray, background monitoring, auto-start on login
 
 ### Linux
+
 - **Target**: `x86_64-unknown-linux-gnu`
 - **osquery**: Supports apt (Debian/Ubuntu), dnf (Fedora), zypper (SUSE)
 - **Features**: System tray, background monitoring
 
 ### Mobile (Tauri 2.0)
+
 - **iOS**: `aarch64-apple-ios`
 - **Android**: `aarch64-linux-android`
 
 ## 📁 Project Structure
+
 ```
 klaayguard/
 ├── src-tauri/           # Rust backend (Tauri)
@@ -121,12 +131,14 @@ klaayguard/
 ## 🔧 Configuration
 
 ### Environment Variables
+
 ```bash
 # .env file
 VITE_API_BASE_URL=https://api.klaay.dev
 ```
 
 ### API Endpoints
+
 - **Config**: `GET /klaayguard/config` - Fetch monitoring configuration
 - **Data**: `POST /klaayguard/data` - Submit collected system data
 
@@ -153,12 +165,40 @@ yarn tauri build --target x86_64-unknown-linux-gnu
 - **JWT Authentication**: Secure API communication
 - **System Integration**: Native osquery installation
 - **Background Operation**: System tray with show/hide/quit
+- **Auto-Start**: Automatic startup on macOS login (mandatory)
 - **Data Encryption**: HTTPS transmission to API
 - **Cross-platform**: Consistent security monitoring across platforms
+
+## 🚀 Automatic Startup on macOS
+
+KlaayGuard automatically configures itself to start on macOS login using the Tauri autostart plugin. This ensures continuous security monitoring without any manual configuration required.
+
+### Automatic Configuration
+
+- **No Setup Required**: The app automatically enables autostart when first run
+- **Always Active**: Auto-start cannot be disabled - this ensures continuous security monitoring
+- **Tauri Plugin**: Uses the official Tauri autostart plugin for reliable operation
+- **User-Level Service**: Runs when the user is logged in (not system-wide)
+
+### How It Works
+
+- **Plugin-Based**: Uses `tauri-plugin-autostart` for cross-platform autostart functionality
+- **Launch Agent**: Automatically creates and manages macOS launch agent
+- **Background Mode**: App starts in background with system tray access
+- **Keep Alive**: Launch agent ensures the app restarts if it crashes
+- **Automatic Updates**: Launch agent updates automatically when app is updated
+
+### Security Benefits
+
+- **Continuous Monitoring**: Ensures security monitoring is always active
+- **No User Intervention**: Prevents accidental disabling of security features
+- **Reliable Operation**: Uses Tauri's proven autostart plugin for robust background operation
+- **Framework Integration**: Leverages Tauri's built-in capabilities instead of manual shell commands
 
 ## 📦 Docker Build (Alternative)
 
 For consistent builds across environments:
+
 ```bash
 # Build using Docker
 docker compose run --rm klaayguard -- yarn run tauri build
