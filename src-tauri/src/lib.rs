@@ -18,9 +18,6 @@ use tauri::Manager;
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 
-#[cfg(target_os = "macos")]
-use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicy};
-
 /// Retrieves the device UUID for security monitoring identification.
 ///
 /// This function queries the system_info table using osquery to get a unique
@@ -154,7 +151,7 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 /// - Automatic updates ensure latest security patches
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -162,17 +159,6 @@ pub fn run() {
         ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            // Hide the app from the dock on macOS for security monitoring
-            #[cfg(target_os = "macos")]
-            {
-                unsafe {
-                    let ns_app = NSApp();
-                    ns_app.setActivationPolicy_(
-                        NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
-                    );
-                }
-                log::info!("KlaayGuard configured as background service - hidden from dock");
-            }
 
             let handle = app.handle().clone();
 
@@ -256,6 +242,15 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error building tauri application");
+
+    // Hide the app from the dock on macOS for security monitoring
+    #[cfg(target_os = "macos")]
+    {
+        app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        log::info!("KlaayGuard configured as background service - hidden from dock");
+    }
+
+    app.run(|_app_handle, _event| {});
 }
