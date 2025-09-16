@@ -216,7 +216,7 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 /// - Automatic updates ensure latest security patches
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut app = tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -270,9 +270,10 @@ pub fn run() {
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
 
-            // Hide the window on startup for background operation
-            window.hide().unwrap();
-            log::info!("KlaayGuard started in background mode - window hidden");
+            // Show the window on startup to display the login screen
+            window.show().unwrap();
+            window.set_focus().unwrap();
+            log::info!("KlaayGuard started - login screen displayed");
 
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {

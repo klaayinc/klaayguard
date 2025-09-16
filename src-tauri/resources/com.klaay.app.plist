@@ -16,6 +16,8 @@
     <true/>
     <key>ProcessType</key>
     <string>Interactive</string>
+    <key>LSUIElement</key>
+    <false/>
     <key>StandardOutPath</key>
     <string>/tmp/klaayguard.log</string>
     <key>StandardErrorPath</key>
