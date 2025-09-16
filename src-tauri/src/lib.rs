@@ -1,12 +1,12 @@
 //! KlaayGuard - Security Monitoring Application
-//! 
+//!
 //! This application provides continuous security monitoring on edge devices.
 //! Key security features:
 //! - Runs as background service (hidden from dock on macOS)
 //! - No quit option in system tray to prevent easy termination
 //! - Automatic updates for security patches
 //! - System tray interface for minimal user interaction
-//! 
+//!
 //! Security Design:
 //! - App cannot be easily terminated by end users
 //! - Background operation ensures continuous monitoring
@@ -22,11 +22,11 @@ use tauri_plugin_updater::UpdaterExt;
 use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicy};
 
 /// Retrieves the device UUID for security monitoring identification.
-/// 
+///
 /// This function queries the system_info table using osquery to get a unique
 /// device identifier. The UUID is used for tracking and reporting security events
 /// to the central monitoring system.
-/// 
+///
 /// Note: Will return a different ID every call if you don't have a hardware ID until
 /// a build with https://github.com/osquery/osquery/pull/8616 is released
 #[tauri::command]
@@ -50,15 +50,15 @@ async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 /// Executes osquery commands to gather system information for security monitoring.
-/// 
+///
 /// This function runs osquery queries against specified tables and returns the results
 /// as JSON. It's used by the security monitoring system to collect data about the
 /// current state of the device.
-/// 
+///
 /// # Arguments
 /// * `app` - Tauri app handle for accessing shell functionality
 /// * `table_names` - Vector of osquery table names to query
-/// 
+///
 /// # Returns
 /// * `Ok(HashMap<String, Value>)` - Query results keyed by table name
 /// * `Err(String)` - Error message if query execution fails
@@ -112,7 +112,7 @@ async fn execute_query(
 }
 
 /// Handles automatic updates for security patches and bug fixes.
-/// 
+///
 /// This function checks for available updates and automatically downloads and installs them.
 /// The app will restart after a successful update to ensure the latest security patches
 /// are active.
@@ -141,13 +141,13 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 }
 
 /// Main entry point for the KlaayGuard security monitoring application.
-/// 
+///
 /// This function initializes the Tauri application with security-focused configuration:
 /// - Hides the app from the dock on macOS for background operation
 /// - Creates a system tray with limited options (no quit functionality)
 /// - Sets up automatic updates for security patches
 /// - Configures window behavior to prevent accidental closure
-/// 
+///
 /// Security Features:
 /// - Background operation prevents easy termination
 /// - System tray provides controlled access
@@ -196,11 +196,10 @@ pub fn run() {
                     log::error!("Failed to create 'Hide' menu item: {}", e);
                     e
                 })?;
-            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &hide_i])
-                .map_err(|e| {
-                    log::error!("Failed to create system tray menu: {}", e);
-                    e
-                })?;
+            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &hide_i]).map_err(|e| {
+                log::error!("Failed to create system tray menu: {}", e);
+                e
+            })?;
 
             // Create tray icon with security monitoring tooltip
             tauri::tray::TrayIconBuilder::new()
@@ -226,7 +225,9 @@ pub fn run() {
                 })
                 .on_tray_icon_event(|tray, event| match event {
                     tauri::tray::TrayIconEvent::Enter { .. } => {
-                        if let Err(e) = tray.set_tooltip(Some("KlaayGuard - Security Monitoring".to_string())) {
+                        if let Err(e) =
+                            tray.set_tooltip(Some("KlaayGuard - Security Monitoring".to_string()))
+                        {
                             log::error!("Failed to set tooltip: {}", e);
                         }
                     }
