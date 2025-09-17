@@ -12,11 +12,74 @@
 //! - Background operation ensures continuous monitoring
 //! - System tray provides controlled access to app functionality
 
-use std::fs;
+use serde_json::Value;
+use std::{collections::HashMap, fs};
 use tauri::Manager;
+use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 
-// Removed osquery, monitoring, and database-related commands.
+// Re-introduced minimal osquery commands used by the UI.
+
+#[tauri::command]
+async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
+    let tables = vec!["system_info".to_string()];
+    let query_result = execute_query(app, tables).await?;
+
+    let uuid = query_result
+        .get("system_info")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|obj| obj.get("uuid"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Couldn't find device uuid".to_string())?;
+
+    Ok(uuid.to_string())
+}
+
+#[tauri::command]
+async fn execute_query(
+    app: tauri::AppHandle,
+    table_names: Vec<String>,
+) -> Result<HashMap<String, Value>, String> {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+
+    let mut all_results = HashMap::new();
+
+    for table_name in table_names {
+        let cmd = app
+            .shell()
+            .sidecar("osqueryi")
+            .unwrap()
+            .args(["--json", &format!("SELECT * FROM {}", table_name)]);
+
+        let output = cmd.output().await.map_err(|e| e.to_string())?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "exit code {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let stdout_str = String::from_utf8(output.stdout)
+            .map_err(|e| format!("Invalid UTF-8 output for table {}: {}", table_name, e))?;
+
+        let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
+            format!(
+                "Failed to parse JSON for table {} (content: '{}'): {}",
+                table_name,
+                stdout_str.trim(),
+                e
+            )
+        })?;
+
+        all_results.insert(table_name, parsed_result);
+    }
+
+    Ok(all_results)
+}
 
 /// Installs a launch agent for automatic startup on macOS.
 ///
@@ -128,6 +191,7 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
+        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle2 = app.handle().clone();
@@ -260,7 +324,7 @@ pub fn run() {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![])
+        .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid])
         .build(tauri::generate_context!())
         .expect("error building tauri application");
 
