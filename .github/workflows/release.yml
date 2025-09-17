@@ -163,8 +163,8 @@ jobs:
 
           if [ "${{ matrix.platform }}" = "macos-arm" ]; then
             # aarch64 .app.tar.gz and signature
-            APP_TGZ_PATH=$(find src-tauri/target -type f -name "KlaayGuard_aarch64.app.tar.gz" | head -n1)
-            SIG_PATH=$(find src-tauri/target -type f -name "KlaayGuard_aarch64.app.tar.gz.sig" | head -n1)
+            APP_TGZ_PATH=$(find src-tauri/target -type f -name "KlaayGuard.app.tar.gz" | head -n1)
+            SIG_PATH=$(find src-tauri/target -type f -name "KlaayGuard.app.tar.gz.sig" | head -n1)
             if [ -n "${APP_TGZ_PATH:-}" ]; then
               RENAMED_TGZ="KlaayGuard_aarch64.${{ matrix.build }}.app.tar.gz"
               cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
