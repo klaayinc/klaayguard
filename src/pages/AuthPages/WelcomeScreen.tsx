@@ -1,8 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
-import CopyableText from "../../components/ui/CopyableText";
+// Removed Close button; no window API needed
 import Button from "../../components/ui/button/Button";
 import klaayLogo from "../../icons/KLAAY-LOGO-RGB_ICON.png";
 
@@ -24,15 +22,7 @@ export const WelcomeScreen: React.FC = () => {
     getDeviceId();
   }, []);
 
-  const handleClose = async () => {
-    try {
-      const appWindow = getCurrentWindow();
-      await appWindow.hide();
-    } catch (error) {
-      console.error("Failed to hide window:", error);
-      alert("Something went wrong while trying to hide the window");
-    }
-  };
+  // Close button removed
 
   // Data collection navigation removed; background collection runs in Rust
 
@@ -58,16 +48,11 @@ export const WelcomeScreen: React.FC = () => {
         </p>
       </div>
 
-      {/* Close Button */}
-      <Button onClick={handleClose}>Close this window</Button>
+      {/* Close Button removed */}
 
-      {/* Footer */}
+      {/* Footer (device ID link removed) */}
       <div className="absolute bottom-8 left-8 right-8 flex justify-between text-white text-sm">
-        <CopyableText
-          text={deviceUUID || "Loading..."}
-          label="Device ID"
-          className="text-white"
-        />
+        <div />
         {/* Data collection button removed */}
       </div>
     </div>
