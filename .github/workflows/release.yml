@@ -10,7 +10,37 @@ on:
 # This workflow will trigger on each push to the `release` branch to create or update a GitHub release, build your app, and upload the artifacts to the release.
 
 jobs:
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Determine version
+        id: version
+        run: |
+          echo "VERSION=$(node -p \"require('./package.json').version\")" >> $GITHUB_OUTPUT
+
+      - name: Create or update GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: v${{ steps.version.outputs.VERSION }}
+          name: Klaayguard v${{ steps.version.outputs.VERSION }}
+          draft: true
+          prerelease: false
+          allowUpdates: true
+          omitBodyDuringUpdate: true
+          body: "See the assets to download this version and install."
+
   publish-tauri:
+    needs: create-release
     permissions:
       contents: write
     strategy:
@@ -92,7 +122,7 @@ jobs:
           echo "CERT_ID is $CERT_ID"
           echo "Certificate imported."
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build app with Tauri CLI
         env:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -102,11 +132,40 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          yarn tauri build ${{ matrix.args }}
 
+      - name: Determine version
+        id: version
+        run: |
+          echo "VERSION=$(node -p \"require('./package.json').version\")" >> $GITHUB_OUTPUT
+
+      - name: Determine architecture label
+        id: arch
+        run: |
+          if [ "${{ matrix.platform }}" = "macos-arm" ]; then
+            echo "ARCH=arm64" >> $GITHUB_OUTPUT
+          else
+            echo "ARCH=x64" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Prepare and rename asset
+        id: rename
+        run: |
+          mkdir -p dist
+          DMG=$(ls -1 src-tauri/target/**/bundle/dmg/*.dmg | head -n 1)
+          if [ -z "$DMG" ]; then
+            echo "No DMG found under src-tauri/target/**/bundle/dmg" >&2
+            exit 1
+          fi
+          NEW_NAME="dist/Klaayguard-${{ steps.version.outputs.VERSION }}-${{ steps.arch.outputs.ARCH }}-${{ matrix.build }}.dmg"
+          cp "$DMG" "$NEW_NAME"
+          echo "asset=$NEW_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload asset to release
+        uses: softprops/action-gh-release@v2
         with:
-          tagName: app-v__VERSION__-${{ matrix.build }}
-          releaseName: 'App v__VERSION__ (${{ matrix.build }})' 
-          releaseBody: "See the assets to download this version and install."
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+          tag_name: v${{ steps.version.outputs.VERSION }}
+          files: ${{ steps.rename.outputs.asset }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
