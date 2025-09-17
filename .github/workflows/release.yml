@@ -10,7 +10,41 @@ on:
 # This workflow will trigger on each push to the `release` branch to create or update a GitHub release, build your app, and upload the artifacts to the release.
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.set_tag.outputs.tag }}
+      version: ${{ steps.set_tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Compute version and tag
+        id: set_tag
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="app-v${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+      - name: Create draft release if missing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.set_tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.set_tag.outputs.tag }} already exists"
+          else
+            gh release create "${{ steps.set_tag.outputs.tag }}" \
+              --title "KlaayGuard v${{ steps.set_tag.outputs.version }}" \
+              --notes "See the assets to download this version and install." \
+              --draft
+          fi
+
   publish-tauri:
+    needs: create-release
     permissions:
       contents: write
     strategy:
@@ -92,21 +126,60 @@ jobs:
           echo "CERT_ID is $CERT_ID"
           echo "Certificate imported."
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build Tauri
         env:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          yarn tauri build ${{ matrix.args }}
 
-        with:
-          tagName: app-v__VERSION__-${{ matrix.build }}
-          releaseName: 'App v__VERSION__ (${{ matrix.build }})' 
-          releaseBody: "See the assets to download this version and install."
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+      - name: Rename and upload artifacts to single release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+
+          # Authenticate gh (uses GITHUB_TOKEN)
+          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
+
+          uploaded=()
+
+          if [ "${{ matrix.platform }}" = "macos-x64" ]; then
+            # DMG for x64
+            DMG_PATH=$(find src-tauri/target -type f -name "KlaayGuard_*_x64.dmg" | head -n1)
+            if [ -n "${DMG_PATH:-}" ]; then
+              RENAMED_DMG="KlaayGuard_${VERSION}_x64_${{ matrix.build }}.dmg"
+              cp "$DMG_PATH" "$RENAMED_DMG"
+              uploaded+=("$RENAMED_DMG")
+            fi
+          fi
+
+          if [ "${{ matrix.platform }}" = "macos-arm" ]; then
+            # aarch64 .app.tar.gz and signature
+            APP_TGZ_PATH=$(find src-tauri/target -type f -name "KlaayGuard_aarch64.app.tar.gz" | head -n1)
+            SIG_PATH=$(find src-tauri/target -type f -name "KlaayGuard_aarch64.app.tar.gz.sig" | head -n1)
+            if [ -n "${APP_TGZ_PATH:-}" ]; then
+              RENAMED_TGZ="KlaayGuard_aarch64.${{ matrix.build }}.app.tar.gz"
+              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
+              uploaded+=("$RENAMED_TGZ")
+            fi
+            if [ -n "${SIG_PATH:-}" ]; then
+              RENAMED_SIG="KlaayGuard_aarch64.${{ matrix.build }}.app.tar.gz.sig"
+              cp "$SIG_PATH" "$RENAMED_SIG"
+              uploaded+=("$RENAMED_SIG")
+            fi
+          fi
+
+          if [ ${#uploaded[@]} -gt 0 ]; then
+            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+          else
+            echo "No artifacts found to upload for matrix=${{ matrix.platform }} ${{ matrix.build }}"
+          fi
