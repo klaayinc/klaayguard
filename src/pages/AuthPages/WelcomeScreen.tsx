@@ -15,7 +15,7 @@ export const WelcomeScreen: React.FC = () => {
   useEffect(() => {
     const getDeviceId = async () => {
       try {
-        const uuid = await invoke("get_device_uuid");
+      const uuid = "unknown";
         setDeviceUUID(uuid as string);
       } catch (error) {
         console.error("Failed to get device UUID:", error);
