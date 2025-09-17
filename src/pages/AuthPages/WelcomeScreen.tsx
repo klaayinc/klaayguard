@@ -34,14 +34,7 @@ export const WelcomeScreen: React.FC = () => {
     }
   };
 
-  const handleDataCollection = () => {
-    navigate("/home", {
-      state: {
-        accountName,
-        accountId,
-      },
-    });
-  };
+  // Data collection navigation removed; background collection runs in Rust
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-8 bg-[#0B223D]">
@@ -75,13 +68,7 @@ export const WelcomeScreen: React.FC = () => {
           label="Device ID"
           className="text-white"
         />
-        <Button
-          variant="outline"
-          onClick={handleDataCollection}
-          className="bg-inherit border-none text-black"
-        >
-          Data collection
-        </Button>
+        {/* Data collection button removed */}
       </div>
     </div>
   );

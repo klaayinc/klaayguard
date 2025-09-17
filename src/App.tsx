@@ -1,6 +1,6 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import SignIn from "./pages/AuthPages/SignIn";
-import { Home } from "./pages/Dashboard/Home";
+// Home page removed; background collection runs in Rust
 import { AuthProvider } from "./context/AuthContext";
 import { ToastContainer } from "react-toastify";
 import AccountSetup from "./pages/AuthPages/AccountSetup";
@@ -13,7 +13,7 @@ export default function App() {
       <AuthProvider>
         <Routes>
           <Route path="/" element={<SignIn />} />
-          <Route path="/home" element={<Home />} />
+          {/* Home route removed */}
           <Route path="/signin" element={<SignIn />} />
           <Route path="/account-setup" element={<AccountSetup />} />
           <Route path="/welcome" element={<WelcomeScreen />} />

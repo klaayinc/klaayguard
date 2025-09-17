@@ -2,6 +2,8 @@ import React, { createContext, useState, useContext, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { jwtDecode } from "jwt-decode";
 import { API_BASE_URL } from "../constants/api";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 type AuthContextType = {
   token: string | null;
@@ -118,6 +120,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         if (jwtToken) {
           setToken(jwtToken);
           localStorage.setItem("jwtToken", jwtToken);
+          try {
+            await invoke("save_auth_token", { token: jwtToken });
+          } catch (e) {
+            console.error("Failed to persist token to Rust state:", e);
+          }
         }
 
         const user = responseData.included?.[0]?.attributes;
@@ -137,7 +144,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
           });
         } else {
           setIsAccountConfigRequired(false);
-          navigate("/home");
+          navigate("/welcome");
         }
 
         console.log("Authenticated User:", user);
@@ -158,6 +165,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     const initializeApp = async () => {
       const savedToken = localStorage.getItem("jwtToken");
       const currentPath = window.location.pathname;
+      try {
+        await invoke("set_api_base_url", { base: API_BASE_URL });
+      } catch (e) {
+        console.error("Failed to set API base URL in Rust state:", e);
+      }
 
       console.log("Account Config Required:", isAccountConfigRequired);
       if (savedToken) {
@@ -165,6 +177,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
           console.log("savedToken", savedToken);
           setToken(savedToken);
           setIsAuthenticated(true);
+          try {
+            await invoke("save_auth_token", { token: savedToken });
+          } catch (e) {
+            console.error("Failed to sync saved token to Rust state:", e);
+          }
           if (currentPath == "/signin") {
             navigate("/account-setup");
           }
@@ -172,8 +189,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
           console.log("savedToken", savedToken);
           setToken(savedToken);
           setIsAuthenticated(true);
+          try {
+            await invoke("save_auth_token", { token: savedToken });
+          } catch (e) {
+            console.error("Failed to sync saved token to Rust state:", e);
+          }
           if (currentPath == "/signin") {
-            navigate("/home");
+            navigate("/welcome");
           }
         }
       } else {
@@ -184,10 +206,34 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     initializeApp();
   }, []);
 
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        unlisten = await listen("auth:invalidated", () => {
+          logout();
+        });
+      } catch (e) {
+        console.error("Failed to bind auth:invalidated listener:", e);
+      }
+    })();
+
+    return () => {
+      if (unlisten) {
+        try { unlisten(); } catch (_e) { /* ignore */ }
+      }
+    };
+  }, []);
+
   const logout = () => {
     setToken(null);
     setIsAuthenticated(false);
     localStorage.removeItem("jwtToken");
+    try {
+      void invoke("clear_auth_token");
+    } catch (_e) {
+      // ignore
+    }
     navigate("/signin");
   };
 

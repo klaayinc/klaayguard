@@ -26,7 +26,7 @@
   },
   "bundle": {
     "active": true,
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": "all",
     "resources": ["vendor/licenses/*", "resources/*"],
     "externalBin": ["vendor/osqueryi"],

@@ -12,13 +12,45 @@
 //! - Background operation ensures continuous monitoring
 //! - System tray provides controlled access to app functionality
 
-use serde_json::Value;
-use std::{collections::HashMap, fs};
-use tauri::Manager;
+use serde_json::{json, Value};
+use std::{collections::HashMap, fs, sync::Arc, time::Duration};
+use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
+use tokio::sync::RwLock;
 
 // Re-introduced minimal osquery commands used by the UI.
+
+/// Shared application state for background operations
+pub struct AppState {
+    pub auth_token: RwLock<Option<String>>,
+    pub api_base_url: RwLock<String>,
+    pub last_run_at: RwLock<Option<std::time::Instant>>,
+}
+
+#[tauri::command]
+async fn set_api_base_url(
+    state: tauri::State<'_, Arc<AppState>>,
+    base: String,
+) -> Result<(), String> {
+    *state.api_base_url.write().await = base;
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_auth_token(
+    state: tauri::State<'_, Arc<AppState>>,
+    token: String,
+) -> Result<(), String> {
+    *state.auth_token.write().await = Some(token);
+    Ok(())
+}
+
+#[tauri::command]
+async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    *state.auth_token.write().await = None;
+    Ok(())
+}
 
 #[tauri::command]
 async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
@@ -79,6 +111,136 @@ async fn execute_query(
     }
 
     Ok(all_results)
+}
+
+async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+    *state.auth_token.write().await = None;
+    let _ = app.emit("auth:invalidated", ());
+    Ok(())
+}
+
+async fn run_cycle(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let token = match state.auth_token.read().await.clone() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let base = state.api_base_url.read().await.clone();
+
+    // 1) GET /klaayguard/config
+    let cfg_resp = client
+        .get(format!("{}/klaayguard/config", base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        invalidate_auth(app, state).await?;
+        return Ok(());
+    }
+    if !cfg_resp.status().is_success() {
+        return Ok(());
+    }
+
+    let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
+    let tables: Vec<String> = cfg_json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    item.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if tables.is_empty() {
+        return Ok(());
+    }
+
+    // 2) osquery
+    let results = execute_query(app.clone(), tables).await?;
+
+    // 3) device uuid
+    let device_uuid = get_device_uuid(app.clone())
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    // 4) format payload like UI
+    let mut formatted: Vec<Value> = Vec::new();
+    for (table_name, entries) in results {
+        if let Some(arr) = entries.as_array() {
+            for entry in arr {
+                formatted.push(json!({
+                    "type": table_name,
+                    "attributes": entry
+                }));
+            }
+        }
+    }
+
+    let body = json!({
+        "device_uuid": device_uuid,
+        "data": formatted
+    });
+
+    // POST /klaayguard/data
+    let post_resp = client
+        .post(format!("{}/klaayguard/data", base))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if post_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        invalidate_auth(app, state).await?;
+        return Ok(());
+    }
+
+    if post_resp.status().is_success() {
+        *state.last_run_at.write().await = Some(std::time::Instant::now());
+    }
+
+    Ok(())
+}
+
+fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        let client = reqwest::Client::builder()
+            .user_agent("klaayguard/0.1")
+            .build()
+            .expect("reqwest client");
+
+        // wait for token once
+        loop {
+            if state.auth_token.read().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+
+        // run immediately
+        if let Err(e) = run_cycle(&app, &state, &client).await {
+            eprintln!("initial cycle error: {}", e);
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = run_cycle(&app, &state, &client).await {
+                eprintln!("cycle error: {}", e);
+            }
+        }
+    });
 }
 
 /// Installs a launch agent for automatic startup on macOS.
@@ -189,7 +351,16 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 /// - Automatic updates ensure latest security patches
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let api_base =
+        std::env::var("KLAAY_API_BASE_URL").unwrap_or_else(|_| "https://api.klaay.dev".to_string());
+    let state = Arc::new(AppState {
+        auth_token: RwLock::new(None),
+        api_base_url: RwLock::new(api_base),
+        last_run_at: RwLock::new(None),
+    });
+
     let app = tauri::Builder::default()
+        .manage(state.clone())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -321,10 +492,21 @@ pub fn run() {
                     log::error!("Failed to create system tray icon: {}", e);
                     e
                 })?;
+            // Spawn background monitoring loop
+            let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
+            let app_handle = app.handle().clone();
+            spawn_background_loop(app_handle, state_for_loop);
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![execute_query, get_device_uuid])
+        .invoke_handler(tauri::generate_handler![
+            execute_query,
+            get_device_uuid,
+            save_auth_token,
+            clear_auth_token,
+            set_api_base_url
+        ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");
 
