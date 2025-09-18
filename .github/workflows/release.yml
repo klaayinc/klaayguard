@@ -51,7 +51,7 @@ jobs:
       fail-fast: false
       matrix:
         build: [development, staging, production]
-        platform: [macos-arm, macos-x64]
+        platform: [macos-arm, macos-x64, ubuntu]
         include:
           - platform: macos-arm # for Arm based macs (M1 and above).
             runner: macos-latest
@@ -59,6 +59,9 @@ jobs:
           - platform: macos-x64 # for Intel based macs.
             runner: macos-latest
             args: "--target x86_64-apple-darwin"
+          - platform: ubuntu
+            runner: ubuntu-22.04
+            args: ""
 
           - build: development
             api_url: "http://localhost:3000"
@@ -67,12 +70,10 @@ jobs:
           - build: production
             api_url: "https://api.klaay.com"
 
-          # - platform: ubuntu # for Tauri v1 you could replace this with ubuntu-20.04.
-          #   runner: ubuntu-22.04
-          #   args: ""
           # - platform: windows
           #   runner: windows-latest
           #   args: ""
+          #
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 480
@@ -142,7 +143,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          yarn tauri build ${{ matrix.args }}
+          if [ "${{ matrix.platform }}" = "ubuntu" ]; then
+            # Build Linux bundles (defaults cover .AppImage/.deb/.rpm via bundle.targets=all)
+            yarn tauri build ${{ matrix.args }}
+          else
+            yarn tauri build ${{ matrix.args }}
+          fi
 
       - name: Rename and upload artifacts to single release
         env:
@@ -194,6 +200,35 @@ jobs:
               cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
               uploaded+=("$RENAMED_TGZ")
               echo "Added to upload: $RENAMED_TGZ"
+            fi
+          fi
+
+          if [ "${{ matrix.platform }}" = "ubuntu" ]; then
+            echo "Looking for Linux artifacts (.AppImage/.deb/.rpm)"
+            BASE_DIR="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
+            # AppImage
+            APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1 || true)
+            if [ -n "${APPIMAGE:-}" ]; then
+              RENAMED_APPIMAGE="KlaayGuard_${VERSION}_x86_64_${{ matrix.build }}.AppImage"
+              cp "$APPIMAGE" "$RENAMED_APPIMAGE"
+              uploaded+=("$RENAMED_APPIMAGE")
+              echo "Added to upload: $RENAMED_APPIMAGE"
+            fi
+            # deb
+            DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
+            if [ -n "${DEB:-}" ]; then
+              RENAMED_DEB="KlaayGuard_${VERSION}_x86_64_${{ matrix.build }}.deb"
+              cp "$DEB" "$RENAMED_DEB"
+              uploaded+=("$RENAMED_DEB")
+              echo "Added to upload: $RENAMED_DEB"
+            fi
+            # rpm
+            RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
+            if [ -n "${RPM:-}" ]; then
+              RENAMED_RPM="KlaayGuard_${VERSION}_x86_64_${{ matrix.build }}.rpm"
+              cp "$RPM" "$RENAMED_RPM"
+              uploaded+=("$RENAMED_RPM")
+              echo "Added to upload: $RENAMED_RPM"
             fi
           fi
 
