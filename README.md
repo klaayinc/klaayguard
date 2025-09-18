@@ -221,29 +221,26 @@ The CI/CD pipeline automatically:
 
 ## 🚀 Automatic Startup on macOS
 
-KlaayGuard automatically configures itself to start on macOS login using the Tauri autostart plugin. This ensures continuous security monitoring without any manual configuration required.
+KlaayGuard configures itself to start at login using a macOS LaunchAgent and is kept running with `KeepAlive`.
 
 ### Automatic Configuration
 
-- **No Setup Required**: The app automatically enables autostart when first run
-- **Always Active**: Auto-start cannot be disabled - this ensures continuous security monitoring
-- **Tauri Plugin**: Uses the official Tauri autostart plugin for reliable operation
+- **No Setup Required**: The app installs a LaunchAgent on first run
+- **Always Active**: Auto-start cannot be disabled to ensure continuous monitoring
 - **User-Level Service**: Runs when the user is logged in (not system-wide)
 
 ### How It Works
 
-- **Plugin-Based**: Uses `tauri-plugin-autostart` for cross-platform autostart functionality
-- **Launch Agent**: Automatically creates and manages macOS launch agent
-- **Background Mode**: App starts in background with system tray access
-- **Keep Alive**: Launch agent ensures the app restarts if it crashes
-- **Automatic Updates**: Launch agent updates automatically when app is updated
+- **LaunchAgent**: A reverse-DNS label `com.klaay.klaayguard` is installed at `~/Library/LaunchAgents/com.klaay.klaayguard.plist`
+- **KeepAlive**: Launchd restarts the app automatically if it exits
+- **Background Mode**: The window close action hides the app instead of quitting
+- **Automatic Updates**: After updates, the app restarts itself to apply changes
 
 ### Security Benefits
 
 - **Continuous Monitoring**: Ensures security monitoring is always active
 - **No User Intervention**: Prevents accidental disabling of security features
-- **Reliable Operation**: Uses Tauri's proven autostart plugin for robust background operation
-- **Framework Integration**: Leverages Tauri's built-in capabilities instead of manual shell commands
+- **OS-Native Reliability**: Uses launchd for robust background operation
 
 ## 📦 Docker Build (Alternative)
 

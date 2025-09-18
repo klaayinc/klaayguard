@@ -310,16 +310,20 @@ async fn install_launch_agent() -> Result<String, String> {
     {
         let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
         let launch_agents_dir = home_dir.join("Library/LaunchAgents");
-        let plist_path = launch_agents_dir.join("KlaayGuard.plist");
+        let label = "com.klaay.klaayguard";
+        let plist_path = launch_agents_dir.join(format!("{}.plist", label));
 
-        // Check if launch agent is already loaded
+        // Determine user launchctl domain
+        let uid = nix::unistd::getuid().as_raw();
+        let domain = format!("gui/{}", uid);
+
+        // Check if launch agent is already loaded using modern launchctl
         let output = std::process::Command::new("launchctl")
-            .args(&["list", "KlaayGuard"])
+            .args(&["print", &format!("{}/{}", domain, label)])
             .output()
             .map_err(|e| format!("Failed to check launch agent status: {}", e))?;
 
         if output.status.success() {
-            // Launch agent is already loaded, no need to install again
             return Ok("Launch agent already installed and running".to_string());
         }
 
@@ -327,33 +331,62 @@ async fn install_launch_agent() -> Result<String, String> {
         fs::create_dir_all(&launch_agents_dir)
             .map_err(|e| format!("Failed to create LaunchAgents directory: {}", e))?;
 
-        // Get the current executable path
+        // Clean up legacy label/file if present
+        let legacy_plist = launch_agents_dir.join("KlaayGuard.plist");
+        if legacy_plist.exists() {
+            let _ = std::process::Command::new("launchctl")
+                .args(&["bootout", &format!("{}/{}", domain, "KlaayGuard")])
+                .output();
+            let _ = fs::remove_file(&legacy_plist);
+        }
+
+        // Get the current executable path (used as fallback when the app is not installed in /Applications)
         let current_exe = std::env::current_exe()
             .map_err(|e| format!("Failed to get current executable path: {}", e))?;
 
-        // Read the plist template and replace the executable path
-        let plist_content = include_str!("../resources/com.klaay.app.plist");
-        let plist_content = plist_content.replace(
-            "/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard",
-            &current_exe.to_string_lossy(),
-        );
+        // Determine preferred executable path: prefer installed app in /Applications
+        let installed_path =
+            std::path::Path::new("/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard");
+        let preferred_exec = if installed_path.exists() {
+            installed_path.to_path_buf()
+        } else {
+            current_exe.clone()
+        };
+
+        // Read the plist template and replace placeholders
+        let plist_content = include_str!("../resources/com.klaay.klaayguard.plist");
+        let plist_content = plist_content
+            .replace("__LABEL__", label)
+            .replace("__EXECUTABLE__", &preferred_exec.to_string_lossy());
 
         // Write the plist file
         fs::write(&plist_path, plist_content)
             .map_err(|e| format!("Failed to write plist file: {}", e))?;
 
-        // Load the launch agent
+        // Bootstrap (load) the launch agent using modern launchctl domain
         let output = std::process::Command::new("launchctl")
-            .args(&["load", plist_path.to_str().unwrap()])
+            .args(&["bootstrap", &domain, plist_path.to_str().unwrap()])
             .output()
-            .map_err(|e| format!("Failed to load launch agent: {}", e))?;
+            .map_err(|e| format!("Failed to bootstrap launch agent: {}", e))?;
 
+        // If already bootstrapped, continue; else require success
         if !output.status.success() {
-            return Err(format!(
-                "Failed to load launch agent: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Error code 9 or message indicating already bootstrapped can be ignored
+            if !stderr.contains("EEXIST") && !stderr.contains("already loaded") {
+                return Err(format!("Failed to bootstrap launch agent: {}", stderr));
+            }
         }
+
+        // Enable the service
+        let _ = std::process::Command::new("launchctl")
+            .args(&["enable", &format!("{}/{}", domain, label)])
+            .output();
+
+        // Kickstart the service immediately
+        let _ = std::process::Command::new("launchctl")
+            .args(&["kickstart", "-k", &format!("{}/{}", domain, label)])
+            .output();
 
         Ok("Launch agent installed successfully".to_string())
     }
@@ -435,19 +468,21 @@ pub fn run() {
             // Check if we're already running as a regular process to prevent duplicates
             #[cfg(target_os = "macos")]
             {
+                let current_pid = std::process::id();
                 let output = std::process::Command::new("pgrep")
                     .args(&["-f", "KlaayGuard"])
                     .output();
 
                 if let Ok(output) = output {
                     if output.status.success() {
-                        let pid_count = String::from_utf8_lossy(&output.stdout)
+                        let other_count = String::from_utf8_lossy(&output.stdout)
                             .lines()
-                            .filter(|line| !line.trim().is_empty())
+                            .filter_map(|line| line.trim().parse::<u32>().ok())
+                            .filter(|pid| *pid != current_pid)
                             .count();
 
-                        // If there's already a KlaayGuard process running, exit this instance
-                        if pid_count > 0 {
+                        // If another KlaayGuard process is running (excluding this one), exit this instance
+                        if other_count > 0 {
                             std::process::exit(0);
                         }
                     }
