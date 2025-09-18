@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    KlaayGuard_lib::run()
+    klaay_guard_lib::run()
 }
