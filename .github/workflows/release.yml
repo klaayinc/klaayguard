@@ -55,7 +55,7 @@ jobs:
         include:
           - platform: macos-arm # for Arm based macs (M1 and above).
             runner: macos-latest
-            args: "--target aarch64-apple-darwin --bundles app"
+            args: "--target aarch64-apple-darwin --bundles dmg"
           - platform: macos-x64 # for Intel based macs.
             runner: macos-latest
             args: "--target x86_64-apple-darwin"
@@ -154,29 +154,33 @@ jobs:
 
           uploaded=()
 
+          # Debug: Show what files are available
+          echo "Available files in target directory:"
+          find src-tauri/target -type f \( -name "*.dmg" -o -name "*.app" -o -name "*.tar.gz" -o -name "*.sig" \) | head -20
+
           if [ "${{ matrix.platform }}" = "macos-x64" ]; then
             # DMG for x64
-            DMG_PATH=$(find src-tauri/target -type f -name "KlaayGuard_*_x64.dmg" | head -n1)
+            echo "Looking for x86_64 DMG files..."
+            DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -type f -name "KlaayGuard_*_x86_64.dmg" | head -n1)
+            echo "Found DMG: ${DMG_PATH:-'None'}"
             if [ -n "${DMG_PATH:-}" ]; then
               RENAMED_DMG="KlaayGuard_${VERSION}_x64_${{ matrix.build }}.dmg"
               cp "$DMG_PATH" "$RENAMED_DMG"
               uploaded+=("$RENAMED_DMG")
+              echo "Added to upload: $RENAMED_DMG"
             fi
           fi
 
           if [ "${{ matrix.platform }}" = "macos-arm" ]; then
-            # aarch64 .app.tar.gz and signature
-            APP_TGZ_PATH=$(find src-tauri/target -type f -name "KlaayGuard.app.tar.gz" | head -n1)
-            SIG_PATH=$(find src-tauri/target -type f -name "KlaayGuard.app.tar.gz.sig" | head -n1)
-            if [ -n "${APP_TGZ_PATH:-}" ]; then
-              RENAMED_TGZ="KlaayGuard_aarch64.${{ matrix.build }}.app.tar.gz"
-              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
-              uploaded+=("$RENAMED_TGZ")
-            fi
-            if [ -n "${SIG_PATH:-}" ]; then
-              RENAMED_SIG="KlaayGuard_aarch64.${{ matrix.build }}.app.tar.gz.sig"
-              cp "$SIG_PATH" "$RENAMED_SIG"
-              uploaded+=("$RENAMED_SIG")
+            # aarch64 DMG files
+            echo "Looking for aarch64 DMG files..."
+            DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -type f -name "KlaayGuard_*_aarch64.dmg" | head -n1)
+            echo "Found DMG: ${DMG_PATH:-'None'}"
+            if [ -n "${DMG_PATH:-}" ]; then
+              RENAMED_DMG="KlaayGuard_${VERSION}_aarch64_${{ matrix.build }}.dmg"
+              cp "$DMG_PATH" "$RENAMED_DMG"
+              uploaded+=("$RENAMED_DMG")
+              echo "Added to upload: $RENAMED_DMG"
             fi
           fi
 
