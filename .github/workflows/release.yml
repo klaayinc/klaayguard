@@ -55,7 +55,7 @@ jobs:
         include:
           - platform: macos-arm # for Arm based macs (M1 and above).
             runner: macos-latest
-            args: "--target aarch64-apple-darwin --bundles dmg"
+            args: "--target aarch64-apple-darwin --bundles app"
           - platform: macos-x64 # for Intel based macs.
             runner: macos-latest
             args: "--target x86_64-apple-darwin"
@@ -172,15 +172,15 @@ jobs:
           fi
 
           if [ "${{ matrix.platform }}" = "macos-arm" ]; then
-            # aarch64 DMG files
-            echo "Looking for aarch64 DMG files..."
-            DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -type f -name "KlaayGuard_*_aarch64.dmg" | head -n1)
-            echo "Found DMG: ${DMG_PATH:-'None'}"
-            if [ -n "${DMG_PATH:-}" ]; then
-              RENAMED_DMG="KlaayGuard_${VERSION}_aarch64_${{ matrix.build }}.dmg"
-              cp "$DMG_PATH" "$RENAMED_DMG"
-              uploaded+=("$RENAMED_DMG")
-              echo "Added to upload: $RENAMED_DMG"
+            # aarch64 .app.tar.gz files
+            echo "Looking for aarch64 .app.tar.gz files..."
+            APP_TGZ_PATH=$(find src-tauri/target -type f -name "KlaayGuard.app.tar.gz" | head -n1)
+            echo "Found .app.tar.gz: ${APP_TGZ_PATH:-'None'}"
+            if [ -n "${APP_TGZ_PATH:-}" ]; then
+              RENAMED_TGZ="KlaayGuard_${VERSION}_aarch64_${{ matrix.build }}.app.tar.gz"
+              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
+              uploaded+=("$RENAMED_TGZ")
+              echo "Added to upload: $RENAMED_TGZ"
             fi
           fi
 
