@@ -172,13 +172,13 @@ jobs:
           fi
 
           if [ "${{ matrix.platform }}" = "macos-arm" ]; then
-            # aarch64 .app bundles - create .tar.gz from .app
-            echo "Looking for aarch64 .app bundles..."
-            APP_PATH=$(find src-tauri/target/aarch64-apple-darwin -type d -name "KlaayGuard.app" | head -n1)
-            echo "Found .app: ${APP_PATH:-'None'}"
-            if [ -n "${APP_PATH:-}" ]; then
+            # aarch64 .app.tar.gz files (automatically created by Tauri)
+            echo "Looking for aarch64 .app.tar.gz files..."
+            APP_TGZ_PATH=$(find src-tauri/target/aarch64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1)
+            echo "Found .app.tar.gz: ${APP_TGZ_PATH:-'None'}"
+            if [ -n "${APP_TGZ_PATH:-}" ]; then
               RENAMED_TGZ="KlaayGuard_${VERSION}_aarch64_${{ matrix.build }}.app.tar.gz"
-              tar -czf "$RENAMED_TGZ" -C "$(dirname "$APP_PATH")" "$(basename "$APP_PATH")"
+              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
               uploaded+=("$RENAMED_TGZ")
               echo "Added to upload: $RENAMED_TGZ"
             fi
