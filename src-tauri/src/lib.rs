@@ -26,6 +26,7 @@ pub struct AppState {
     pub auth_token: RwLock<Option<String>>,
     pub api_base_url: RwLock<String>,
     pub last_run_at: RwLock<Option<std::time::Instant>>,
+    pub last_attempt_at: RwLock<Option<std::time::Instant>>,
 }
 
 #[tauri::command]
@@ -50,6 +51,29 @@ async fn save_auth_token(
 async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     *state.auth_token.write().await = None;
     Ok(())
+}
+
+/// Returns seconds until next scheduled run (900s interval).
+/// -1 indicates not signed in (no token yet). 0 means due now or overdue.
+#[tauri::command]
+async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Result<i64, String> {
+    if state.auth_token.read().await.is_none() {
+        return Ok(-1);
+    }
+    // Use last attempt time so countdown advances even if last run failed
+    let last = *state.last_attempt_at.read().await;
+    let interval = std::time::Duration::from_secs(15 * 60);
+    if let Some(last) = last {
+        let elapsed = last.elapsed();
+        if elapsed >= interval {
+            Ok(0)
+        } else {
+            Ok((interval - elapsed).as_secs() as i64)
+        }
+    } else {
+        // first run should happen immediately after login/token
+        Ok(0)
+    }
 }
 
 #[tauri::command]
@@ -131,6 +155,10 @@ async fn run_cycle(
 
     let base = state.api_base_url.read().await.clone();
 
+    // Mark an attempt start and notify UI listeners
+    *state.last_attempt_at.write().await = Some(std::time::Instant::now());
+    let _ = app.emit("collection:attempt", ());
+
     // 1) GET /klaayguard/config
     let cfg_resp = client
         .get(format!("{}/klaayguard/config", base))
@@ -141,9 +169,20 @@ async fn run_cycle(
 
     if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         invalidate_auth(app, state).await?;
+        let _ = app.emit(
+            "collection:error",
+            json!({ "stage": "config", "status": 401 }),
+        );
         return Ok(());
     }
     if !cfg_resp.status().is_success() {
+        let _ = app.emit(
+            "collection:error",
+            json!({
+                "stage": "config",
+                "status": cfg_resp.status().as_u16()
+            }),
+        );
         return Ok(());
     }
 
@@ -163,6 +202,10 @@ async fn run_cycle(
         .unwrap_or_default();
 
     if tables.is_empty() {
+        let _ = app.emit(
+            "collection:error",
+            json!({ "stage": "config", "reason": "no_tables" }),
+        );
         return Ok(());
     }
 
@@ -203,11 +246,24 @@ async fn run_cycle(
 
     if post_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         invalidate_auth(app, state).await?;
+        let _ = app.emit(
+            "collection:error",
+            json!({ "stage": "post", "status": 401 }),
+        );
         return Ok(());
     }
 
     if post_resp.status().is_success() {
         *state.last_run_at.write().await = Some(std::time::Instant::now());
+        let _ = app.emit("collection:success", ());
+    } else {
+        let _ = app.emit(
+            "collection:error",
+            json!({
+                "stage": "post",
+                "status": post_resp.status().as_u16()
+            }),
+        );
     }
 
     Ok(())
@@ -357,6 +413,7 @@ pub fn run() {
         auth_token: RwLock::new(None),
         api_base_url: RwLock::new(api_base),
         last_run_at: RwLock::new(None),
+        last_attempt_at: RwLock::new(None),
     });
 
     let app = tauri::Builder::default()
@@ -505,7 +562,8 @@ pub fn run() {
             get_device_uuid,
             save_auth_token,
             clear_auth_token,
-            set_api_base_url
+            set_api_base_url,
+            get_next_run_in_seconds
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");

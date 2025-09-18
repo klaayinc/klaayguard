@@ -1,30 +1,42 @@
 import React, { useEffect, useState } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
+import { useAuth } from "../../context/AuthContext";
 // Removed Close button; no window API needed
-import Button from "../../components/ui/button/Button";
 import klaayLogo from "../../icons/KLAAY-LOGO-RGB_ICON.png";
+import { invoke } from "@tauri-apps/api/core";
 
 export const WelcomeScreen: React.FC = () => {
-  const navigate = useNavigate();
-  const location = useLocation();
-  const { accountName, accountId } = location.state || {};
-  const [deviceUUID, setDeviceUUID] = useState<string | null>(null);
+  const { userName } = useAuth();
+  const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
 
   useEffect(() => {
-    const getDeviceId = async () => {
+    const tick = async () => {
       try {
-      const uuid = "unknown";
-        setDeviceUUID(uuid as string);
-      } catch (error) {
-        console.error("Failed to get device UUID:", error);
+        const secs = await invoke<number>("get_next_run_in_seconds");
+        setSecondsLeft(secs);
+      } catch {
+        // ignore
       }
     };
-    getDeviceId();
+    // initial + interval
+    void tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => {
+      window.clearInterval(timer);
+    };
   }, []);
 
   // Close button removed
 
   // Data collection navigation removed; background collection runs in Rust
+
+  const formatCountdown = (secs: number | null) => {
+    if (secs === null) return "--:--";
+    if (secs < 0) return "Sign in required";
+    const s = Math.max(0, secs);
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m.toString().padStart(2, "0")}:${r.toString().padStart(2, "0")}`;
+  };
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-8 bg-[#0B223D]">
@@ -41,10 +53,10 @@ export const WelcomeScreen: React.FC = () => {
       {/* Main Content */}
       <div className="text-center mb-12">
         <h1 className="text-3xl font-bold text-white mb-4">
-          Hi {accountName || "User"}, Your KlaayGuard App is installed
+          Hi {userName || "User"}, Your KlaayGuard App is installed
         </h1>
         <p className="text-xl text-white">
-          Connection status: <span className="text-blue-300">Active</span>
+          Next collection in: <span className="text-blue-300">{formatCountdown(secondsLeft)}</span>
         </p>
       </div>
 

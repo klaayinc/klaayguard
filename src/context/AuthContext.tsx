@@ -1,3 +1,4 @@
+
 import React, { createContext, useState, useContext, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { jwtDecode } from "jwt-decode";
@@ -5,11 +6,13 @@ import { API_BASE_URL } from "../constants/api";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+
 type AuthContextType = {
   token: string | null;
   isAuthenticated: boolean;
   isAccountConfigRequired: boolean;
   error: string;
+  userName: string | null;
   checkAuthentication: () => void;
   authenticateUser: (
     username: string,
@@ -29,8 +32,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   const [error, setError] = useState<string>("");
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isAccountConfigRequired, setIsAccountConfigRequired] = useState(false);
+  const [userName, setUserName] = useState<string | null>(null);
 
   // No longer check first launch or handle osquery installation
+
+  const fetchUserNameFromMe = async (bearerToken: string): Promise<string | null> => {
+    try {
+      const resp = await fetch(`${API_BASE_URL}/me`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${bearerToken}` },
+      });
+      if (!resp.ok) return null;
+      const body = await resp.json();
+      const attrs = body?.data?.attributes ?? {};
+      const first = (attrs.first_name as string | undefined) || "";
+      const last = (attrs.last_name as string | undefined) || "";
+      const email = (attrs.email as string | undefined) || null;
+      const full = `${first} ${last}`.trim();
+      return full || email || null;
+    } catch {
+      return null;
+    }
+  };
 
   async function checkAuthentication() {
     try {
@@ -43,31 +66,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
       if (response.ok) {
         setIsAuthenticated(true);
+        try {
+          if (token) {
+            const name = await fetchUserNameFromMe(token);
+            if (name) setUserName(name);
+          }
+        } catch {}
+        setError("");
       } else {
         setIsAuthenticated(false);
+        setError("Authentication failed. Please check your credentials.");
       }
-    } catch (err) {
-      console.error("Error checking authentication:", err);
+    } catch (_err) {
       setIsAuthenticated(false);
+      setError("An error occurred during authentication.");
     }
   }
 
   const decodeTokenManually = (token: string) => {
     try {
       const payload = jwtDecode(token);
-      console.log(
-        "Decoded Payload:",
-        payload.iss,
-        payload.sub,
-        payload.aud,
-        payload.exp,
-        payload.nbf,
-        payload.iat,
-        payload.jti
-      );
       return payload;
-    } catch (error) {
-      console.error("Failed to decode JWT:", error);
+    } catch (_error) {
       return null;
     }
   };
@@ -122,20 +142,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
           localStorage.setItem("jwtToken", jwtToken);
           try {
             await invoke("save_auth_token", { token: jwtToken });
-          } catch (e) {
-            console.error("Failed to persist token to Rust state:", e);
-          }
+          } catch (_e) {}
         }
 
-        const user = responseData.included?.[0]?.attributes;
-        //
         const account = decodeTokenManually(jwtToken) as Record<string, unknown>;
-
-        console.log("Decoded Account:", account);
 
         if (!account?.account_id) {
           setIsAccountConfigRequired(true);
-          console.log("Not Found Account ID, Navigating to Account Setup");
           navigate("/account-setup", {
             state: {
               username: username,
@@ -147,16 +160,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
           navigate("/welcome");
         }
 
-        console.log("Authenticated User:", user);
-        console.log("Authenticated Account:", account);
+        // Resolve display name from /me endpoint
+        if (jwtToken) {
+          const name = await fetchUserNameFromMe(jwtToken);
+          setUserName(name ?? username);
+        } else {
+          setUserName(username);
+        }
 
         setIsAuthenticated(true);
         setError("");
       } else {
         setError("Authentication failed. Please check your credentials.");
       }
-    } catch (err) {
-      console.error("Error authenticating user:", err);
+    } catch (_err) {
       setError("An error occurred during authentication.");
     }
   }
@@ -167,34 +184,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
       const currentPath = window.location.pathname;
       try {
         await invoke("set_api_base_url", { base: API_BASE_URL });
-      } catch (e) {
-        console.error("Failed to set API base URL in Rust state:", e);
-      }
+      } catch (_e) {}
 
-      console.log("Account Config Required:", isAccountConfigRequired);
       if (savedToken) {
-        if (isAccountConfigRequired) {
-          console.log("savedToken", savedToken);
-          setToken(savedToken);
-          setIsAuthenticated(true);
-          try {
-            await invoke("save_auth_token", { token: savedToken });
-          } catch (e) {
-            console.error("Failed to sync saved token to Rust state:", e);
-          }
-          if (currentPath == "/signin") {
+        // Best-effort derive a display name from JWT if available
+        const decoded = ((): Record<string, unknown> | null => {
+          try { return decodeTokenManually(savedToken) as Record<string, unknown>; } catch { return null; }
+        })();
+        if (decoded) {
+          const n = (decoded as any)?.name || (decoded as any)?.email || null;
+          if (n) setUserName(String(n));
+        }
+
+        setToken(savedToken);
+        setIsAuthenticated(true);
+        try {
+          await invoke("save_auth_token", { token: savedToken });
+        } catch (_e) {}
+        try {
+          const name = await fetchUserNameFromMe(savedToken);
+          if (name) setUserName(name);
+        } catch {}
+
+        if (currentPath == "/signin") {
+          if (isAccountConfigRequired) {
             navigate("/account-setup");
-          }
-        } else {
-          console.log("savedToken", savedToken);
-          setToken(savedToken);
-          setIsAuthenticated(true);
-          try {
-            await invoke("save_auth_token", { token: savedToken });
-          } catch (e) {
-            console.error("Failed to sync saved token to Rust state:", e);
-          }
-          if (currentPath == "/signin") {
+          } else {
             navigate("/welcome");
           }
         }
@@ -213,17 +228,25 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         unlisten = await listen("auth:invalidated", () => {
           logout();
         });
-      } catch (e) {
-        console.error("Failed to bind auth:invalidated listener:", e);
-      }
+      } catch (_e) {}
     })();
 
     return () => {
       if (unlisten) {
-        try { unlisten(); } catch (_e) { /* ignore */ }
+        try { unlisten(); } catch (_e) {}
       }
     };
   }, []);
+
+  useEffect(() => {
+    (async () => {
+      if (!token) return;
+      try {
+        const name = await fetchUserNameFromMe(token);
+        if (name) setUserName(name);
+      } catch {}
+    })();
+  }, [token]);
 
   const logout = () => {
     setToken(null);
@@ -244,6 +267,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         isAuthenticated,
         isAccountConfigRequired,
         error,
+        userName,
         checkAuthentication,
         authenticateUser,
         logout,
