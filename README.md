@@ -10,7 +10,7 @@ KlaayGuard automatically:
 
 - Installs and manages osquery on Windows, macOS, and Linux
 - Collects system security data (processes, network connections, installed software, etc.)
-- Reports data to `https://api.klaay.dev` every 15 minutes
+- Reports data to your configured API every 15 minutes (defaults to `http://localhost:3000`)
 - Runs as a system tray application for background monitoring
 - Provides authentication and secure data transmission
 
@@ -63,10 +63,7 @@ cd klaayguard
 # Install dependencies
 yarn install
 
-# Create environment file
-echo "VITE_API_BASE_URL=https://api.klaay.dev" > .env
-
-# Run in development
+# Run in development (uses http://localhost:3000 by default)
 yarn tauri dev
 ```
 
@@ -130,10 +127,12 @@ klaayguard/
 
 ## 🔧 Configuration
 
-### Environment Variables
+### Environment Variables (optional)
+
+The app defaults to `http://localhost:3000`. To point to another API, set a Vite env at build/dev time (e.g. in a local `.env`):
 
 ```bash
-# .env file
+# optional .env
 VITE_API_BASE_URL=https://api.klaay.dev
 ```
 

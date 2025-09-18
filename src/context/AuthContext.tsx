@@ -2,7 +2,7 @@
 import React, { createContext, useState, useContext, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { jwtDecode } from "jwt-decode";
-import { API_BASE_URL } from "../constants/api";
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:3000";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -38,7 +38,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   const fetchUserNameFromMe = async (bearerToken: string): Promise<string | null> => {
     try {
-      const resp = await fetch(`${API_BASE_URL}/me`, {
+      const resp = await fetch(`${BASE_URL}/me`, {
         method: "GET",
         headers: { Authorization: `Bearer ${bearerToken}` },
       });
@@ -57,7 +57,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   async function checkAuthentication() {
     try {
-      const response = await fetch(`${API_BASE_URL}/me`, {
+      const response = await fetch(`${BASE_URL}/me`, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -125,7 +125,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
               },
             },
           };
-      const response = await fetch(`${API_BASE_URL}/authenticate`, {
+      const response = await fetch(`${BASE_URL}/authenticate`, {
         method: "POST",
         headers: {
           "Content-Type": "application/vnd.api+json",
@@ -183,7 +183,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
       const savedToken = localStorage.getItem("jwtToken");
       const currentPath = window.location.pathname;
       try {
-        await invoke("set_api_base_url", { base: API_BASE_URL });
+        await invoke("set_api_base_url", { base: BASE_URL });
       } catch (_e) {}
 
       if (savedToken) {

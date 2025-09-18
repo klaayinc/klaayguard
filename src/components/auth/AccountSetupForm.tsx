@@ -2,7 +2,7 @@ import React, { useEffect, useState } from "react";
 import { useAuth } from "../../context/AuthContext";
 import { notify } from "../../utils/utils";
 import { Location, useLocation, useNavigate } from "react-router-dom";
-import { API_BASE_URL } from "../../constants/api";
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:3000";
 
 interface Account {
   id: string;
@@ -42,7 +42,7 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
     const fetchAccounts = async () => {
       setLoading(true);
       try {
-        const res = await fetch(`${API_BASE_URL}/accounts`, {
+        const res = await fetch(`${BASE_URL}/accounts`, {
           method: "GET",
           headers: {
             Authorization: `Bearer ${token}`,
