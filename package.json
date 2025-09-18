@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "setup-osquery": "rake",
-    "tauri:build": "rake && tauri build",
+    "tauri:build": "rake && node scripts/tauri-build.cjs",
     "tauri:dev": "rake && tauri dev",
     "sync-version": "node scripts/sync-version.js",
     "version": "npm run sync-version"
