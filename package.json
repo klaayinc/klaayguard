@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "setup-osquery": "rake",
+    "tauri:build": "rake && tauri build",
+    "tauri:dev": "rake && tauri dev"
   },
   "dependencies": {
     "@fullcalendar/core": "^6.1.15",
