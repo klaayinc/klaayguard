@@ -158,7 +158,58 @@ yarn tauri build --release  # Build optimized release
 yarn tauri build --target x86_64-pc-windows-msvc
 yarn tauri build --target aarch64-apple-darwin
 yarn tauri build --target x86_64-unknown-linux-gnu
+
+# Version management
+yarn sync-version       # Sync version across all files
+yarn version            # Alias for sync-version
 ```
+
+## 📋 Version Management
+
+KlaayGuard uses a single source of truth for version management:
+
+### Single Source of Truth
+
+- **VERSION file**: Contains the canonical version number (e.g., `0.1.1`)
+- **Automatic sync**: All files are automatically synchronized when building
+- **No conflicts**: Eliminates version mismatches between package.json, tauri.conf.json, and Cargo.toml
+
+### How to Update Version
+
+1. **Edit VERSION file**:
+
+   ```bash
+   echo "0.1.2" > VERSION
+   ```
+
+2. **Sync across all files**:
+
+   ```bash
+   yarn sync-version
+   ```
+
+3. **Verify synchronization**:
+   ```bash
+   cat VERSION                    # Should show 0.1.2
+   node -p "require('./package.json').version"  # Should show 0.1.2
+   node -p "require('./src-tauri/tauri.conf.json').version"  # Should show 0.1.2
+   grep '^version =' src-tauri/Cargo.toml  # Should show version = "0.1.2"
+   ```
+
+### Files Updated by sync-version
+
+- `package.json` - Node.js package version
+- `src-tauri/tauri.conf.json` - Tauri application version
+- `src-tauri/Cargo.toml` - Rust crate version
+
+### GitHub Actions Integration
+
+The CI/CD pipeline automatically:
+
+- Reads version from VERSION file
+- Syncs versions before building
+- Uses consistent versioning for all artifacts
+- Creates properly named release assets
 
 ## 🔒 Security Features
 

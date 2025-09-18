@@ -26,7 +26,7 @@ jobs:
       - name: Compute version and tag
         id: set_tag
         run: |
-          VERSION=$(node -p "require('./package.json').version")
+          VERSION=$(cat VERSION)
           TAG="app-v${VERSION}"
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
@@ -104,6 +104,9 @@ jobs:
       - name: Setup osquery binaries
         run: yarn setup-osquery
 
+      - name: Sync version across all files
+        run: yarn sync-version
+
       - name: (Mac) Import Apple Developer Certificate
         if: ${{ matrix.runner == 'macos-latest' }}
         env:
@@ -147,7 +150,7 @@ jobs:
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           set -euo pipefail
-          VERSION=$(node -p "require('./package.json').version")
+          VERSION=$(cat VERSION)
 
           # Authenticate gh (uses GITHUB_TOKEN)
           echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
@@ -161,13 +164,23 @@ jobs:
           if [ "${{ matrix.platform }}" = "macos-x64" ]; then
             # DMG for x64
             echo "Looking for x86_64 DMG files..."
-            DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -type f -name "KlaayGuard_*_x86_64.dmg" | head -n1)
-            echo "Found DMG: ${DMG_PATH:-'None'}"
+            echo "Searching in: src-tauri/target/x86_64-apple-darwin"
+            echo "All DMG files in target:"
+            find src-tauri/target/x86_64-apple-darwin -name "*.dmg" -type f || echo "No DMG files found"
+            
+            DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -type f -name "KlaayGuard_*.dmg" | head -n1)
+            echo "Found DMG: '${DMG_PATH:-None}'"
+            
             if [ -n "${DMG_PATH:-}" ]; then
               RENAMED_DMG="KlaayGuard_${VERSION}_x64_${{ matrix.build }}.dmg"
               cp "$DMG_PATH" "$RENAMED_DMG"
               uploaded+=("$RENAMED_DMG")
               echo "Added to upload: $RENAMED_DMG"
+            else
+              echo "No DMG file found with pattern 'KlaayGuard_*.dmg'"
+              echo "Trying alternative patterns:"
+              find src-tauri/target/x86_64-apple-darwin -name "*KlaayGuard*.dmg" -type f || echo "No files with *KlaayGuard*.dmg"
+              find src-tauri/target/x86_64-apple-darwin -name "*.dmg" -type f || echo "No .dmg files at all"
             fi
           fi
 

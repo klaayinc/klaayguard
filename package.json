@@ -10,7 +10,9 @@
     "tauri": "tauri",
     "setup-osquery": "rake",
     "tauri:build": "rake && tauri build",
-    "tauri:dev": "rake && tauri dev"
+    "tauri:dev": "rake && tauri dev",
+    "sync-version": "node scripts/sync-version.js",
+    "version": "npm run sync-version"
   },
   "dependencies": {
     "@fullcalendar/core": "^6.1.15",
