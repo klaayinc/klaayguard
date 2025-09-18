@@ -18,8 +18,8 @@ OSQUERY_VERSION = "5.18.1"
 TARBALL_FILE = "osqueryd-macos-bare-#{OSQUERY_VERSION}.tar.gz"
 TARBALL_PATH = File.join(DIR_TMP, TARBALL_FILE)
 
-# Linux binary (x86_64 GNU)
-LINUX_TARBALL_FILE = "osqueryd-linux-bare-#{OSQUERY_VERSION}.tar.gz"
+# Linux binary (x86_64 GNU). Verified via GitHub API for 5.18.1.
+LINUX_TARBALL_FILE = "osquery-#{OSQUERY_VERSION}_1.linux_x86_64.tar.gz"
 LINUX_TARBALL_PATH = File.join(DIR_TMP, LINUX_TARBALL_FILE)
 
 file TARBALL_PATH => [DIR_TMP] do
@@ -45,10 +45,18 @@ end
 
 file OSQUERYD_LINUX_PATH => [LINUX_TARBALL_PATH] do
     log "Extracting linux tarball.."
-    # Extract into a separate filename to avoid clobbering macOS binary when running both
+    # Extract into tmp; tarball contains usr/bin/osqueryd and opt/osquery/bin/osqueryd
     sh "tar -xvzf #{LINUX_TARBALL_PATH} -C #{DIR_TMP}"
-    # The extracted binary is named osqueryd; duplicate to dedicated filename for task dependency clarity
-    sh "cp #{File.join(DIR_TMP, 'osqueryd')} #{OSQUERYD_LINUX_PATH}"
+    linux_usr_bin = File.join(DIR_TMP, "usr", "bin", "osqueryd")
+    linux_opt_bin = File.join(DIR_TMP, "opt", "osquery", "bin", "osqueryd")
+    source_bin = if File.exist?(linux_usr_bin)
+        linux_usr_bin
+    elsif File.exist?(linux_opt_bin)
+        linux_opt_bin
+    else
+        raise "osqueryd not found after extracting linux tarball"
+    end
+    sh "cp #{source_bin} #{OSQUERYD_LINUX_PATH}"
     sh "chmod +x #{OSQUERYD_LINUX_PATH}"
 end
 
