@@ -206,7 +206,7 @@ jobs:
 
           if [ "${{ matrix.platform }}" = "ubuntu" ]; then
             echo "Looking for Linux artifacts (.AppImage/.deb/.rpm)"
-            BASE_DIR="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
+            BASE_DIR="src-tauri/target/release/bundle"
             # AppImage
             APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1 || true)
             if [ -n "${APPIMAGE:-}" ]; then
