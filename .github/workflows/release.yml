@@ -136,6 +136,7 @@ jobs:
       - name: Build Tauri
         env:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
+          VITE_EARTHENWARE_URL: https://app.klaay.dev
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}

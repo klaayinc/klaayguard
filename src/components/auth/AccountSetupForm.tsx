@@ -2,7 +2,10 @@ import React, { useEffect, useState } from "react";
 import { useAuth } from "../../context/AuthContext";
 import { notify } from "../../utils/utils";
 import { Location, useLocation, useNavigate } from "react-router-dom";
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:3000";
+const BASE_URL = import.meta.env.VITE_API_BASE_URL as string;
+if (!BASE_URL) {
+  throw new Error("VITE_API_BASE_URL is required");
+}
 
 interface Account {
   id: string;

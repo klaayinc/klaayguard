@@ -63,7 +63,7 @@ cd klaayguard
 # Install dependencies
 yarn install
 
-# Run in development (uses http://localhost:3000 by default)
+# Run in development (uses http://localhost:3000 by default; CI overrides with env)
 yarn tauri dev
 ```
 
@@ -127,13 +127,14 @@ klaayguard/
 
 ## 🔧 Configuration
 
-### Environment Variables (optional)
+### Environment Variables (required)
 
-The app defaults to `http://localhost:3000`. To point to another API, set a Vite env at build/dev time (e.g. in a local `.env`):
+The app does not hardcode endpoint fallbacks. Provide these envs at build/dev time. CI sets them for releases via matrix and workflow env.
 
 ```bash
-# optional .env
-VITE_API_BASE_URL=https://api.klaay.dev
+# .env for local development
+VITE_API_BASE_URL=http://localhost:3000
+VITE_EARTHENWARE_URL=http://localhost:5173
 ```
 
 ### API Endpoints

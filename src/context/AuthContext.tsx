@@ -2,7 +2,10 @@
 import React, { createContext, useState, useContext, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { jwtDecode } from "jwt-decode";
-const BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:3000";
+const BASE_URL = import.meta.env.VITE_API_BASE_URL as string;
+if (!BASE_URL) {
+  throw new Error("VITE_API_BASE_URL is required");
+}
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -77,7 +80,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         setIsAuthenticated(false);
         setError("Authentication failed. Please check your credentials.");
       }
-    } catch (_err) {
+    } catch {
       setIsAuthenticated(false);
       setError("An error occurred during authentication.");
     }
@@ -87,7 +90,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     try {
       const payload = jwtDecode(token);
       return payload;
-    } catch (_error) {
+    } catch {
       return null;
     }
   };
@@ -140,9 +143,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         if (jwtToken) {
           setToken(jwtToken);
           localStorage.setItem("jwtToken", jwtToken);
-          try {
-            await invoke("save_auth_token", { token: jwtToken });
-          } catch (_e) {}
+          void invoke("save_auth_token", { token: jwtToken }).catch(() => {});
         }
 
         const account = decodeTokenManually(jwtToken) as Record<string, unknown>;
@@ -173,7 +174,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
       } else {
         setError("Authentication failed. Please check your credentials.");
       }
-    } catch (_err) {
+    } catch {
       setError("An error occurred during authentication.");
     }
   }
@@ -182,9 +183,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     const initializeApp = async () => {
       const savedToken = localStorage.getItem("jwtToken");
       const currentPath = window.location.pathname;
-      try {
-        await invoke("set_api_base_url", { base: BASE_URL });
-      } catch (_e) {}
+      void invoke("set_api_base_url", { base: BASE_URL }).catch(() => {});
 
       if (savedToken) {
         // Best-effort derive a display name from JWT if available
@@ -192,15 +191,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
           try { return decodeTokenManually(savedToken) as Record<string, unknown>; } catch { return null; }
         })();
         if (decoded) {
-          const n = (decoded as any)?.name || (decoded as any)?.email || null;
+          const nameCandidate = (decoded as Record<string, unknown>)?.name as string | undefined;
+          const emailCandidate = (decoded as Record<string, unknown>)?.email as string | undefined;
+          const n = nameCandidate || emailCandidate || null;
           if (n) setUserName(String(n));
         }
 
         setToken(savedToken);
         setIsAuthenticated(true);
-        try {
-          await invoke("save_auth_token", { token: savedToken });
-        } catch (_e) {}
+        void invoke("save_auth_token", { token: savedToken }).catch(() => {});
         try {
           const name = await fetchUserNameFromMe(savedToken);
           if (name) setUserName(name);
@@ -230,16 +229,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         setIsAuthenticated(true);
         
         // Save token to Tauri backend
-        try {
-          invoke("save_auth_token", { token: newToken });
-        } catch (_e) {}
+        void invoke("save_auth_token", { token: newToken }).catch(() => {});
         
         // Fetch user name
-        try {
-          fetchUserNameFromMe(newToken).then(name => {
-            if (name) setUserName(name);
-          });
-        } catch {}
+        void fetchUserNameFromMe(newToken).then(name => {
+          if (name) setUserName(name);
+        });
         
         // Navigate to welcome screen
         navigate("/welcome");
@@ -257,12 +252,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         unlisten = await listen("auth:invalidated", () => {
           logout();
         });
-      } catch (_e) {}
+      } catch {
+        // ignore
+      }
     })();
 
     return () => {
       if (unlisten) {
-        try { unlisten(); } catch (_e) {}
+        try { unlisten(); } catch { /* noop */ }
       }
     };
   }, []);

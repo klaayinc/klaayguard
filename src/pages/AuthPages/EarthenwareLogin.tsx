@@ -2,7 +2,10 @@ import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 
-const EARTHENWARE_URL = "http://localhost:5173";
+const EARTHENWARE_URL = import.meta.env.VITE_EARTHENWARE_URL as string;
+if (!EARTHENWARE_URL) {
+  throw new Error("VITE_EARTHENWARE_URL is required");
+}
 
 export default function EarthenwareLogin() {
   const navigate = useNavigate();
