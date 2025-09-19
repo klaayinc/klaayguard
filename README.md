@@ -135,6 +135,9 @@ The app does not hardcode endpoint fallbacks. Provide these envs at build/dev ti
 # .env for local development
 VITE_API_BASE_URL=http://localhost:3000
 VITE_EARTHENWARE_URL=http://localhost:5173
+
+# Sentry Configuration (optional but recommended)
+VITE_SENTRY_DSN=your_sentry_dsn_here
 ```
 
 ### API Endpoints
@@ -219,6 +222,24 @@ The CI/CD pipeline automatically:
 - **Auto-Start**: Automatic startup on macOS login (mandatory)
 - **Data Encryption**: HTTPS transmission to API
 - **Cross-platform**: Consistent security monitoring across platforms
+
+## 📊 Error Monitoring
+
+KlaayGuard includes comprehensive error monitoring and performance tracking using Sentry.io:
+
+- **Frontend Monitoring**: React application errors and performance
+- **Backend Monitoring**: Rust application errors and system issues
+- **Real-time Alerts**: Immediate notification of critical errors
+- **Release Tracking**: Monitor error rates by application version
+- **Performance Insights**: Track application performance metrics
+
+### Setup Error Monitoring
+
+1. **Create Sentry Project**: Sign up at [sentry.io](https://sentry.io) and create a new project
+2. **Configure DSN**: Add your Sentry DSN to environment variables
+3. **Deploy**: Errors will be automatically tracked in production
+
+For detailed setup instructions, see [docs/SENTRY_SETUP.md](docs/SENTRY_SETUP.md).
 
 ## 🚀 Automatic Startup on macOS
 

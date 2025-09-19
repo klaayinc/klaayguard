@@ -6,6 +6,10 @@ import "simplebar-react/dist/simplebar.min.css";
 import App from "./App.tsx";
 import { AppWrapper } from "./components/common/PageMeta.tsx";
 import { ThemeProvider } from "./context/ThemeContext.tsx";
+import { initSentry } from "./sentry.ts";
+
+// Initialize Sentry before rendering the app
+initSentry();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
