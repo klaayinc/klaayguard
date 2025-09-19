@@ -221,6 +221,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     initializeApp();
   }, []);
 
+  // Listen for storage changes to handle token updates from iframe
+  useEffect(() => {
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === "jwtToken" && e.newValue) {
+        const newToken = e.newValue;
+        setToken(newToken);
+        setIsAuthenticated(true);
+        
+        // Save token to Tauri backend
+        try {
+          invoke("save_auth_token", { token: newToken });
+        } catch (_e) {}
+        
+        // Fetch user name
+        try {
+          fetchUserNameFromMe(newToken).then(name => {
+            if (name) setUserName(name);
+          });
+        } catch {}
+        
+        // Navigate to welcome screen
+        navigate("/welcome");
+      }
+    };
+
+    window.addEventListener("storage", handleStorageChange);
+    return () => window.removeEventListener("storage", handleStorageChange);
+  }, [navigate]);
+
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     (async () => {
