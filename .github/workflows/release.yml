@@ -61,7 +61,7 @@ jobs:
             args: "--target x86_64-apple-darwin"
           - platform: ubuntu
             runner: ubuntu-22.04
-            args: ""
+            args: "--bundles deb rpm"
 
           - build: development
             api_url: "http://localhost:3000"
