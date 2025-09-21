@@ -142,6 +142,8 @@ sequenceDiagram
 
 #### 7) Security and Robustness Notes
 
+- Status: Implemented
+
 - Token exposure: Prefer Keychain persistence and avoid re-exposing raw token to React; expose `authenticated` flag and display info.
 - Iframe origin checks: Compare `new URL(VITE_EARTHENWARE_URL).origin` with `event.origin` to avoid subtle mismatches.
 - Observability: Add structured logs and Sentry breadcrumbs in Tauri for config/collect/upload stages, including status codes and retry counts.
