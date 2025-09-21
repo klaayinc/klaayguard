@@ -35,6 +35,8 @@ pub struct AppState {
     pub upload_in_progress: RwLock<bool>,
     // Prevent repeated Keychain delete prompts by ensuring we only delete once per session
     pub keychain_cleared_this_session: RwLock<bool>,
+    pub last_upload_tick_at: RwLock<Option<std::time::Instant>>, // wake-gap detection for uploader
+    pub last_focus_at: RwLock<Option<std::time::Instant>>,       // debounce for focus-on-failure
 }
 
 const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
@@ -274,6 +276,53 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     Ok(())
+}
+
+fn wake_gap_seconds() -> u64 {
+    std::env::var("KLAAYGUARD_WAKE_GAP_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+fn focus_debounce_seconds() -> u64 {
+    std::env::var("KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60)
+}
+
+async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    let now = std::time::Instant::now();
+    let debounce = std::time::Duration::from_secs(focus_debounce_seconds());
+    let should_focus = {
+        let last = *state.last_focus_at.read().await;
+        match last {
+            Some(prev) => now.duration_since(prev) >= debounce,
+            None => true,
+        }
+    };
+    if should_focus {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        *state.last_focus_at.write().await = Some(now);
+        let _ = app.emit(
+            "focus:on_failure",
+            json!({ "at": chrono::Utc::now().to_rfc3339() }),
+        );
+    }
+}
+
+async fn emit_error_and_focus(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    event: &str,
+    payload: serde_json::Value,
+) {
+    let _ = app.emit(event, payload);
+    focus_window_with_debounce(app, state).await;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,10 +578,13 @@ async fn run_upload_cycle(
         mark_rows_handled_and_advance_watermark(app, state, &ids).await?;
         let _ = app.emit("upload:success", json!({ "count": ids.len() }));
     } else {
-        let _ = app.emit(
+        emit_error_and_focus(
+            app,
+            state,
             "upload:error",
             json!({ "stage": "post", "status": resp.status().as_u16() }),
-        );
+        )
+        .await;
     }
     *state.upload_in_progress.write().await = false;
     Ok(())
@@ -554,6 +606,13 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         // immediate drain
         if let Err(e) = run_upload_cycle(&app, &state, &client).await {
             eprintln!("initial upload cycle error: {}", e);
+            emit_error_and_focus(
+                &app,
+                &state,
+                "upload:error",
+                json!({ "stage": "internal", "error": e }),
+            )
+            .await;
         }
         // interval loop (15 minutes)
         let interval_secs: u64 = std::env::var("KLAAYGUARD_UPLOAD_INTERVAL_SECONDS")
@@ -561,11 +620,46 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(15 * 60);
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        // initialize last upload tick to now
+        *state.last_upload_tick_at.write().await = Some(std::time::Instant::now());
         loop {
             interval.tick().await;
+            let now = std::time::Instant::now();
+            let woke = {
+                let last = *state.last_upload_tick_at.read().await;
+                if let Some(prev) = last {
+                    let elapsed = now.duration_since(prev);
+                    let threshold = std::time::Duration::from_secs(wake_gap_seconds());
+                    elapsed >= threshold
+                } else {
+                    false
+                }
+            };
             if let Err(e) = run_upload_cycle(&app, &state, &client).await {
                 eprintln!("upload cycle error: {}", e);
+                emit_error_and_focus(
+                    &app,
+                    &state,
+                    "upload:error",
+                    json!({ "stage": "internal", "error": e }),
+                )
+                .await;
             }
+            if woke {
+                let _ = app.emit("system:wake_detected", json!({ "loop": "upload" }));
+                // immediate extra drain to catch up after wake
+                if let Err(e) = run_upload_cycle(&app, &state, &client).await {
+                    eprintln!("upload cycle (post-wake) error: {}", e);
+                    emit_error_and_focus(
+                        &app,
+                        &state,
+                        "upload:error",
+                        json!({ "stage": "internal", "error": e, "post_wake": true }),
+                    )
+                    .await;
+                }
+            }
+            *state.last_upload_tick_at.write().await = Some(now);
         }
     });
 }
@@ -605,13 +699,13 @@ async fn run_cycle(
         return Ok(());
     }
     if !cfg_resp.status().is_success() {
-        let _ = app.emit(
+        emit_error_and_focus(
+            app,
+            state,
             "collection:error",
-            json!({
-                "stage": "config",
-                "status": cfg_resp.status().as_u16()
-            }),
-        );
+            json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
+        )
+        .await;
         return Ok(());
     }
 
@@ -631,10 +725,13 @@ async fn run_cycle(
         .unwrap_or_default();
 
     if tables.is_empty() {
-        let _ = app.emit(
+        emit_error_and_focus(
+            app,
+            state,
             "collection:error",
             json!({ "stage": "config", "reason": "no_tables" }),
-        );
+        )
+        .await;
         return Ok(());
     }
 
@@ -671,13 +768,39 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         // run immediately
         if let Err(e) = run_cycle(&app, &state, &client).await {
             eprintln!("initial cycle error: {}", e);
+            emit_error_and_focus(
+                &app,
+                &state,
+                "collection:error",
+                json!({ "stage": "internal", "error": e }),
+            )
+            .await;
         }
 
         let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
         loop {
             interval.tick().await;
+            // detect potential wake by long elapsed since last attempt
+            let woke = {
+                let last = *state.last_attempt_at.read().await;
+                if let Some(prev) = last {
+                    prev.elapsed() >= std::time::Duration::from_secs(wake_gap_seconds())
+                } else {
+                    false
+                }
+            };
+            if woke {
+                let _ = app.emit("system:wake_detected", json!({ "loop": "collection" }));
+            }
             if let Err(e) = run_cycle(&app, &state, &client).await {
                 eprintln!("cycle error: {}", e);
+                emit_error_and_focus(
+                    &app,
+                    &state,
+                    "collection:error",
+                    json!({ "stage": "internal", "error": e }),
+                )
+                .await;
             }
         }
     });
@@ -932,6 +1055,8 @@ pub fn run() {
         db_path: RwLock::new(None),
         upload_in_progress: RwLock::new(false),
         keychain_cleared_this_session: RwLock::new(false),
+        last_upload_tick_at: RwLock::new(None),
+        last_focus_at: RwLock::new(None),
     });
 
     let app = tauri::Builder::default()
