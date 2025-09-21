@@ -532,7 +532,7 @@ async fn select_pending_rows(
     max_rows: usize,
 ) -> Result<Vec<UploadRow>, String> {
     let db_path = get_db_path_cached(app, state).await?;
-    let mut conn = if db_path == PathBuf::from(":memory:") {
+    let conn = if db_path == PathBuf::from(":memory:") {
         Connection::open_in_memory().map_err(|e| e.to_string())?
     } else {
         Connection::open(&db_path).map_err(|e| e.to_string())?
@@ -1161,7 +1161,7 @@ async fn get_db_size_mb(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result
 
 async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
     let db_path = get_db_path_cached(app, state).await?;
-    let mut conn = if db_path == PathBuf::from(":memory:") {
+    let conn = if db_path == PathBuf::from(":memory:") {
         Connection::open_in_memory().map_err(|e| e.to_string())?
     } else {
         Connection::open(&db_path).map_err(|e| e.to_string())?
