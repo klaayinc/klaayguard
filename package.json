@@ -5,11 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && vite build --mode production",
+    "build:staging": "tsc && vite build --mode staging",
+    "build:development": "tsc && vite build --mode development",
     "preview": "vite preview",
-    "tauri": "tauri",
+    "tauri": "node scripts/tauri-build.cjs",
     "setup-osquery": "rake",
     "tauri:build": "rake && node scripts/tauri-build.cjs",
+    "tauri:build:staging": "KLAAY_ENV=staging rake && node scripts/tauri-build.cjs",
+    "tauri:build:development": "KLAAY_ENV=development rake && node scripts/tauri-build.cjs",
     "tauri:dev": "rake && tauri dev",
     "sync-version": "node scripts/sync-version.js",
     "version": "npm run sync-version"

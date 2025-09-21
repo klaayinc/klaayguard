@@ -1,4 +1,22 @@
 fn main() {
+    // Determine environment for compile-time defaults
+    let klaay_env = std::env::var("KLAAY_ENV")
+        .ok()
+        .or_else(|| std::env::var("NODE_ENV").ok())
+        .unwrap_or_else(|| "production".to_string())
+        .to_lowercase();
+
+    // Compute default API base if not explicitly provided
+    let default_api = match klaay_env.as_str() {
+        "staging" => "https://api.klaay.dev",
+        "development" => "http://localhost:3000",
+        _ => "https://api.klaay.com",
+    };
+    let api_base = std::env::var("VITE_API_BASE_URL").unwrap_or_else(|_| default_api.to_string());
+
+    // Expose compile-time default for Rust side
+    println!("cargo:rustc-env=APP_DEFAULT_API_BASE_URL={}", api_base);
+
     let mut windows = tauri_build::WindowsAttributes::new();
     windows = windows.app_manifest(
         r#"

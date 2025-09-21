@@ -440,8 +440,10 @@ async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
 /// - Automatic updates ensure latest security patches
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Require VITE_API_BASE_URL to be set by the build environment
-    let api_base = std::env::var("VITE_API_BASE_URL").expect("VITE_API_BASE_URL must be set");
+    // Require VITE_API_BASE_URL; allow compile-time default fallback per environment
+    let api_base = std::env::var("VITE_API_BASE_URL")
+        .or_else(|_| std::env::var("APP_DEFAULT_API_BASE_URL"))
+        .unwrap_or_else(|_| "https://api.klaay.com".to_string());
     let state = Arc::new(AppState {
         auth_token: RwLock::new(None),
         api_base_url: RwLock::new(api_base),

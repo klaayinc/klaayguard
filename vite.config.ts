@@ -21,6 +21,13 @@ export default defineConfig(async () => ({
     }),
   ],
 
+  // Define app environment for frontend usage
+  define: {
+    __KLAAY_ENV__: JSON.stringify(
+      process.env.KLAAY_ENV || process.env.NODE_ENV || "production"
+    ),
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent vite from obscuring rust errors

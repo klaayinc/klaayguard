@@ -67,17 +67,21 @@ yarn install
 yarn tauri dev
 ```
 
-### Build for Production
+### Build
 
 ```bash
-# Build for current platform
-yarn tauri build
+# Default environment is production
+yarn tauri:build
 
-# Build for specific platforms
-yarn tauri build --target x86_64-pc-windows-msvc    # Windows
-yarn tauri build --target aarch64-apple-darwin      # macOS Apple Silicon
-yarn tauri build --target x86_64-apple-darwin       # macOS Intel
-yarn tauri build --target x86_64-unknown-linux-gnu  # Linux
+# Staging/Development overrides
+KLAAY_ENV=staging yarn tauri:build
+KLAAY_ENV=development yarn tauri:build
+
+# Pass through platform targets
+yarn tauri:build --target aarch64-apple-darwin      # macOS Apple Silicon
+yarn tauri:build --target x86_64-apple-darwin       # macOS Intel
+yarn tauri:build --target x86_64-pc-windows-msvc    # Windows
+yarn tauri:build --target x86_64-unknown-linux-gnu  # Linux
 ```
 
 ## 🏗️ Multi-Platform Support
@@ -153,9 +157,9 @@ yarn dev                 # Start Vite dev server
 yarn tauri dev          # Start Tauri development
 
 # Building
-yarn build              # Build frontend
-yarn tauri build        # Build desktop app
-yarn tauri build --release  # Build optimized release
+yarn build                  # Build frontend (production mode)
+yarn tauri:build            # Build desktop app (production by default)
+yarn tauri:build --release  # Build optimized release
 
 # Platform-specific builds
 yarn tauri build --target x86_64-pc-windows-msvc
@@ -270,7 +274,7 @@ For consistent builds across environments:
 
 ```bash
 # Build using Docker
-docker compose run --rm klaayguard -- yarn run tauri build
+docker compose run --rm klaayguard -- yarn run tauri:build
 ```
 
 ## 🤝 Contributing
