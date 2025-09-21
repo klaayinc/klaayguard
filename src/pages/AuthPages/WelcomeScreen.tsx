@@ -3,10 +3,13 @@ import { useAuth } from "../../context/AuthContext";
 // Removed Close button; no window API needed
 import klaayLogo from "../../icons/KLAAY-LOGO-RGB_ICON.png";
 import { invoke } from "@tauri-apps/api/core";
+import { useNavigate } from "react-router-dom";
+import { toast } from "react-toastify";
 
 export const WelcomeScreen: React.FC = () => {
   const { userName } = useAuth();
   const [secondsLeft, setSecondsLeft] = useState<number | null>(null);
+  const navigate = useNavigate();
 
   useEffect(() => {
     const tick = async () => {
@@ -37,6 +40,13 @@ export const WelcomeScreen: React.FC = () => {
     const r = s % 60;
     return `${m.toString().padStart(2, "0")}:${r.toString().padStart(2, "0")}`;
   };
+
+  useEffect(() => {
+    if (secondsLeft !== null && secondsLeft < 0) {
+      toast.info("Session expired. Please sign in to continue.");
+      navigate("/signin");
+    }
+  }, [secondsLeft, navigate]);
 
   return (
     <div className="min-h-screen flex flex-col items-center justify-center p-8 bg-[#0B223D]">
