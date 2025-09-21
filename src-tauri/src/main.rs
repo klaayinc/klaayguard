@@ -22,5 +22,9 @@ fn main() {
         }
     });
 
+    // Ensure Rust log crate is initialized early so tauri-plugin-log captures logs
+    // The plugin installs a logger; we just ensure standard logging macros are used elsewhere
+    log::set_max_level(log::LevelFilter::Info);
+
     klaay_guard_lib::run()
 }

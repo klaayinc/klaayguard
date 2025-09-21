@@ -1,4 +1,6 @@
 import * as Sentry from "@sentry/react";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { appLogDir, join } from "@tauri-apps/api/path";
 
 // Initialize Sentry
 export function initSentry() {
@@ -13,23 +15,17 @@ export function initSentry() {
     dsn,
     environment: import.meta.env.MODE,
     release: import.meta.env.VITE_APP_VERSION || "0.1.5",
-    tracesSampleRate: 1.0,
-    integrations: [
-      Sentry.browserTracingIntegration({
-        tracePropagationTargets: [
-          "localhost",
-          /^https:\/\/yourserver\.com\/api/,
-        ],
-      }),
-    ],
-    // Capture unhandled promise rejections
-    captureUnhandledRejections: true,
-    // Capture uncaught exceptions
+    // Minimal config; tracing disabled to avoid extra dependencies
     beforeSend(event) {
-      // Filter out development errors if needed
-      if (import.meta.env.MODE === "development") {
-        console.log("Sentry event:", event);
-      }
+      try {
+        const line = JSON.stringify({ ts: new Date().toISOString(), sentry: event }) + "\n";
+        // Resolve app log directory and append line
+        appLogDir().then((dir) => {
+          join(dir, "app.log").then((path) => {
+            writeTextFile(path, line, { append: true } as any).catch(() => {});
+          });
+        });
+      } catch (_) {}
       return event;
     },
   });

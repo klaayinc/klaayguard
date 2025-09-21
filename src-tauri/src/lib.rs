@@ -21,6 +21,7 @@ use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
+// use tauri_plugin_log::LogTarget; // use defaults
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -772,8 +773,8 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
         // immediate drain
-        if let Err(e) = run_upload_cycle(&app, &state, &client).await {
-            eprintln!("initial upload cycle error: {}", e);
+            if let Err(e) = run_upload_cycle(&app, &state, &client).await {
+            log::error!("initial upload cycle error: {}", e);
             emit_error_and_focus(
                 &app,
                 &state,
@@ -804,7 +805,7 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                 }
             };
             if let Err(e) = run_upload_cycle(&app, &state, &client).await {
-                eprintln!("upload cycle error: {}", e);
+                log::error!("upload cycle error: {}", e);
                 emit_error_and_focus(
                     &app,
                     &state,
@@ -819,7 +820,7 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                 sentry::capture_message("wake_detected_upload", Level::Info);
                 // immediate extra drain to catch up after wake
                 if let Err(e) = run_upload_cycle(&app, &state, &client).await {
-                    eprintln!("upload cycle (post-wake) error: {}", e);
+                    log::error!("upload cycle (post-wake) error: {}", e);
                     emit_error_and_focus(
                         &app,
                         &state,
@@ -1006,7 +1007,7 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
 
         // run immediately
         if let Err(e) = run_cycle(&app, &state, &client).await {
-            eprintln!("initial cycle error: {}", e);
+            log::error!("initial cycle error: {}", e);
             emit_error_and_focus(
                 &app,
                 &state,
@@ -1034,7 +1035,7 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                 sentry::capture_message("wake_detected_collection", Level::Info);
             }
             if let Err(e) = run_cycle(&app, &state, &client).await {
-                eprintln!("cycle error: {}", e);
+                log::error!("cycle error: {}", e);
                 emit_error_and_focus(
                     &app,
                     &state,
@@ -1451,6 +1452,8 @@ pub fn run() {
         .manage(state.clone())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_log::Builder::new().level(log::LevelFilter::Info).build())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle2 = app.handle().clone();
@@ -1488,7 +1491,7 @@ pub fn run() {
 
             tauri::async_runtime::spawn(async move {
                 update(handle2).await.unwrap_or_else(|e| {
-                    eprintln!("Failed to check for updates: {}", e);
+                    log::error!("Failed to check for updates: {}", e);
                     sentry::capture_message(&format!("update_check_failed:{}", e), Level::Error);
                 });
             });
@@ -1498,7 +1501,7 @@ pub fn run() {
             {
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = install_launch_agent().await {
-                        eprintln!("Failed to install launch agent: {}", e);
+                        log::error!("Failed to install launch agent: {}", e);
                         sentry::capture_message(
                             &format!("launch_agent_install_failed:{}", e),
                             Level::Error,
@@ -1603,7 +1606,7 @@ pub fn run() {
 
             // Initialize SQLite (file-backed) path and schema
             if let Err(e) = init_sqlite(&app.handle()) {
-                eprintln!("Failed to initialize SQLite: {}", e);
+                log::error!("Failed to initialize SQLite: {}", e);
                 sentry::capture_message(&format!("sqlite_init_failed:{}", e), Level::Error);
             } else {
                 if let Some(p) = get_sqlite_path(&app.handle()).ok() {
