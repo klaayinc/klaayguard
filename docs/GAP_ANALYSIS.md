@@ -62,7 +62,8 @@ sequenceDiagram
 
 ### Current Implementation Snapshot
 
-- Tauri background loop (15 min) fetches config, runs bundled `osqueryi`, and persists results to a local SQLite queue (`results` table). Upload to API is deferred to Loop B.
+- Loop A: Tauri background loop (15 min) fetches config, runs bundled `osqueryi`, and persists results to a local SQLite queue (`results` table).
+- Loop B: Background uploader implemented. Drains pending rows and advances a `last_upload_at` watermark in `metadata` after successful upload.
 - macOS LaunchAgent installed with `RunAtLoad` and `KeepAlive=true`; window close hides; no quit menu; duplicate instance guard; updater enabled.
 - React handles iframe login and `/authenticate` POST; the iframe posts the token directly to Tauri via IPC. Tauri stores the token securely in the macOS Keychain and restores it on boot. React does not persist or read the token and instead uses a tokenless `get_auth_status` IPC.
 - Endpoints provided via `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` (used by both React and Tauri).
@@ -90,19 +91,26 @@ sequenceDiagram
 
 #### 3) Loop B: Upload Pending → Mark Handled → Update last_upload_at
 
-- Expected: Every cycle, select pending rows (`handled=false` and `created_at > last_upload_at`), POST, mark handled, update `last_upload_at`.
-- Current: Queue exists and is being populated by Loop A; uploader not implemented yet; `metadata.last_upload_at` not set.
-- Gaps: Idempotent upload, partial‑batch handling, retry/backoff logic are pending.
-- Recommendations:
-  - Implement a separate uploader that drains batches from SQLite, marks handled in a transaction, and sets `metadata.last_upload_at=now()`
-  - Add exponential backoff on transient failures; never drop data
+- Status: Implemented
+
+  - Separate uploader task with immediate drain on startup and a 15‑minute interval (`KLAAYGUARD_UPLOAD_INTERVAL_SECONDS`), guarded to avoid overlap.
+  - Selects pending rows with `handled = false AND created_at > last_upload_at`, ordered by `created_at` asc, limited by `KLAAYGUARD_UPLOAD_MAX_ROWS` (default 1000).
+  - POSTs to `POST /klaayguard/data` with `Authorization: Bearer <token>` and payload `{ device_id, batch_id, rows[] }` where each row includes `id, table_name, json, run_id, created_at`.
+  - On `202 Accepted` (or generally success), marks posted rows `handled=true, handled_at=now()` and advances `metadata.last_upload_at` to `MAX(created_at)` of the handled set in a single transaction.
+  - Emits UI events: `upload:success` on success; `upload:error` with `{ stage, status }` on errors.
+  - On `401/403`, clears token from Keychain, emits `auth:invalidated` and `auth:status`, and focuses/shows the app for re‑login. No rows are marked in this case.
+
+- Remaining gaps / enhancements:
+  - Payload size cap and payload splitting by bytes (currently only row‑count cap).
+  - Rate‑limit and transient error exponential backoff with jitter (currently retries next interval).
+  - Optional per‑row acceptance handling if server returns granular statuses (currently marks all on success).
+  - Wake‑from‑sleep trigger to drain immediately (startup immediate drain is implemented).
 
 #### 4) Background Execution and System Sleep
 
-- Expected: Runs without UI; robust to sleep/wake.
-- Current: Runs in Tauri without UI; during sleep, timers pause and resume on wake. Queue is present (SQLite `results`), so data accumulates durably while offline.
-- Gaps: Backlog drain/upload strategy depends on Loop B implementation.
-- Recommendations: Drain backlog on wake/start via Loop B; optionally assert power during active runs (advanced macOS) if necessary.
+- Status: Running headless in Tauri; Loop A and Loop B both operate without UI.
+- Startup: Immediate drain for Loop B implemented to catch up backlog.
+- Sleep/Wake: Timers pause during sleep and resume on wake; backlog persists in SQLite and drains on next interval. Optional wake trigger for immediate drain remains a possible enhancement.
 
 #### 5) Environment Management (Dev/Staging/Prod)
 
@@ -133,8 +141,7 @@ sequenceDiagram
 
 ### Status Summary & Next Steps
 
-- Token storage and boot‑time restore are implemented; 401/403 invalidation focuses the app for re‑login.
-- SQLite queue is implemented (`results` now populated on every cycle). Add `metadata.last_upload_at` during Loop B.
-- Next: Implement Loop B uploader with mark‑as‑handled and retry/backoff.
-- Ensure `.env.*` alignment for API/Earthenware; keep loops and auth strictly in Tauri.
-- Accept OS sleep; backlog will be drained once Loop B lands. LaunchAgent remains as is; Apple Silicon targeting unchanged.
+- Authentication storage/restore implemented; 401/403 invalidation clears token and focuses app for re‑login.
+- Loop A and Loop B implemented end‑to‑end. `metadata.last_upload_at` advances to the handled set’s max `created_at` on success.
+- Next enhancements: payload size cap/splitting, explicit exponential backoff with jitter and `Retry‑After` support, optional per‑row result handling, and wake‑triggered immediate drain.
+- Ensure `.env.*` alignment for API/Earthenware; keep loops and auth strictly in Tauri. LaunchAgent and Apple Silicon targeting unchanged.
