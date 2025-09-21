@@ -57,6 +57,7 @@ sequenceDiagram
 - Primary delivery target: macOS Apple Silicon.
 - Additional supported builds (see Build Targets & Sidecars): macOS Intel (x86_64) and Linux x86_64 (glibc). Blocked targets pending sidecar packaging: Linux aarch64, Windows (x86_64/arm64).
 - Environment overlays: `KLAAY_ENV` selects development/staging/production. Build overlays use `src-tauri/tauri.development.json` and `src-tauri/tauri.staging.json`; defaults for `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` are set in `scripts/tauri-build.cjs` per environment.
+  - CI/CD: GitHub Actions builds all three environments using the env-aware wrapper (`yarn tauri:build`) with `KLAAY_ENV` and passes per-environment URLs; see `.github/workflows/release.yml`.
 - Environments and endpoints:
   - **Development**: API `http://localhost:3000`, Earthenware `http://localhost:5173`
   - **Staging**: API `https://api.klaay.dev`, Earthenware `https://app.klaay.dev`
@@ -123,10 +124,12 @@ sequenceDiagram
 
 #### 5) Environment Management (Dev/Staging/Prod)
 
+- Status: Implemented
+
 - Expected: Distinct API and Earthenware URLs per environment; both layers aligned.
-- Current: `KLAAY_ENV` drives environment selection; `scripts/tauri-build.cjs` sets default `VITE_API_BASE_URL`/`VITE_EARTHENWARE_URL` per env and selects Tauri overlay configs (`tauri.staging.json`, `tauri.development.json`).
-- Gaps: Possible mismatch if external env overrides diverge between React and Tauri; no runtime validation/telemetry of resolved URLs.
-- Recommendations: Provide `.env.development`, `.env.staging`, `.env.production`; optionally add `VITE_ENVIRONMENT`; expose active URLs from Tauri to React and warn if mismatched; log/telemetry the resolved URLs on startup.
+- Current: `KLAAY_ENV` drives environment selection; `scripts/tauri-build.cjs` selects per-env Tauri overlays and injects default `VITE_API_BASE_URL`/`VITE_EARTHENWARE_URL` when missing. CI builds development/staging/production and passes `KLAAY_ENV` plus per-env URL matrix. README includes an environment matrix and `.env.*` examples.
+- Gaps: Minor — no runtime validation/telemetry of resolved URLs; potential mismatch warnings are not surfaced yet.
+- Recommendations: Keep `.env.development`, `.env.staging`, `.env.production` as documented in README. Optionally expose resolved URLs from Tauri to React and warn if mismatched; add startup logs/telemetry of resolved URLs.
 
 #### 6) Tauri Autostart and Process Management
 
@@ -193,5 +196,5 @@ sequenceDiagram
 - Authentication storage/restore implemented; 401/403 invalidation clears token and focuses app for re‑login.
 - Loop A and Loop B implemented end‑to‑end. `metadata.last_upload_at` advances to the handled set’s max `created_at` on success.
 - Next enhancements: payload size cap/splitting, explicit exponential backoff with jitter and `Retry‑After` support, optional per‑row result handling, and wake‑triggered immediate drain.
-- Ensure `.env.*` alignment for API/Earthenware and validate resolved URLs at startup.
+- Environment management documented in README (variable matrix and `.env.*` examples). Consider adding runtime validation/telemetry for resolved URLs. CI builds dev/staging/prod using `KLAAY_ENV` with per-environment URLs.
 - Document and maintain the Build Targets & Sidecars matrix; add missing sidecars to unblock Linux aarch64 and Windows if/when targeted.

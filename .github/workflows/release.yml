@@ -65,10 +65,13 @@ jobs:
 
           - build: development
             api_url: "http://localhost:3000"
+            earthenware_url: "http://localhost:5173"
           - build: staging
             api_url: "https://api.klaay.dev"
+            earthenware_url: "https://app.klaay.dev"
           - build: production
             api_url: "https://api.klaay.com"
+            earthenware_url: "https://app.klaay.com"
 
           # - platform: windows
           #   runner: windows-latest
@@ -133,10 +136,11 @@ jobs:
           echo "CERT_ID is $CERT_ID"
           echo "Certificate imported."
 
-      - name: Build Tauri
+      - name: Build Tauri (env-aware)
         env:
+          KLAAY_ENV: ${{ matrix.build }}
           VITE_API_BASE_URL: ${{ matrix.api_url }}
-          VITE_EARTHENWARE_URL: https://app.klaay.dev
+          VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
           VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -147,9 +151,9 @@ jobs:
         run: |
           if [ "${{ matrix.platform }}" = "ubuntu" ]; then
             # Build Linux bundles (defaults cover .AppImage/.deb/.rpm via bundle.targets=all)
-            yarn tauri build ${{ matrix.args }}
+            yarn tauri:build ${{ matrix.args }}
           else
-            yarn tauri build ${{ matrix.args }}
+            yarn tauri:build ${{ matrix.args }}
           fi
 
       - name: Rename and upload artifacts to single release

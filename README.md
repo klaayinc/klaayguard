@@ -131,18 +131,68 @@ klaayguard/
 
 ## 🔧 Configuration
 
-### Environment Variables (required)
+### Environment Management (Dev/Staging/Prod)
 
-The app does not hardcode endpoint fallbacks. Provide these envs at build/dev time. CI sets them for releases via matrix and workflow env.
+KlaayGuard supports three environments selected via `KLAAY_ENV`:
+
+- `production` (default)
+- `staging`
+- `development`
+
+Behavior by layer:
+
+- Vite/React: `yarn build --mode <env>` is selected via Tauri overlay configs. Frontend code reads `import.meta.env.*`.
+- Tauri build wrapper: `scripts/tauri-build.cjs` picks the correct Tauri overlay and injects default URLs when not provided.
+- Rust/Tauri (runtime): reads environment variables at startup; if missing, falls back to compile-time defaults produced by `src-tauri/build.rs` and finally to production-safe hardcoded values.
+
+#### Variables and Defaults
+
+| Variable                                    | Layer                   | Required                        | production default      | staging default         | development default     | Purpose                                  |
+| ------------------------------------------- | ----------------------- | ------------------------------- | ----------------------- | ----------------------- | ----------------------- | ---------------------------------------- |
+| `KLAAY_ENV`                                 | Build (Node/Vite/Tauri) | No                              | `production`            | `staging`               | `development`           | Selects environment and Tauri overlay    |
+| `VITE_API_BASE_URL`                         | Vite + Rust (runtime)   | Yes (wrapper provides defaults) | `https://api.klaay.com` | `https://api.klaay.dev` | `http://localhost:3000` | Kiln API base URL                        |
+| `VITE_EARTHENWARE_URL`                      | Vite                    | Yes (wrapper provides defaults) | `https://app.klaay.com` | `https://app.klaay.dev` | `http://localhost:5173` | Earthenware login iframe origin          |
+| `VITE_SENTRY_DSN`                           | Vite + Rust             | No                              | empty                   | empty                   | empty                   | Sentry DSN for error reporting           |
+| `VITE_APP_VERSION`                          | Vite                    | No                              | empty (falls back)      | empty                   | empty                   | Release tag in frontend Sentry; optional |
+| `KLAAYGUARD_UPLOAD_INTERVAL_SECONDS`        | Rust                    | No                              | 900                     | 900                     | 900                     | Upload loop interval seconds             |
+| `KLAAYGUARD_UPLOAD_MAX_ROWS`                | Rust                    | No                              | 1000                    | 1000                    | 1000                    | Max rows per upload batch                |
+| `KLAAYGUARD_WAKE_GAP_SECONDS`               | Rust                    | No                              | 300                     | 300                     | 300                     | Wake detection threshold                 |
+| `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` | Rust                    | No                              | 60                      | 60                      | 60                      | Debounce app focus on failures           |
+| `KLAAYGUARD_DB_MODE`                        | Rust                    | No                              | `file`                  | `file`                  | `file`                  | SQLite mode (`file` or `memory`)         |
+| `KLAAYGUARD_DB_PATH`                        | Rust                    | No                              | auto                    | auto                    | auto                    | Override SQLite file path                |
+| `TAURI_DEV_HOST`                            | Vite dev                | No                              | `0.0.0.0`               | `0.0.0.0`               | `0.0.0.0`               | Host for HMR when running `tauri dev`    |
+
+Notes:
+
+- The build wrapper only injects defaults for `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` if they are not already set in the environment.
+- Rust reads `VITE_API_BASE_URL` at runtime. If not present, it uses compile-time `APP_DEFAULT_API_BASE_URL` produced by `src-tauri/build.rs` (based on `KLAAY_ENV` or `VITE_API_BASE_URL` at build time). Final fallback is `https://api.klaay.com`.
+
+#### Local .env files
+
+Create `.env.*` files in the repo root for local development:
 
 ```bash
-# .env for local development
+# .env.development
 VITE_API_BASE_URL=http://localhost:3000
 VITE_EARTHENWARE_URL=http://localhost:5173
-
-# Sentry Configuration (optional but recommended)
-VITE_SENTRY_DSN=your_sentry_dsn_here
+VITE_SENTRY_DSN=
 ```
+
+```bash
+# .env.staging
+VITE_API_BASE_URL=https://api.klaay.dev
+VITE_EARTHENWARE_URL=https://app.klaay.dev
+VITE_SENTRY_DSN=
+```
+
+```bash
+# .env.production
+VITE_API_BASE_URL=https://api.klaay.com
+VITE_EARTHENWARE_URL=https://app.klaay.com
+VITE_SENTRY_DSN=
+```
+
+You can also set `KLAAY_ENV` to choose overlays when using the Tauri wrapper.
 
 ### API Endpoints
 
@@ -170,6 +220,10 @@ yarn tauri build --target x86_64-unknown-linux-gnu
 yarn sync-version       # Sync version across all files
 yarn version            # Alias for sync-version
 ```
+
+### CI/CD Environment Builds
+
+The GitHub Actions workflow builds artifacts for `development`, `staging`, and `production`. It sets `KLAAY_ENV` and passes per-environment URLs to ensure consistent configuration. See `.github/workflows/release.yml`.
 
 ## 📋 Version Management
 
