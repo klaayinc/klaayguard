@@ -184,8 +184,14 @@ sequenceDiagram
   - Default file-backed DB under app data dir (e.g., `~/Library/Application Support/com.klaay.app/klaayguard.db`).
   - Override with `KLAAYGUARD_DB_MODE=memory` for in-memory DB or `KLAAYGUARD_DB_PATH` for a custom file path.
 - Retention considerations:
-  - Queue grows with un-uploaded rows; uploader drains and marks handled.
-  - Recommend documenting expected growth bounds and optional rotation/cleanup policy for handled rows.
+  - Implemented: time-based and size-based pruning of handled rows.
+    - Time-based: deletes handled rows older than `KLAAYGUARD_RETENTION_DAYS` and not newer than the watermark `metadata.last_upload_at`.
+    - Size-based: when SQLite exceeds `KLAAYGUARD_MAX_DB_MB`, deletes oldest handled rows until under cap.
+    - Safety: pending (`handled=0`) rows are never deleted.
+    - Cadence: background retention loop runs every `KLAAYGUARD_RETENTION_INTERVAL_SECONDS` seconds in batches of `KLAAYGUARD_PRUNE_BATCH_ROWS` to avoid long locks.
+  - Indexes added to support hot paths and pruning: `idx_results_pending(handled, created_at, id)`, `idx_results_run(run_id)`, `idx_results_handled_at(handled, handled_at)`.
+  - Events and breadcrumbs: emits `retention:run` with deletion counts and size before/after; `retention:error` on failures.
+  - Defaults are conservative: 30 days, 200MB cap, daily job, 5000 rows per batch. See README for env tuning.
 
 #### 11) Observability & Telemetry
 

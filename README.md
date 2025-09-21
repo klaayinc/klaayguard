@@ -160,6 +160,10 @@ Behavior by layer:
 | `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` | Rust                    | No                              | 60                      | 60                      | 60                      | Debounce app focus on failures           |
 | `KLAAYGUARD_DB_MODE`                        | Rust                    | No                              | `file`                  | `file`                  | `file`                  | SQLite mode (`file` or `memory`)         |
 | `KLAAYGUARD_DB_PATH`                        | Rust                    | No                              | auto                    | auto                    | auto                    | Override SQLite file path                |
+| `KLAAYGUARD_RETENTION_DAYS`                 | Rust                    | No                              | 30                      | 30                      | 30                      | Days to keep handled rows                |
+| `KLAAYGUARD_RETENTION_INTERVAL_SECONDS`     | Rust                    | No                              | 86400                   | 86400                   | 86400                   | Retention job interval seconds           |
+| `KLAAYGUARD_MAX_DB_MB`                      | Rust                    | No                              | 200                     | 200                     | 200                     | Max DB size (MB) before extra pruning    |
+| `KLAAYGUARD_PRUNE_BATCH_ROWS`               | Rust                    | No                              | 5000                    | 5000                    | 5000                    | Rows deleted per prune batch             |
 | `TAURI_DEV_HOST`                            | Vite dev                | No                              | `0.0.0.0`               | `0.0.0.0`               | `0.0.0.0`               | Host for HMR when running `tauri dev`    |
 
 Notes:
@@ -331,6 +335,16 @@ For consistent builds across environments:
 # Build using Docker
 docker compose run --rm klaayguard -- yarn run tauri:build
 ```
+
+## 🧹 Data Retention
+
+KlaayGuard prunes uploaded (handled) rows to keep local storage bounded:
+
+- Time-based: deletes handled rows older than `KLAAYGUARD_RETENTION_DAYS` and not newer than the upload watermark (`last_upload_at`).
+- Size-based: if the SQLite file exceeds `KLAAYGUARD_MAX_DB_MB`, deletes the oldest handled rows until size is under the cap.
+- Safety: never deletes pending (`handled=0`) rows. Pruning runs every `KLAAYGUARD_RETENTION_INTERVAL_SECONDS` seconds in small batches (`KLAAYGUARD_PRUNE_BATCH_ROWS`).
+
+These defaults are safe for most environments; tune via env vars if you expect unusually high data volume.
 
 ## 🤝 Contributing
 

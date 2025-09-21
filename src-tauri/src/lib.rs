@@ -40,6 +40,7 @@ pub struct AppState {
     pub keychain_cleared_this_session: RwLock<bool>,
     pub last_upload_tick_at: RwLock<Option<std::time::Instant>>, // wake-gap detection for uploader
     pub last_focus_at: RwLock<Option<std::time::Instant>>,       // debounce for focus-on-failure
+    pub retention_in_progress: RwLock<bool>,
 }
 
 const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
@@ -393,6 +394,34 @@ fn focus_debounce_seconds() -> u64 {
         .unwrap_or(60)
 }
 
+fn retention_days() -> i64 {
+    std::env::var("KLAAYGUARD_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(30)
+}
+
+fn retention_interval_seconds() -> u64 {
+    std::env::var("KLAAYGUARD_RETENTION_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(24 * 60 * 60)
+}
+
+fn prune_batch_rows() -> i64 {
+    std::env::var("KLAAYGUARD_PRUNE_BATCH_ROWS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(5000)
+}
+
+fn max_db_mb() -> u64 {
+    std::env::var("KLAAYGUARD_MAX_DB_MB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(200)
+}
+
 async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState>) {
     let now = std::time::Instant::now();
     let debounce = std::time::Duration::from_secs(focus_debounce_seconds());
@@ -503,7 +532,7 @@ async fn select_pending_rows(
     max_rows: usize,
 ) -> Result<Vec<UploadRow>, String> {
     let db_path = get_db_path_cached(app, state).await?;
-    let conn = if db_path == PathBuf::from(":memory:") {
+    let mut conn = if db_path == PathBuf::from(":memory:") {
         Connection::open_in_memory().map_err(|e| e.to_string())?
     } else {
         Connection::open(&db_path).map_err(|e| e.to_string())?
@@ -1102,10 +1131,180 @@ fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS idx_results_pending ON results(handled, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_results_run ON results(run_id);
+        CREATE INDEX IF NOT EXISTS idx_results_handled_at ON results(handled, handled_at);
         "#,
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+async fn get_db_size_mb(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<u64, String> {
+    let db_path = get_db_path_cached(app, state).await?;
+    if db_path == PathBuf::from(":memory:") {
+        // Estimate using page_count * page_size
+        let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let page_count: i64 = conn
+            .query_row("PRAGMA page_count;", [], |r| r.get(0))
+            .unwrap_or(0);
+        let page_size: i64 = conn
+            .query_row("PRAGMA page_size;", [], |r| r.get(0))
+            .unwrap_or(4096);
+        let bytes = page_count.saturating_mul(page_size) as u64;
+        Ok(bytes / (1024 * 1024))
+    } else {
+        let meta = std::fs::metadata(&db_path).map_err(|e| e.to_string())?;
+        Ok(meta.len() / (1024 * 1024))
+    }
+}
+
+async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
+    let db_path = get_db_path_cached(app, state).await?;
+    let mut conn = if db_path == PathBuf::from(":memory:") {
+        Connection::open_in_memory().map_err(|e| e.to_string())?
+    } else {
+        Connection::open(&db_path).map_err(|e| e.to_string())?
+    };
+    let last_upload = get_last_upload_at(app, state).await?;
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days() as i64))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let mut total_deleted: usize = 0;
+    loop {
+        let deleted = conn
+            .execute(
+                "DELETE FROM results WHERE id IN (
+                   SELECT id FROM results
+                   WHERE handled=1
+                     AND datetime(created_at) <= datetime(?1)
+                     AND datetime(created_at) <= datetime(?2)
+                   ORDER BY datetime(created_at) ASC, id ASC
+                   LIMIT ?3
+                 )",
+                params![last_upload.as_str(), cutoff.as_str(), prune_batch_rows()],
+            )
+            .map_err(|e| e.to_string())?;
+        total_deleted += deleted as usize;
+        if deleted == 0 {
+            break;
+        }
+    }
+    Ok(total_deleted)
+}
+
+async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
+    let db_path = get_db_path_cached(app, state).await?;
+    if db_path == PathBuf::from(":memory:") {
+        // No file to size-bound in memory mode; skip
+        return Ok(0);
+    }
+    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let last_upload = get_last_upload_at(app, state).await?;
+    let mut total_deleted: usize = 0;
+    let cap = max_db_mb();
+    loop {
+        let size_now = get_db_size_mb(app, state).await?;
+        if size_now <= cap {
+            break;
+        }
+        let deleted = conn
+            .execute(
+                "DELETE FROM results WHERE id IN (
+                   SELECT id FROM results
+                   WHERE handled=1
+                     AND datetime(created_at) <= datetime(?1)
+                   ORDER BY datetime(created_at) ASC, id ASC
+                   LIMIT ?2
+                 )",
+                params![last_upload.as_str(), prune_batch_rows()],
+            )
+            .map_err(|e| e.to_string())?;
+        total_deleted += deleted as usize;
+        if deleted == 0 {
+            break;
+        }
+    }
+    Ok(total_deleted)
+}
+
+async fn run_retention_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+    // Prevent overlap
+    if *state.retention_in_progress.read().await {
+        return Ok(());
+    }
+    *state.retention_in_progress.write().await = true;
+    let before = get_db_size_mb(app, state).await.unwrap_or(0);
+    add_breadcrumb("retention", &format!("start_db_mb:{}", before), Level::Info);
+    let time_deleted = prune_time_based(app, state).await.unwrap_or(0);
+    let mut after = get_db_size_mb(app, state).await.unwrap_or(before);
+    let mut size_deleted = 0usize;
+    if after > max_db_mb() {
+        size_deleted = prune_size_based(app, state).await.unwrap_or(0);
+        after = get_db_size_mb(app, state).await.unwrap_or(after);
+    }
+    // Optimize lightweight
+    let _ = {
+        let db_path = get_db_path_cached(app, state).await?;
+        let conn = if db_path == PathBuf::from(":memory:") {
+            Connection::open_in_memory().map_err(|e| e.to_string())?
+        } else {
+            Connection::open(&db_path).map_err(|e| e.to_string())?
+        };
+        conn.execute_batch("PRAGMA optimize;").ok();
+        Ok::<(), String>(())
+    };
+    let _ = app.emit(
+        "retention:run",
+        json!({
+            "deleted_time_based": time_deleted,
+            "deleted_size_based": size_deleted,
+            "db_mb_before": before,
+            "db_mb_after": after,
+        }),
+    );
+    add_breadcrumb(
+        "retention",
+        &format!(
+            "done time_deleted:{} size_deleted:{} db_mb:{}->{}",
+            time_deleted, size_deleted, before, after
+        ),
+        Level::Info,
+    );
+    *state.retention_in_progress.write().await = false;
+    Ok(())
+}
+
+fn spawn_retention_loop(app: tauri::AppHandle, state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        // Wait for DB path to be initialized
+        loop {
+            if state.db_path.read().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        // Run immediately once
+        if let Err(e) = run_retention_cycle(&app, &state).await {
+            log::error!("retention initial run error: {}", e);
+            let _ = app.emit(
+                "retention:error",
+                json!({ "stage": "initial", "error": e.to_string() }),
+            );
+        }
+        let interval_secs = retention_interval_seconds();
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            interval.tick().await;
+            if let Err(e) = run_retention_cycle(&app, &state).await {
+                log::error!("retention run error: {}", e);
+                let _ = app.emit(
+                    "retention:error",
+                    json!({ "stage": "interval", "error": e.to_string() }),
+                );
+            }
+        }
+    });
 }
 
 async fn persist_results_to_sqlite(
@@ -1430,6 +1629,7 @@ pub fn run() {
         keychain_cleared_this_session: RwLock::new(false),
         last_upload_tick_at: RwLock::new(None),
         last_focus_at: RwLock::new(None),
+        retention_in_progress: RwLock::new(false),
     });
 
     let app = tauri::Builder::default()
@@ -1629,7 +1829,9 @@ pub fn run() {
 
             spawn_background_loop(app_handle.clone(), state_for_loop.clone());
             // Spawn uploader loop (Loop B)
-            spawn_upload_loop(app_handle, state_for_loop);
+            spawn_upload_loop(app_handle.clone(), state_for_loop.clone());
+            // Spawn retention loop (maintenance)
+            spawn_retention_loop(app_handle, state_for_loop);
 
             Ok(())
         })
