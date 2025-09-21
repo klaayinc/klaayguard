@@ -12,11 +12,10 @@ export function initSentry() {
   Sentry.init({
     dsn,
     environment: import.meta.env.MODE,
-    release: import.meta.env.VITE_APP_VERSION || "0.1.4",
+    release: import.meta.env.VITE_APP_VERSION || "0.1.5",
     tracesSampleRate: 1.0,
     integrations: [
-      new Sentry.BrowserTracing({
-        // Set sampling rate for performance monitoring
+      Sentry.browserTracingIntegration({
         tracePropagationTargets: [
           "localhost",
           /^https:\/\/yourserver\.com\/api/,

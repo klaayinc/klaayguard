@@ -367,7 +367,7 @@ async fn get_last_upload_at(
     state: &Arc<AppState>,
 ) -> Result<String, String> {
     let db_path = get_db_path_cached(app, state).await?;
-    let mut conn = if db_path == PathBuf::from(":memory:") {
+    let conn = if db_path == PathBuf::from(":memory:") {
         Connection::open_in_memory().map_err(|e| e.to_string())?
     } else {
         Connection::open(&db_path).map_err(|e| e.to_string())?
@@ -391,7 +391,7 @@ async fn select_pending_rows(
     max_rows: usize,
 ) -> Result<Vec<UploadRow>, String> {
     let db_path = get_db_path_cached(app, state).await?;
-    let mut conn = if db_path == PathBuf::from(":memory:") {
+    let conn = if db_path == PathBuf::from(":memory:") {
         Connection::open_in_memory().map_err(|e| e.to_string())?
     } else {
         Connection::open(&db_path).map_err(|e| e.to_string())?
@@ -452,7 +452,7 @@ async fn mark_rows_handled_and_advance_watermark(
     };
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     // UPDATE handled flag
-    let (ph, mut params_vec) = build_in_clause_params(ids);
+    let (ph, params_vec) = build_in_clause_params(ids);
     let update_sql = format!(
         "UPDATE results SET handled=1, handled_at=CURRENT_TIMESTAMP WHERE id IN ({})",
         ph
@@ -833,7 +833,7 @@ fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
                 .map_err(|e| format!("create_dir_all for db parent failed: {}", e))?;
         }
     }
-    let mut conn = if db_path == PathBuf::from(":memory:") {
+    let conn = if db_path == PathBuf::from(":memory:") {
         Connection::open_in_memory().map_err(|e| e.to_string())?
     } else {
         Connection::open(&db_path).map_err(|e| e.to_string())?

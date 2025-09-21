@@ -104,13 +104,17 @@ sequenceDiagram
   - Payload size cap and payload splitting by bytes (currently only row‑count cap).
   - Rate‑limit and transient error exponential backoff with jitter (currently retries next interval).
   - Optional per‑row acceptance handling if server returns granular statuses (currently marks all on success).
-  - Wake‑from‑sleep trigger to drain immediately (startup immediate drain is implemented).
+  - Optional macOS native wake listener for even faster detection (monotonic wake detection is implemented).
 
 #### 4) Background Execution and System Sleep
 
-- Status: Running headless in Tauri; Loop A and Loop B both operate without UI.
-- Startup: Immediate drain for Loop B implemented to catch up backlog.
-- Sleep/Wake: Timers pause during sleep and resume on wake; backlog persists in SQLite and drains on next interval. Optional wake trigger for immediate drain remains a possible enhancement.
+- Status: Implemented
+  - Headless background operation in Tauri; Loops A and B are independent of window state (window close hides to tray only).
+  - Monotonic wake‑gap detection: each loop infers system wake when elapsed since last tick exceeds `KLAAYGUARD_WAKE_GAP_SECONDS` (default 300s) and emits `system:wake_detected` with `{ loop: "upload" | "collection" }`.
+  - Post‑wake catch‑up: Loop B performs an immediate extra drain after a detected wake, then resumes normal cadence; Loop A proceeds on its next scheduled tick.
+  - Focus on failure: Any error in either loop triggers the app window to show and focus, debounced by `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` (default 60s). Event `focus:on_failure` is emitted when focusing occurs.
+  - 401/403 handling unchanged: token cleared, `auth:invalidated` + `auth:status` emitted, and window focused for re‑login.
+  - Structured events: `collection:attempt`, `collection:success`, `collection:error`; `upload:success`, `upload:error`; `system:wake_detected`; `focus:on_failure`.
 
 #### 5) Environment Management (Dev/Staging/Prod)
 
