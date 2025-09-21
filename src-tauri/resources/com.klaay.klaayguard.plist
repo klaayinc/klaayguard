@@ -1,1 +1,32 @@
-<!-- Removed: now managed by tauri-plugin-autostart (macOS LaunchAgent). File kept intentionally empty to avoid bundling unused LaunchAgent template. -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__OPEN_PATH__</string>
+        <string>-a</string>
+        <string>__APP_PATH__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/klaayguard.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/klaayguard.error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>KLAAYGUARD_LAUNCHD</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>
+
