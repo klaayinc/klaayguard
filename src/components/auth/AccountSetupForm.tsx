@@ -1,11 +1,7 @@
 import React, { useEffect, useState } from "react";
-import { useAuth } from "../../context/AuthContext";
 import { notify } from "../../utils/utils";
 import { Location, useLocation, useNavigate } from "react-router-dom";
-const BASE_URL = import.meta.env.VITE_API_BASE_URL as string;
-if (!BASE_URL) {
-  throw new Error("VITE_API_BASE_URL is required");
-}
+import { invoke } from "@tauri-apps/api/core";
 
 interface Account {
   id: string;
@@ -29,7 +25,6 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
   );
   const [originLocation, setOriginLocation] = useState<Location | null>(null);
 
-  const { token, authenticateUser } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
 
@@ -45,15 +40,10 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
     const fetchAccounts = async () => {
       setLoading(true);
       try {
-        const res = await fetch(`${BASE_URL}/accounts`, {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        });
-        if (!res.ok) throw new Error("Failed to fetch accounts");
-        const { data } = await res.json();
-        setAccounts(data);
+        const status = await invoke<{ authenticated: boolean }>("get_auth_status");
+        if (!status.authenticated) throw new Error("Not authenticated");
+        // Accounts are part of Earthenware-driven flow; skip direct fetch here
+        setAccounts([]);
       } catch (err) {
         console.error("Error fetching accounts:", err);
         setAccounts([]);
@@ -62,7 +52,7 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
       }
     };
     fetchAccounts();
-  }, [token]);
+  }, []);
 
   const handleAccountSelect = (accountId: string) => {
     setSelected(accountId);
@@ -79,14 +69,8 @@ export const AccountSetupForm: React.FC<AccountSelectorProps> = ({
       return;
     }
     try {
-      await authenticateUser(username, password, selected);
-      const selectedAccount = accounts.find((acc) => acc.id === selected);
-      navigate("/welcome", {
-        state: {
-          accountName: selectedAccount?.attributes.name,
-          accountId: selected,
-        },
-      });
+      // No direct React auth; rely on iframe login. Navigate to welcome.
+      navigate("/welcome");
     } catch (error) {
       notify(new String(error).toString(), "error");
     }

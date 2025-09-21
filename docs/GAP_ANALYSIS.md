@@ -140,20 +140,13 @@ sequenceDiagram
 - Gaps: None critical; optional use of `tauri-plugin-autostart` for Windows/Linux if cross-platform autostart is later required.
 - Recommendations: Keep LaunchAgent as the macOS source of truth; keep `StartInterval` enabled as a crash safety net; continue using in-process tokio intervals for 15-minute cadence.
 
-#### 7) Apple Silicon Targeting
-
-- Expected: Build for macOS Apple Silicon only (for now).
-- Current: Bundled `osqueryi` sidecars cover macOS Apple Silicon, macOS Intel, and Linux x86_64 (glibc). See "Build Targets & Sidecars" for full matrix.
-- Gaps: Ensure release distribution policy aligns with matrix (primary delivery macOS arm64); restrict CI artifacts where desired; ensure sidecar availability for any additional targets before enabling.
-- Recommendations: Gate CI to `aarch64-apple-darwin` for primary releases; optionally produce macOS Intel and Linux x86_64 artifacts; validate bundled sidecars post-build.
-
-#### 8) Security and Robustness Notes
+#### 7) Security and Robustness Notes
 
 - Token exposure: Prefer Keychain persistence and avoid re-exposing raw token to React; expose `authenticated` flag and display info.
 - Iframe origin checks: Compare `new URL(VITE_EARTHENWARE_URL).origin` with `event.origin` to avoid subtle mismatches.
 - Observability: Add structured logs and Sentry breadcrumbs in Tauri for config/collect/upload stages, including status codes and retry counts.
 
-#### 9) Build Targets & Sidecars
+#### 8) Build Targets & Sidecars
 
 - Supported build targets are constrained by availability of the `osqueryi` sidecar bundled via `bundle.externalBin`:
 
@@ -171,7 +164,7 @@ sequenceDiagram
   - `tauri.conf.json` includes `externalBin: ["vendor/osqueryi"]` so Tauri bundles the correct binary per platform.
   - Although `bundle.targets` may be set to `"all"`, actual runnable artifacts require a matching sidecar.
 
-#### 10) Updater
+#### 9) Updater
 
 - Updater is enabled in `tauri.conf.json` and uses the Tauri updater plugin.
 - Behavior depends on signing keys:
@@ -179,7 +172,7 @@ sequenceDiagram
   - When signing key is absent (local/dev), `tauri.no-updater.json` overlay disables artifact creation.
 - Recommendation: Document per-environment updater endpoints and signing requirements; add basic UI/telemetry for update events where useful.
 
-#### 11) Data Retention & Storage
+#### 10) Data Retention & Storage
 
 - SQLite path selection:
   - Default file-backed DB under app data dir (e.g., `~/Library/Application Support/com.klaay.app/klaayguard.db`).
@@ -188,7 +181,7 @@ sequenceDiagram
   - Queue grows with un-uploaded rows; uploader drains and marks handled.
   - Recommend documenting expected growth bounds and optional rotation/cleanup policy for handled rows.
 
-#### 12) Observability & Telemetry
+#### 11) Observability & Telemetry
 
 - Add structured logs and Sentry breadcrumbs around auth, collection, and upload stages (status codes, retry counts, batch sizes, timings).
 - Emit and document events already present: `auth:status`, `auth:invalidated`, `collection:attempt`, `collection:success`, `collection:error`, `upload:success`, `upload:error`, `system:wake_detected`, `focus:on_failure`.

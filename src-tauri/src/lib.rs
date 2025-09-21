@@ -14,6 +14,7 @@
 
 use keyring::Entry;
 use rusqlite::{params, Connection, ToSql};
+use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
@@ -69,6 +70,22 @@ fn delete_token_from_keychain() -> Result<(), String> {
     }
 }
 
+fn add_breadcrumb(category: &str, message: &str, level: Level) {
+    let mut data = std::collections::BTreeMap::new();
+    data.insert(
+        "ts".to_string(),
+        serde_json::json!(chrono::Utc::now().to_rfc3339()),
+    );
+    sentry::add_breadcrumb(sentry::Breadcrumb {
+        ty: "default".to_string(),
+        category: Some(category.to_string()),
+        message: Some(message.to_string()),
+        level,
+        data,
+        ..Default::default()
+    });
+}
+
 #[tauri::command]
 async fn set_api_base_url(
     state: tauri::State<'_, Arc<AppState>>,
@@ -87,6 +104,8 @@ async fn save_auth_token(
     // Reset the session guard; we have a fresh token now
     *state.keychain_cleared_this_session.write().await = false;
     let _ = save_token_to_keychain(&token);
+    add_breadcrumb("auth", "token_saved", Level::Info);
+    sentry::capture_message("auth_token_saved", Level::Info);
     Ok(())
 }
 
@@ -99,6 +118,8 @@ async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), 
         let _ = delete_token_from_keychain();
         *state.keychain_cleared_this_session.write().await = true;
     }
+    add_breadcrumb("auth", "token_cleared", Level::Info);
+    sentry::capture_message("auth_token_cleared", Level::Info);
     Ok(())
 }
 
@@ -165,6 +186,8 @@ async fn get_auth_status(
         .user_agent("klaayguard/0.1")
         .build()
         .map_err(|e| e.to_string())?;
+    add_breadcrumb("auth", "me_request_start", Level::Info);
+    sentry::capture_message("auth_me_request_start", Level::Info);
     let name = match client
         .get(format!("{}/me", base))
         .bearer_auth(&token)
@@ -172,11 +195,18 @@ async fn get_auth_status(
         .await
     {
         Ok(resp) => {
+            add_breadcrumb(
+                "auth",
+                &format!("me_response_status:{}", resp.status().as_u16()),
+                Level::Info,
+            );
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED
                 || resp.status() == reqwest::StatusCode::FORBIDDEN
             {
                 // Invalidate and prompt login
                 invalidate_auth(&app, &state).await.ok();
+                add_breadcrumb("auth", "auth_invalidated_on_me", Level::Warning);
+                sentry::capture_message("auth_invalidated_on_me", Level::Warning);
                 None
             } else if resp.status().is_success() {
                 match resp.json::<Value>().await {
@@ -208,7 +238,11 @@ async fn get_auth_status(
                 None
             }
         }
-        Err(_) => None,
+        Err(e) => {
+            add_breadcrumb("auth", &format!("me_request_error:{}", e), Level::Warning);
+            sentry::capture_message("auth_me_request_error", Level::Warning);
+            None
+        }
     };
     Ok(AuthStatus {
         authenticated: true,
@@ -337,6 +371,8 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     focus_window_with_debounce(app, state).await;
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
+    add_breadcrumb("auth", "auth_invalidated", Level::Warning);
+    sentry::capture_message("auth_invalidated", Level::Warning);
     Ok(())
 }
 
@@ -374,6 +410,7 @@ async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState
             "focus:on_failure",
             json!({ "at": chrono::Utc::now().to_rfc3339() }),
         );
+        add_breadcrumb("ui", "focus_on_failure", Level::Info);
     }
 }
 
@@ -595,6 +632,12 @@ async fn run_upload_cycle(
         *state.upload_in_progress.write().await = false;
         return Ok(());
     }
+    add_breadcrumb(
+        "upload",
+        &format!("pending_rows:{}", rows.len()),
+        Level::Info,
+    );
+    sentry::capture_message("upload_pending_rows", Level::Info);
     let device_id = get_device_uuid_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
@@ -617,36 +660,92 @@ async fn run_upload_cycle(
         batch_id,
         rows: payload_rows,
     };
-    let resp = client
-        .post(format!("{}/klaayguard/data", base))
-        .bearer_auth(&token)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-        || resp.status() == reqwest::StatusCode::FORBIDDEN
-    {
-        invalidate_auth(app, state).await?;
-        let _ = app.emit(
-            "upload:error",
-            json!({ "stage": "post", "status": resp.status().as_u16() }),
-        );
-        *state.upload_in_progress.write().await = false;
-        return Ok(());
-    }
-    if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED {
-        // Mark handled and advance watermark
-        mark_rows_handled_and_advance_watermark(app, state, &ids).await?;
-        let _ = app.emit("upload:success", json!({ "count": ids.len() }));
-    } else {
-        emit_error_and_focus(
-            app,
-            state,
-            "upload:error",
-            json!({ "stage": "post", "status": resp.status().as_u16() }),
-        )
-        .await;
+    let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
+    let retry_delays = [60u64, 120u64];
+    let mut attempt: usize = 0;
+    loop {
+        let send_result = client
+            .post(format!("{}/klaayguard/data", base))
+            .bearer_auth(&token)
+            .json(&payload)
+            .send()
+            .await;
+        match send_result {
+            Ok(resp) => {
+                add_breadcrumb(
+                    "upload",
+                    &format!("post_status:{}", resp.status().as_u16()),
+                    Level::Info,
+                );
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN
+                {
+                    add_breadcrumb("upload", "auth_invalidated_on_post", Level::Warning);
+                    invalidate_auth(app, state).await?;
+                    let _ = app.emit(
+                        "upload:error",
+                        json!({ "stage": "post", "status": resp.status().as_u16() }),
+                    );
+                    *state.upload_in_progress.write().await = false;
+                    return Ok(());
+                }
+                if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED {
+                    mark_rows_handled_and_advance_watermark(app, state, &ids).await?;
+                    let _ = app.emit("upload:success", json!({ "count": ids.len() }));
+                    add_breadcrumb(
+                        "upload",
+                        &format!("success_count:{}", ids.len()),
+                        Level::Info,
+                    );
+                    break;
+                } else if is_transient_status(resp.status().as_u16())
+                    && attempt < retry_delays.len()
+                {
+                    let delay = retry_delays[attempt];
+                    add_breadcrumb(
+                        "upload",
+                        &format!("transient_status_retry_in_s:{}", delay),
+                        Level::Warning,
+                    );
+                    sentry::capture_message("upload_transient_status_retry", Level::Warning);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    attempt += 1;
+                    continue;
+                } else {
+                    emit_error_and_focus(
+                        app,
+                        state,
+                        "upload:error",
+                        json!({ "stage": "post", "status": resp.status().as_u16() }),
+                    )
+                    .await;
+                    sentry::capture_message("upload_error_non_transient", Level::Warning);
+                    break;
+                }
+            }
+            Err(e) => {
+                add_breadcrumb("upload", &format!("network_error:{}", e), Level::Warning);
+                sentry::capture_message("upload_network_error", Level::Warning);
+                if attempt < retry_delays.len() {
+                    let delay = retry_delays[attempt];
+                    add_breadcrumb("upload", &format!("retry_in_s:{}", delay), Level::Warning);
+                    sentry::capture_message("upload_retry", Level::Warning);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    attempt += 1;
+                    continue;
+                } else {
+                    emit_error_and_focus(
+                        app,
+                        state,
+                        "upload:error",
+                        json!({ "stage": "network", "error": e.to_string() }),
+                    )
+                    .await;
+                    sentry::capture_message("upload_error_network_final", Level::Warning);
+                    break;
+                }
+            }
+        }
     }
     *state.upload_in_progress.write().await = false;
     Ok(())
@@ -709,6 +808,8 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             }
             if woke {
                 let _ = app.emit("system:wake_detected", json!({ "loop": "upload" }));
+                add_breadcrumb("system", "wake_detected_upload", Level::Info);
+                sentry::capture_message("wake_detected_upload", Level::Info);
                 // immediate extra drain to catch up after wake
                 if let Err(e) = run_upload_cycle(&app, &state, &client).await {
                     eprintln!("upload cycle (post-wake) error: {}", e);
@@ -719,6 +820,7 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                         json!({ "stage": "internal", "error": e, "post_wake": true }),
                     )
                     .await;
+                    sentry::capture_message("upload_error_post_wake", Level::Warning);
                 }
             }
             *state.last_upload_tick_at.write().await = Some(now);
@@ -743,12 +845,65 @@ async fn run_cycle(
     let _ = app.emit("collection:attempt", ());
 
     // 1) GET /klaayguard/config
-    let cfg_resp = client
-        .get(format!("{}/klaayguard/config", base))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    add_breadcrumb("collection", "config_fetch_start", Level::Info);
+    sentry::capture_message("collection_config_fetch_start", Level::Info);
+    let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
+    let retry_delays = [60u64, 120u64];
+    let mut attempt = 0usize;
+    let cfg_resp = loop {
+        match client
+            .get(format!("{}/klaayguard/config", base))
+            .bearer_auth(&token)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                add_breadcrumb(
+                    "collection",
+                    &format!("config_status:{}", resp.status().as_u16()),
+                    Level::Info,
+                );
+                if !resp.status().is_success()
+                    && is_transient_status(resp.status().as_u16())
+                    && attempt < retry_delays.len()
+                {
+                    let delay = retry_delays[attempt];
+                    add_breadcrumb(
+                        "collection",
+                        &format!("transient_retry_in_s:{}", delay),
+                        Level::Warning,
+                    );
+                    sentry::capture_message("collection_transient_retry", Level::Warning);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    attempt += 1;
+                    continue;
+                }
+                break resp;
+            }
+            Err(e) => {
+                add_breadcrumb(
+                    "collection",
+                    &format!("config_network_error:{}", e),
+                    Level::Warning,
+                );
+                sentry::capture_message("collection_config_network_error", Level::Warning);
+                if attempt < retry_delays.len() {
+                    let delay = retry_delays[attempt];
+                    add_breadcrumb(
+                        "collection",
+                        &format!("retry_in_s:{}", delay),
+                        Level::Warning,
+                    );
+                    sentry::capture_message("collection_retry", Level::Warning);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    attempt += 1;
+                    continue;
+                } else {
+                    return Err(e.to_string());
+                }
+            }
+        }
+    };
 
     if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED
         || cfg_resp.status() == reqwest::StatusCode::FORBIDDEN
@@ -758,6 +913,7 @@ async fn run_cycle(
             "collection:error",
             json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
         );
+        sentry::capture_message("collection_auth_invalidated_on_config", Level::Warning);
         return Ok(());
     }
     if !cfg_resp.status().is_success() {
@@ -768,6 +924,7 @@ async fn run_cycle(
             json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
         )
         .await;
+        sentry::capture_message("collection_error_config_non_transient", Level::Warning);
         return Ok(());
     }
 
@@ -803,6 +960,8 @@ async fn run_cycle(
     }
 
     // 2) osquery
+    add_breadcrumb("collection", "osquery_start", Level::Info);
+    sentry::capture_message("collection_osquery_start", Level::Info);
     let results = execute_sql_batch(app.clone(), queries).await?;
 
     // 3) Persist results to SQLite (Loop A)
@@ -813,6 +972,12 @@ async fn run_cycle(
         "collection:success",
         json!({ "inserted_rows": inserted, "run_id": run_id }),
     );
+    add_breadcrumb(
+        "collection",
+        &format!("persisted_rows:{} run_id:{}", inserted, run_id),
+        Level::Info,
+    );
+    sentry::capture_message("collection_persisted", Level::Info);
 
     Ok(())
 }
@@ -858,6 +1023,8 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             };
             if woke {
                 let _ = app.emit("system:wake_detected", json!({ "loop": "collection" }));
+                add_breadcrumb("system", "wake_detected_collection", Level::Info);
+                sentry::capture_message("wake_detected_collection", Level::Info);
             }
             if let Err(e) = run_cycle(&app, &state, &client).await {
                 eprintln!("cycle error: {}", e);
@@ -1238,6 +1405,29 @@ pub fn run() {
         .ok()
         .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
         .unwrap_or_else(|| "https://api.klaay.com".to_string());
+    if let Ok(earthenware) = std::env::var("VITE_EARTHENWARE_URL") {
+        add_breadcrumb(
+            "startup",
+            &format!("endpoints api:{} earthenware:{}", api_base, earthenware),
+            Level::Info,
+        );
+        // naive mismatch hint: localhost vs non-localhost
+        let api_is_local = api_base.contains("localhost") || api_base.contains("127.0.0.1");
+        let ew_is_local = earthenware.contains("localhost") || earthenware.contains("127.0.0.1");
+        if api_is_local ^ ew_is_local {
+            add_breadcrumb(
+                "startup",
+                "endpoint_mismatch_local_vs_remote",
+                Level::Warning,
+            );
+        }
+    } else {
+        add_breadcrumb(
+            "startup",
+            &format!("endpoints api:{} earthenware:<unset>", api_base),
+            Level::Info,
+        );
+    }
     let state = Arc::new(AppState {
         auth_token: RwLock::new(None),
         api_base_url: RwLock::new(api_base),

@@ -7,12 +7,20 @@ fn main() {
         std::env::var("VITE_SENTRY_DSN").unwrap_or_default(),
         sentry::ClientOptions {
             release: sentry::release_name!(),
-            // Capture user IPs and potentially sensitive headers when using HTTP server integrations
-            // see https://docs.sentry.io/platforms/rust/data-management/data-collected for more info
+            environment: std::env::var("KLAAY_ENV").ok().map(|s| s.into()),
             send_default_pii: true,
+            attach_stacktrace: true,
             ..Default::default()
         },
     ));
+    sentry::configure_scope(|scope| {
+        scope.set_tag("component", "tauri");
+        scope.set_tag("os", std::env::consts::OS);
+        scope.set_tag("arch", std::env::consts::ARCH);
+        if let Ok(app_version) = std::env::var("TAURI_APP_VERSION") {
+            scope.set_tag("app_version", app_version);
+        }
+    });
 
     klaay_guard_lib::run()
 }

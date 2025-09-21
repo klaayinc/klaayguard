@@ -64,8 +64,8 @@ export default function EarthenwareLogin() {
         src={`${EARTHENWARE_URL}/login`}
         className="h-full w-full border-0"
         title="Earthenware Login"
-        allow="camera; microphone; geolocation"
-        sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+        // Minimize permissions; expand only if strictly required by Earthenware login
+        sandbox="allow-same-origin allow-scripts allow-forms"
       />
     </div>
   );
