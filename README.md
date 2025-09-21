@@ -308,6 +308,7 @@ KlaayGuard configures itself to start at login using a macOS LaunchAgent and is 
 - **No Setup Required**: The app installs a LaunchAgent on first run
 - **Always Active**: Auto-start cannot be disabled to ensure continuous monitoring
 - **User-Level Service**: Runs when the user is logged in (not system-wide)
+- **Important**: Auto-start and restart behavior only work when the app is launched from the macOS Applications folder (`/Applications`). Launching from outside Applications (e.g., Downloads) prevents login auto-start and restart from working.
 
 ### How It Works
 
