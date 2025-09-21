@@ -54,7 +54,9 @@ sequenceDiagram
 - React app is only for authentication (Earthenware iframe) and optional user display.
 - Background data collection and upload run in Tauri irrespective of the React window.
 - App must auto-start at login and keep running if closed; recover after restarts.
-- Target platform (for now): macOS Apple Silicon.
+- Primary delivery target: macOS Apple Silicon.
+- Additional supported builds (see Build Targets & Sidecars): macOS Intel (x86_64) and Linux x86_64 (glibc). Blocked targets pending sidecar packaging: Linux aarch64, Windows (x86_64/arm64).
+- Environment overlays: `KLAAY_ENV` selects development/staging/production. Build overlays use `src-tauri/tauri.development.json` and `src-tauri/tauri.staging.json`; defaults for `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` are set in `scripts/tauri-build.cjs` per environment.
 - Environments and endpoints:
   - **Development**: API `http://localhost:3000`, Earthenware `http://localhost:5173`
   - **Staging**: API `https://api.klaay.dev`, Earthenware `https://app.klaay.dev`
@@ -67,6 +69,9 @@ sequenceDiagram
 - macOS LaunchAgent installed with `RunAtLoad` and `KeepAlive=true`; window close hides; no quit menu; duplicate instance guard; updater enabled.
 - React handles iframe login and `/authenticate` POST; the iframe posts the token directly to Tauri via IPC. Tauri stores the token securely in the macOS Keychain and restores it on boot. React does not persist or read the token and instead uses a tokenless `get_auth_status` IPC.
 - Endpoints provided via `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` (used by both React and Tauri).
+- Environment defaults and overlays: `scripts/tauri-build.cjs` injects sane defaults for `VITE_*` per `KLAAY_ENV` and selects per-env Tauri overlays (`tauri.staging.json`, `tauri.development.json`). `tauri.no-updater.json` disables updater artifacts when signing keys are not present.
+- Sidecar packaging: `rake` populates `src-tauri/vendor/osqueryi-<triple>`; `tauri.conf.json` lists it under `bundle.externalBin` so the correct platform-specific binary is bundled.
+- Updater behavior: updater artifacts are produced when signing key is present; unsigned local builds skip updater artifacts via override config.
 
 ### Gaps and Recommendations
 
@@ -119,9 +124,9 @@ sequenceDiagram
 #### 5) Environment Management (Dev/Staging/Prod)
 
 - Expected: Distinct API and Earthenware URLs per environment; both layers aligned.
-- Current: Uses `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL`; no central environment switch or validation.
-- Gaps: Possible mismatch between React and Tauri if env vars diverge.
-- Recommendations: Provide `.env.development`, `.env.staging`, `.env.production`; optionally add `VITE_ENVIRONMENT`; expose active URLs from Tauri to React and warn if mismatched.
+- Current: `KLAAY_ENV` drives environment selection; `scripts/tauri-build.cjs` sets default `VITE_API_BASE_URL`/`VITE_EARTHENWARE_URL` per env and selects Tauri overlay configs (`tauri.staging.json`, `tauri.development.json`).
+- Gaps: Possible mismatch if external env overrides diverge between React and Tauri; no runtime validation/telemetry of resolved URLs.
+- Recommendations: Provide `.env.development`, `.env.staging`, `.env.production`; optionally add `VITE_ENVIRONMENT`; expose active URLs from Tauri to React and warn if mismatched; log/telemetry the resolved URLs on startup.
 
 #### 6) Tauri Autostart and Process Management
 
@@ -133,9 +138,9 @@ sequenceDiagram
 #### 7) Apple Silicon Targeting
 
 - Expected: Build for macOS Apple Silicon only (for now).
-- Current: Bundled `osqueryi` and generic targets; CI may build wider.
-- Gaps: Ensure release targeting is restricted in CI and binary matches architecture.
-- Recommendations: Gate CI to `aarch64-apple-darwin`; validate bundled `osqueryi`.
+- Current: Bundled `osqueryi` sidecars cover macOS Apple Silicon, macOS Intel, and Linux x86_64 (glibc). See "Build Targets & Sidecars" for full matrix.
+- Gaps: Ensure release distribution policy aligns with matrix (primary delivery macOS arm64); restrict CI artifacts where desired; ensure sidecar availability for any additional targets before enabling.
+- Recommendations: Gate CI to `aarch64-apple-darwin` for primary releases; optionally produce macOS Intel and Linux x86_64 artifacts; validate bundled sidecars post-build.
 
 #### 8) Security and Robustness Notes
 
@@ -143,9 +148,50 @@ sequenceDiagram
 - Iframe origin checks: Compare `new URL(VITE_EARTHENWARE_URL).origin` with `event.origin` to avoid subtle mismatches.
 - Observability: Add structured logs and Sentry breadcrumbs in Tauri for config/collect/upload stages, including status codes and retry counts.
 
+#### 9) Build Targets & Sidecars
+
+- Supported build targets are constrained by availability of the `osqueryi` sidecar bundled via `bundle.externalBin`:
+
+  | OS            | CPU     | Rust target triple        | Sidecar packaged                          | Notes                       |
+  | ------------- | ------- | ------------------------- | ----------------------------------------- | --------------------------- |
+  | macOS         | arm64   | aarch64-apple-darwin      | Yes (`osqueryi-aarch64-apple-darwin`)     | Primary delivery target     |
+  | macOS         | x86_64  | x86_64-apple-darwin       | Yes (`osqueryi-x86_64-apple-darwin`)      | Supported                   |
+  | Linux (glibc) | x86_64  | x86_64-unknown-linux-gnu  | Yes (`osqueryi-x86_64-unknown-linux-gnu`) | Supported                   |
+  | Linux (glibc) | aarch64 | aarch64-unknown-linux-gnu | No                                        | Blocked until sidecar added |
+  | Windows       | x86_64  | x86_64-pc-windows-msvc    | No                                        | Blocked until sidecar added |
+  | Windows       | arm64   | aarch64-pc-windows-msvc   | No                                        | Blocked until sidecar added |
+
+- Packaging pipeline:
+  - `Rakefile` downloads osquery (5.18.1), extracts platform bins, and writes `src-tauri/vendor/osqueryi-<triple>`.
+  - `tauri.conf.json` includes `externalBin: ["vendor/osqueryi"]` so Tauri bundles the correct binary per platform.
+  - Although `bundle.targets` may be set to `"all"`, actual runnable artifacts require a matching sidecar.
+
+#### 10) Updater
+
+- Updater is enabled in `tauri.conf.json` and uses the Tauri updater plugin.
+- Behavior depends on signing keys:
+  - When `TAURI_SIGNING_PRIVATE_KEY` is present, updater artifacts are produced and served; Windows installer is configured with `installMode: passive`.
+  - When signing key is absent (local/dev), `tauri.no-updater.json` overlay disables artifact creation.
+- Recommendation: Document per-environment updater endpoints and signing requirements; add basic UI/telemetry for update events where useful.
+
+#### 11) Data Retention & Storage
+
+- SQLite path selection:
+  - Default file-backed DB under app data dir (e.g., `~/Library/Application Support/com.klaay.app/klaayguard.db`).
+  - Override with `KLAAYGUARD_DB_MODE=memory` for in-memory DB or `KLAAYGUARD_DB_PATH` for a custom file path.
+- Retention considerations:
+  - Queue grows with un-uploaded rows; uploader drains and marks handled.
+  - Recommend documenting expected growth bounds and optional rotation/cleanup policy for handled rows.
+
+#### 12) Observability & Telemetry
+
+- Add structured logs and Sentry breadcrumbs around auth, collection, and upload stages (status codes, retry counts, batch sizes, timings).
+- Emit and document events already present: `auth:status`, `auth:invalidated`, `collection:attempt`, `collection:success`, `collection:error`, `upload:success`, `upload:error`, `system:wake_detected`, `focus:on_failure`.
+
 ### Status Summary & Next Steps
 
 - Authentication storage/restore implemented; 401/403 invalidation clears token and focuses app for re‑login.
 - Loop A and Loop B implemented end‑to‑end. `metadata.last_upload_at` advances to the handled set’s max `created_at` on success.
 - Next enhancements: payload size cap/splitting, explicit exponential backoff with jitter and `Retry‑After` support, optional per‑row result handling, and wake‑triggered immediate drain.
-- Ensure `.env.*` alignment for API/Earthenware; keep loops and auth strictly in Tauri. LaunchAgent and Apple Silicon targeting unchanged.
+- Ensure `.env.*` alignment for API/Earthenware and validate resolved URLs at startup.
+- Document and maintain the Build Targets & Sidecars matrix; add missing sidecars to unblock Linux aarch64 and Windows if/when targeted.
