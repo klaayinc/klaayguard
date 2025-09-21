@@ -55,7 +55,7 @@ sequenceDiagram
 - Background data collection and upload run in Tauri irrespective of the React window.
 - App must auto-start at login and keep running if closed; recover after restarts.
 - Primary delivery target: macOS Apple Silicon.
-- Additional supported builds (see Build Targets & Sidecars): macOS Intel (x86_64) and Linux x86_64 (glibc). Blocked targets pending sidecar packaging: Linux aarch64, Windows (x86_64/arm64).
+- Additional supported builds (see Build Targets & Sidecars): macOS Intel (x86_64), Linux x86_64 (glibc), Linux aarch64 (glibc), and Windows x86_64. Blocked target: Windows arm64 pending sidecar packaging.
 - Environment overlays: `KLAAY_ENV` selects development/staging/production. Build overlays use `src-tauri/tauri.development.json` and `src-tauri/tauri.staging.json`; defaults for `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` are set in `scripts/tauri-build.cjs` per environment.
   - CI/CD: GitHub Actions builds all three environments using the env-aware wrapper (`yarn tauri:build`) with `KLAAY_ENV` and passes per-environment URLs; see `.github/workflows/release.yml`.
 - Environments and endpoints:
@@ -152,19 +152,21 @@ sequenceDiagram
 
 - Supported build targets are constrained by availability of the `osqueryi` sidecar bundled via `bundle.externalBin`:
 
-  | OS            | CPU     | Rust target triple        | Sidecar packaged                          | Notes                       |
-  | ------------- | ------- | ------------------------- | ----------------------------------------- | --------------------------- |
-  | macOS         | arm64   | aarch64-apple-darwin      | Yes (`osqueryi-aarch64-apple-darwin`)     | Primary delivery target     |
-  | macOS         | x86_64  | x86_64-apple-darwin       | Yes (`osqueryi-x86_64-apple-darwin`)      | Supported                   |
-  | Linux (glibc) | x86_64  | x86_64-unknown-linux-gnu  | Yes (`osqueryi-x86_64-unknown-linux-gnu`) | Supported                   |
-  | Linux (glibc) | aarch64 | aarch64-unknown-linux-gnu | No                                        | Blocked until sidecar added |
-  | Windows       | x86_64  | x86_64-pc-windows-msvc    | No                                        | Blocked until sidecar added |
-  | Windows       | arm64   | aarch64-pc-windows-msvc   | No                                        | Blocked until sidecar added |
+  | OS            | CPU     | Rust target triple        | Sidecar packaged                           | Notes                       |
+  | ------------- | ------- | ------------------------- | ------------------------------------------ | --------------------------- |
+  | macOS         | arm64   | aarch64-apple-darwin      | Yes (`osqueryi-aarch64-apple-darwin`)      | Primary delivery target     |
+  | macOS         | x86_64  | x86_64-apple-darwin       | Yes (`osqueryi-x86_64-apple-darwin`)       | Supported                   |
+  | Linux (glibc) | x86_64  | x86_64-unknown-linux-gnu  | Yes (`osqueryi-x86_64-unknown-linux-gnu`)  | Supported                   |
+  | Linux (glibc) | aarch64 | aarch64-unknown-linux-gnu | Yes (`osqueryi-aarch64-unknown-linux-gnu`) | Supported                   |
+  | Windows       | x86_64  | x86_64-pc-windows-msvc    | Yes (`osqueryi-x86_64-pc-windows-msvc`)    | Supported                   |
+  | Windows       | arm64   | aarch64-pc-windows-msvc   | No                                         | Blocked until sidecar added |
 
 - Packaging pipeline:
   - `Rakefile` downloads osquery (5.18.1), extracts platform bins, and writes `src-tauri/vendor/osqueryi-<triple>`.
   - `tauri.conf.json` includes `externalBin: ["vendor/osqueryi"]` so Tauri bundles the correct binary per platform.
   - Although `bundle.targets` may be set to `"all"`, actual runnable artifacts require a matching sidecar.
+  - Checksums: release checksum files are fetched and SHA256 is verified for macOS/Linux tarballs and the Windows zip before extraction.
+  - Windows sidecar is sourced from the osquery GitHub Release asset matching the pinned `OSQUERY_VERSION`.
 
 #### 9) Updater
 
