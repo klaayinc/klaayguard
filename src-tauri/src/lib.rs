@@ -369,9 +369,8 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
         let _ = delete_token_from_keychain();
         *state.keychain_cleared_this_session.write().await = true;
     }
-    // Log locally so focus reasons are visible in KlaayGuard.log
+    // Log locally and bring the app to focus to prompt re-login
     log::warn!("Authentication invalidated; focusing window for re-login");
-    // Use debounced focus to avoid excessive window focusing on repeated failures
     focus_window_with_debounce(app, state).await;
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
@@ -409,8 +408,8 @@ async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState
             let _ = window.show();
             let _ = window.set_focus();
         }
-        // Log locally so that focus triggered by background errors is visible in log file
-        log::warn!("Focusing main window due to background error (debounced)");
+        // Log locally when focusing for user-required action (e.g., sign-in)
+        log::warn!("Focusing main window for user action (debounced)");
         *state.last_focus_at.write().await = Some(now);
         let _ = app.emit(
             "focus:on_failure",
@@ -422,7 +421,7 @@ async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState
 
 async fn emit_error_and_focus(
     app: &tauri::AppHandle,
-    state: &Arc<AppState>,
+    _state: &Arc<AppState>,
     event: &str,
     payload: serde_json::Value,
 ) {
@@ -430,13 +429,12 @@ async fn emit_error_and_focus(
     let _ = app.emit(event, payload.clone());
     // Report to Sentry as an error-level event with context
     let serialized = payload.to_string();
-    // Also log locally to KlaayGuard.log for visibility when window focuses
+    // Also log locally to KlaayGuard.log
     log::error!("error_event:{}, payload:{}", event, serialized);
     sentry::capture_message(
         &format!("error_event:{}, payload:{}", event, serialized),
         Level::Error,
     );
-    focus_window_with_debounce(app, state).await;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1444,10 +1442,16 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // If another instance is attempted, bring existing window to front
+            // On secondary launch, show the existing window; only focus if sign-in is required
+            let needs_login = {
+                let st = app.state::<Arc<AppState>>().inner().clone();
+                tauri::async_runtime::block_on(async { st.auth_token.read().await.is_none() })
+            };
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.set_focus();
+                if needs_login {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
             }
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
@@ -1489,10 +1493,30 @@ pub fn run() {
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
 
-            // Show the window on startup to display the login screen
-            window.show().unwrap();
-            window.set_focus().unwrap();
-            log::info!("KlaayGuard started - login screen displayed");
+            // Load token from keychain at startup and emit status BEFORE deciding focus
+            let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
+            if let Ok(Some(tok)) = load_token_from_keychain() {
+                tauri::async_runtime::block_on(async {
+                    *state_for_loop.auth_token.write().await = Some(tok);
+                });
+                let _ = app.emit("auth:status", json!({ "authenticated": true }));
+            } else {
+                let _ = app.emit("auth:status", json!({ "authenticated": false }));
+            }
+
+            // Only take focus on startup if sign-in is required
+            {
+                let needs_login = tauri::async_runtime::block_on(async {
+                    state_for_loop.auth_token.read().await.is_none()
+                });
+                if needs_login {
+                    window.show().unwrap();
+                    window.set_focus().unwrap();
+                    log::info!("KlaayGuard started - login screen displayed");
+                } else {
+                    log::info!("KlaayGuard started - running in background (no focus)");
+                }
+            }
 
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -1522,14 +1546,23 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         log::info!("Show window requested from system tray");
+                        // Show window; only force focus if sign-in is required
+                        let needs_login = {
+                            let st = app.state::<Arc<AppState>>().inner().clone();
+                            tauri::async_runtime::block_on(async {
+                                st.auth_token.read().await.is_none()
+                            })
+                        };
                         if let Some(window) = app.get_webview_window("main") {
                             if let Err(e) = window.show() {
                                 log::error!("Failed to show window: {}", e);
                             } else {
                                 log::info!("Window shown successfully");
                             }
-                            if let Err(e) = window.set_focus() {
-                                log::error!("Failed to focus window: {}", e);
+                            if needs_login {
+                                if let Err(e) = window.set_focus() {
+                                    log::error!("Failed to focus window: {}", e);
+                                }
                             }
                         }
                     }
