@@ -12,6 +12,8 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <key>StartInterval</key>
+    <integer>__START_INTERVAL__</integer>
     <key>ProcessType</key>
     <string>Interactive</string>
     <key>StandardOutPath</key>

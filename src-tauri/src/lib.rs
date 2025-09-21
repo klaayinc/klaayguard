@@ -272,6 +272,59 @@ async fn execute_query(
     Ok(all_results)
 }
 
+/// Executes a batch of SQL statements against osquery and returns results keyed by logical id
+/// The vector contains pairs of (logical_id, sql_to_execute).
+async fn execute_sql_batch(
+    app: tauri::AppHandle,
+    queries: Vec<(String, String)>,
+) -> Result<HashMap<String, Value>, String> {
+    let mut all_results: HashMap<String, Value> = HashMap::new();
+
+    for (logical_id, sql) in queries {
+        let cmd = app
+            .shell()
+            .sidecar("osqueryi")
+            .unwrap()
+            .args(["--json", sql.as_str()]);
+
+        let output = cmd.output().await.map_err(|e| e.to_string())?;
+
+        if !output.status.success() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stderr_lc = stderr_str.to_ascii_lowercase();
+            if stderr_lc.contains("no such table")
+                || stderr_lc.contains("no such column")
+                || stderr_lc.contains("no such module")
+            {
+                all_results.insert(logical_id, serde_json::json!([]));
+                continue;
+            }
+            return Err(format!(
+                "sql for '{}' failed (exit code {:?}): {}",
+                logical_id,
+                output.status.code(),
+                stderr_str
+            ));
+        }
+
+        let stdout_str = String::from_utf8(output.stdout)
+            .map_err(|e| format!("Invalid UTF-8 output for {}: {}", logical_id, e))?;
+
+        let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
+            format!(
+                "Failed to parse JSON for {} (content: '{}'): {}",
+                logical_id,
+                stdout_str.trim(),
+                e
+            )
+        })?;
+
+        all_results.insert(logical_id, parsed_result);
+    }
+
+    Ok(all_results)
+}
+
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     *state.auth_token.write().await = None;
     // Delete the token at most once per session to reduce prompts
@@ -280,10 +333,8 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
         let _ = delete_token_from_keychain();
         *state.keychain_cleared_this_session.write().await = true;
     }
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
+    // Use debounced focus to avoid excessive window focusing on repeated failures
+    focus_window_with_debounce(app, state).await;
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     Ok(())
@@ -721,21 +772,26 @@ async fn run_cycle(
     }
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
-    let tables: Vec<String> = cfg_json
+    // Build query list. If item has an explicit `sql`, use it; otherwise default to SELECT * FROM <id>.
+    let queries: Vec<(String, String)> = cfg_json
         .get("data")
         .and_then(|d| d.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|item| {
-                    item.get("id")
+                    let id = item.get("id").and_then(|v| v.as_str())?;
+                    let sql = item
+                        .get("sql")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("SELECT * FROM {}", id));
+                    Some((id.to_string(), sql))
                 })
                 .collect()
         })
         .unwrap_or_default();
 
-    if tables.is_empty() {
+    if queries.is_empty() {
         emit_error_and_focus(
             app,
             state,
@@ -747,7 +803,7 @@ async fn run_cycle(
     }
 
     // 2) osquery
-    let results = execute_query(app.clone(), tables).await?;
+    let results = execute_sql_batch(app.clone(), queries).await?;
 
     // 3) Persist results to SQLite (Loop A)
     let run_id = Uuid::new_v4().to_string();
@@ -930,16 +986,6 @@ async fn install_launch_agent() -> Result<String, String> {
         let uid = nix::unistd::getuid().as_raw();
         let domain = format!("gui/{}", uid);
 
-        // Check if launch agent is already loaded using modern launchctl
-        let output = std::process::Command::new("launchctl")
-            .args(&["print", &format!("{}/{}", domain, label)])
-            .output()
-            .map_err(|e| format!("Failed to check launch agent status: {}", e))?;
-
-        if output.status.success() {
-            return Ok("Launch agent already installed and running".to_string());
-        }
-
         // Create LaunchAgents directory if it doesn't exist
         fs::create_dir_all(&launch_agents_dir)
             .map_err(|e| format!("Failed to create LaunchAgents directory: {}", e))?;
@@ -966,15 +1012,44 @@ async fn install_launch_agent() -> Result<String, String> {
             current_exe.clone()
         };
 
-        // Read the plist template and replace placeholders
+        // Read the plist template and replace placeholders, including a configurable StartInterval
         let plist_content = include_str!("../resources/com.klaay.klaayguard.plist");
+        let start_interval: u64 = std::env::var("KLAAYGUARD_LAUNCHD_START_INTERVAL_SECONDS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300);
         let plist_content = plist_content
             .replace("__LABEL__", label)
-            .replace("__EXECUTABLE__", &preferred_exec.to_string_lossy());
+            .replace("__EXECUTABLE__", &preferred_exec.to_string_lossy())
+            .replace("__START_INTERVAL__", &start_interval.to_string());
+
+        // If an existing plist differs, we will reload it; if identical and already loaded, return early
+        let mut needs_reload = true;
+        if let Ok(existing) = fs::read_to_string(&plist_path) {
+            if existing == plist_content {
+                // Check if launch agent is already loaded using modern launchctl
+                let output = std::process::Command::new("launchctl")
+                    .args(&["print", &format!("{}/{}", domain, label)])
+                    .output()
+                    .map_err(|e| format!("Failed to check launch agent status: {}", e))?;
+                if output.status.success() {
+                    return Ok("Launch agent already installed and running".to_string());
+                }
+                // File matches but not loaded => proceed to bootstrap without bootout
+                needs_reload = false;
+            }
+        }
 
         // Write the plist file
         fs::write(&plist_path, plist_content)
             .map_err(|e| format!("Failed to write plist file: {}", e))?;
+
+        // If previously loaded with older content, boot it out first to ensure a clean reload
+        if needs_reload {
+            let _ = std::process::Command::new("launchctl")
+                .args(&["bootout", &format!("{}/{}", domain, label)])
+                .output();
+        }
 
         // Bootstrap (load) the launch agent using modern launchctl domain
         let output = std::process::Command::new("launchctl")
@@ -1008,6 +1083,111 @@ async fn install_launch_agent() -> Result<String, String> {
     {
         Err("Launch agent installation is only supported on macOS".to_string())
     }
+}
+
+#[derive(Serialize)]
+struct RuntimeStatusLoops {
+    collection_seconds_since_last_run: Option<u64>,
+    collection_seconds_until_next_due: Option<i64>,
+    upload_seconds_since_last_tick: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct RuntimeStatusAutostart {
+    platform: String,
+    strategy: String,
+    installed: bool,
+    label: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RuntimeStatus {
+    autostart: RuntimeStatusAutostart,
+    loops: RuntimeStatusLoops,
+    auth: AuthStatus,
+}
+
+#[tauri::command]
+async fn get_runtime_status(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<RuntimeStatus, String> {
+    // Loops status
+    let collection_seconds_since_last_run = {
+        let last = *state.last_run_at.read().await;
+        last.map(|t| t.elapsed().as_secs())
+    };
+    let collection_seconds_until_next_due = {
+        if state.auth_token.read().await.is_none() {
+            Some(-1)
+        } else {
+            let last = *state.last_attempt_at.read().await;
+            let interval = std::time::Duration::from_secs(15 * 60);
+            if let Some(last) = last {
+                let elapsed = last.elapsed();
+                if elapsed >= interval {
+                    Some(0)
+                } else {
+                    Some((interval - elapsed).as_secs() as i64)
+                }
+            } else {
+                Some(0)
+            }
+        }
+    };
+    let upload_seconds_since_last_tick = {
+        let last = *state.last_upload_tick_at.read().await;
+        last.map(|t| t.elapsed().as_secs())
+    };
+
+    // Auth
+    let auth = if state.auth_token.read().await.is_some() {
+        AuthStatus {
+            authenticated: true,
+            display_name: None,
+        }
+    } else {
+        AuthStatus {
+            authenticated: false,
+            display_name: None,
+        }
+    };
+
+    // Autostart (platform-specific)
+    #[cfg(target_os = "macos")]
+    let autostart = {
+        let label = "com.klaay.klaayguard".to_string();
+        let uid = nix::unistd::getuid().as_raw();
+        let domain = format!("gui/{}", uid);
+        let installed = std::process::Command::new("launchctl")
+            .args(&["print", &format!("{}/{}", domain, &label)])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        RuntimeStatusAutostart {
+            platform: "macos".to_string(),
+            strategy: "launchagent".to_string(),
+            installed,
+            label: Some(label),
+        }
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let autostart = RuntimeStatusAutostart {
+        platform: std::env::consts::OS.to_string(),
+        strategy: "none".to_string(),
+        installed: false,
+        label: None,
+    };
+
+    Ok(RuntimeStatus {
+        autostart,
+        loops: RuntimeStatusLoops {
+            collection_seconds_since_last_run,
+            collection_seconds_until_next_due,
+            upload_seconds_since_last_tick,
+        },
+        auth,
+    })
 }
 
 /// Handles automatic updates for security patches and bug fixes.
@@ -1245,7 +1425,9 @@ pub fn run() {
             clear_auth_token,
             set_api_base_url,
             get_next_run_in_seconds,
-            get_auth_status
+            get_auth_status,
+            install_launch_agent,
+            get_runtime_status
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");

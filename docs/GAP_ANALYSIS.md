@@ -67,7 +67,7 @@ sequenceDiagram
 
 - Loop A: Tauri background loop (15 min) fetches config, runs bundled `osqueryi`, and persists results to a local SQLite queue (`results` table).
 - Loop B: Background uploader implemented. Drains pending rows and advances a `last_upload_at` watermark in `metadata` after successful upload.
-- macOS LaunchAgent installed with `RunAtLoad` and `KeepAlive=true`; window close hides; no quit menu; duplicate instance guard; updater enabled.
+- macOS LaunchAgent installed with `RunAtLoad`, `KeepAlive=true`, and `StartInterval=300s` safety net; idempotent installer (content-aware) reloads on change; window close hides; no quit menu; duplicate instance guard; updater enabled.
 - React handles iframe login and `/authenticate` POST; the iframe posts the token directly to Tauri via IPC. Tauri stores the token securely in the macOS Keychain and restores it on boot. React does not persist or read the token and instead uses a tokenless `get_auth_status` IPC.
 - Endpoints provided via `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` (used by both React and Tauri).
 - Environment defaults and overlays: `scripts/tauri-build.cjs` injects sane defaults for `VITE_*` per `KLAAY_ENV` and selects per-env Tauri overlays (`tauri.staging.json`, `tauri.development.json`). `tauri.no-updater.json` disables updater artifacts when signing keys are not present.
@@ -134,9 +134,9 @@ sequenceDiagram
 #### 6) Tauri Autostart and Process Management
 
 - Expected: Auto-start and keep running; lean on native mechanisms.
-- Current: LaunchAgent (`RunAtLoad`, `KeepAlive=true`), hide-on-close, no Quit menu, duplicate-instance guard, updater.
-- Gaps: None critical; optional use of `tauri-plugin-autostart` if cross-platform needed.
-- Recommendations: Keep LaunchAgent; optionally add `StartInterval` as a safety net; continue using in-process tokio interval for 15-minute cadence.
+- Current: LaunchAgent (`RunAtLoad`, `KeepAlive=true`, `StartInterval=300s`), hide-on-close, no Quit menu, duplicate-instance guard, updater. Installer is idempotent: compares existing plist content and reloads only when changed.
+- Gaps: None critical; optional use of `tauri-plugin-autostart` for Windows/Linux if cross-platform autostart is later required.
+- Recommendations: Keep LaunchAgent as the macOS source of truth; keep `StartInterval` enabled as a crash safety net; continue using in-process tokio intervals for 15-minute cadence.
 
 #### 7) Apple Silicon Targeting
 
@@ -190,11 +190,13 @@ sequenceDiagram
 
 - Add structured logs and Sentry breadcrumbs around auth, collection, and upload stages (status codes, retry counts, batch sizes, timings).
 - Emit and document events already present: `auth:status`, `auth:invalidated`, `collection:attempt`, `collection:success`, `collection:error`, `upload:success`, `upload:error`, `system:wake_detected`, `focus:on_failure`.
+- IPC: `get_runtime_status` exposes a read-only snapshot for autostart status (platform/strategy/label/installed), loop health (last run/next due), and auth state, for diagnostics and UI surfacing.
 
 ### Status Summary & Next Steps
 
 - Authentication storage/restore implemented; 401/403 invalidation clears token and focuses app for re‑login.
 - Loop A and Loop B implemented end‑to‑end. `metadata.last_upload_at` advances to the handled set’s max `created_at` on success.
+- Autostart hardened: LaunchAgent includes `StartInterval=300s` safety net and uses an idempotent installer that reloads when the plist content changes; focus-on-failure is debounced; runtime status is available via `get_runtime_status` IPC.
 - Next enhancements: payload size cap/splitting, explicit exponential backoff with jitter and `Retry‑After` support, optional per‑row result handling, and wake‑triggered immediate drain.
 - Environment management documented in README (variable matrix and `.env.*` examples). Consider adding runtime validation/telemetry for resolved URLs. CI builds dev/staging/prod using `KLAAY_ENV` with per-environment URLs.
 - Document and maintain the Build Targets & Sidecars matrix; add missing sidecars to unblock Linux aarch64 and Windows if/when targeted.
