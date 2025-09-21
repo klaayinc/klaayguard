@@ -64,22 +64,20 @@ sequenceDiagram
 
 - Tauri background loop (15 min) fetches config, runs bundled `osqueryi`, and posts data to API.
 - macOS LaunchAgent installed with `RunAtLoad` and `KeepAlive=true`; window close hides; no quit menu; duplicate instance guard; updater enabled.
-- React handles iframe login and `/authenticate` POST; stores token in `localStorage` and forwards to Tauri via command.
+- React handles iframe login and `/authenticate` POST; the iframe posts the token directly to Tauri via IPC. Tauri stores the token securely in the macOS Keychain and restores it on boot. React does not persist or read the token and instead uses a tokenless `get_auth_status` IPC.
 - Endpoints provided via `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` (used by both React and Tauri).
 
 ### Gaps and Recommendations
 
 #### 1) Authentication and Token Management
 
-- Expected: Tauri is canonical for token; on unauthenticated state, React iframe login writes token to Tauri; token is stored securely and restored on boot.
-- Current: Token is in React `localStorage` and mirrored into a Tauri in-memory `RwLock`; no secure persistence or boot-time restore.
-- Gaps:
-  - No secure, durable token storage in Tauri (e.g., macOS Keychain)
-  - No boot-time token restore before loops start
-  - React depends on direct token reads; no `get_auth_status` abstraction
-- Recommendations:
-  - Use Keychain (e.g., `tauri-plugin-keychain`) to persist token; load on startup before spawning loops
-  - Expose `set_auth_token` and `get_auth_status` commands; keep Tauri as the source of truth
+- Status: Implemented
+  - Tauri is authoritative for the auth token and stores it in the macOS Keychain
+  - Token is restored at boot before background loops start
+  - IPC commands: `save_auth_token`, `clear_auth_token`, `get_auth_status` (returns `{ authenticated, display_name }` without exposing the token)
+  - React never persists or reads the token; the Earthenware iframe posts the token to Tauri via IPC
+  - Iframe origin check uses `new URL(VITE_EARTHENWARE_URL).origin` against `event.origin`
+  - On 401 from the API, Tauri emits `auth:invalidated` and updates `auth:status`
 
 #### 2) Loop A: Config → osquery → Local Store (SQLite)
 
