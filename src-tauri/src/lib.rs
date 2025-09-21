@@ -17,8 +17,9 @@ use rusqlite::{params, Connection, ToSql};
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 // use tauri_plugin_log::LogTarget; // use defaults
@@ -1154,117 +1155,7 @@ async fn persist_results_to_sqlite(
 /// This function creates a launchd plist file in the user's LaunchAgents directory
 /// and loads it to ensure the app starts automatically on login. This is a mandatory
 /// security feature that cannot be disabled by users.
-#[tauri::command]
-async fn install_launch_agent() -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
-        let launch_agents_dir = home_dir.join("Library/LaunchAgents");
-        let label = "com.klaay.klaayguard";
-        let plist_path = launch_agents_dir.join(format!("{}.plist", label));
-
-        // Determine user launchctl domain
-        let uid = nix::unistd::getuid().as_raw();
-        let domain = format!("gui/{}", uid);
-
-        // Create LaunchAgents directory if it doesn't exist
-        fs::create_dir_all(&launch_agents_dir)
-            .map_err(|e| format!("Failed to create LaunchAgents directory: {}", e))?;
-
-        // Clean up legacy label/file if present
-        let legacy_plist = launch_agents_dir.join("KlaayGuard.plist");
-        if legacy_plist.exists() {
-            let _ = std::process::Command::new("launchctl")
-                .args(&["bootout", &format!("{}/{}", domain, "KlaayGuard")])
-                .output();
-            let _ = fs::remove_file(&legacy_plist);
-        }
-
-        // Get the current executable path (used as fallback when the app is not installed in /Applications)
-        let current_exe = std::env::current_exe()
-            .map_err(|e| format!("Failed to get current executable path: {}", e))?;
-
-        // Determine preferred executable path: prefer installed app in /Applications
-        let installed_path =
-            std::path::Path::new("/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard");
-        let preferred_exec = if installed_path.exists() {
-            installed_path.to_path_buf()
-        } else {
-            current_exe.clone()
-        };
-
-        // Read the plist template and replace placeholders, including a configurable StartInterval
-        let plist_content = include_str!("../resources/com.klaay.klaayguard.plist");
-        let start_interval: u64 = std::env::var("KLAAYGUARD_LAUNCHD_START_INTERVAL_SECONDS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(300);
-        let plist_content = plist_content
-            .replace("__LABEL__", label)
-            .replace("__EXECUTABLE__", &preferred_exec.to_string_lossy())
-            .replace("__START_INTERVAL__", &start_interval.to_string());
-
-        // If an existing plist differs, we will reload it; if identical and already loaded, return early
-        let mut needs_reload = true;
-        if let Ok(existing) = fs::read_to_string(&plist_path) {
-            if existing == plist_content {
-                // Check if launch agent is already loaded using modern launchctl
-                let output = std::process::Command::new("launchctl")
-                    .args(&["print", &format!("{}/{}", domain, label)])
-                    .output()
-                    .map_err(|e| format!("Failed to check launch agent status: {}", e))?;
-                if output.status.success() {
-                    return Ok("Launch agent already installed and running".to_string());
-                }
-                // File matches but not loaded => proceed to bootstrap without bootout
-                needs_reload = false;
-            }
-        }
-
-        // Write the plist file
-        fs::write(&plist_path, plist_content)
-            .map_err(|e| format!("Failed to write plist file: {}", e))?;
-
-        // If previously loaded with older content, boot it out first to ensure a clean reload
-        if needs_reload {
-            let _ = std::process::Command::new("launchctl")
-                .args(&["bootout", &format!("{}/{}", domain, label)])
-                .output();
-        }
-
-        // Bootstrap (load) the launch agent using modern launchctl domain
-        let output = std::process::Command::new("launchctl")
-            .args(&["bootstrap", &domain, plist_path.to_str().unwrap()])
-            .output()
-            .map_err(|e| format!("Failed to bootstrap launch agent: {}", e))?;
-
-        // If already bootstrapped, continue; else require success
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Error code 9 or message indicating already bootstrapped can be ignored
-            if !stderr.contains("EEXIST") && !stderr.contains("already loaded") {
-                return Err(format!("Failed to bootstrap launch agent: {}", stderr));
-            }
-        }
-
-        // Enable the service
-        let _ = std::process::Command::new("launchctl")
-            .args(&["enable", &format!("{}/{}", domain, label)])
-            .output();
-
-        // Kickstart the service immediately
-        let _ = std::process::Command::new("launchctl")
-            .args(&["kickstart", "-k", &format!("{}/{}", domain, label)])
-            .output();
-
-        Ok("Launch agent installed successfully".to_string())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("Launch agent installation is only supported on macOS".to_string())
-    }
-}
+// Removed manual macOS LaunchAgent installation; handled by tauri-plugin-autostart
 
 #[derive(Serialize)]
 struct RuntimeStatusLoops {
@@ -1472,6 +1363,10 @@ pub fn run() {
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle2 = app.handle().clone();
@@ -1493,18 +1388,16 @@ pub fn run() {
                 });
             });
 
-            // Automatically install launch agent on macOS
+            // Autostart handled via plugin; enable at startup on macOS using LaunchAgent
             #[cfg(target_os = "macos")]
             {
-                tauri::async_runtime::spawn(async move {
-                    if let Err(e) = install_launch_agent().await {
-                        log::error!("Failed to install launch agent: {}", e);
-                        sentry::capture_message(
-                            &format!("launch_agent_install_failed:{}", e),
-                            Level::Error,
-                        );
-                    }
-                });
+                if let Err(e) = app.autolaunch().enable() {
+                    log::error!("Failed to enable autostart: {}", e);
+                    sentry::capture_message(
+                        &format!("autostart_enable_failed:{}", e),
+                        Level::Error,
+                    );
+                }
             }
             let window = app.get_webview_window("main").unwrap();
             let window_ = window.clone();
@@ -1629,7 +1522,6 @@ pub fn run() {
             set_api_base_url,
             get_next_run_in_seconds,
             get_auth_status,
-            install_launch_agent,
             get_runtime_status
         ])
         .build(tauri::generate_context!())
