@@ -420,7 +420,14 @@ async fn emit_error_and_focus(
     event: &str,
     payload: serde_json::Value,
 ) {
-    let _ = app.emit(event, payload);
+    // Emit to UI listeners
+    let _ = app.emit(event, payload.clone());
+    // Report to Sentry as an error-level event with context
+    let serialized = payload.to_string();
+    sentry::capture_message(
+        &format!("error_event:{}, payload:{}", event, serialized),
+        Level::Error,
+    );
     focus_window_with_debounce(app, state).await;
 }
 
@@ -1482,6 +1489,7 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 update(handle2).await.unwrap_or_else(|e| {
                     eprintln!("Failed to check for updates: {}", e);
+                    sentry::capture_message(&format!("update_check_failed:{}", e), Level::Error);
                 });
             });
 
@@ -1491,6 +1499,10 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = install_launch_agent().await {
                         eprintln!("Failed to install launch agent: {}", e);
+                        sentry::capture_message(
+                            &format!("launch_agent_install_failed:{}", e),
+                            Level::Error,
+                        );
                     }
                 });
             }
@@ -1592,6 +1604,7 @@ pub fn run() {
             // Initialize SQLite (file-backed) path and schema
             if let Err(e) = init_sqlite(&app.handle()) {
                 eprintln!("Failed to initialize SQLite: {}", e);
+                sentry::capture_message(&format!("sqlite_init_failed:{}", e), Level::Error);
             } else {
                 if let Some(p) = get_sqlite_path(&app.handle()).ok() {
                     tauri::async_runtime::block_on(async {
