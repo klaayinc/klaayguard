@@ -62,7 +62,7 @@ sequenceDiagram
 
 ### Current Implementation Snapshot
 
-- Tauri background loop (15 min) fetches config, runs bundled `osqueryi`, and posts data to API.
+- Tauri background loop (15 min) fetches config, runs bundled `osqueryi`, and persists results to a local SQLite queue (`results` table). Upload to API is deferred to Loop B.
 - macOS LaunchAgent installed with `RunAtLoad` and `KeepAlive=true`; window close hides; no quit menu; duplicate instance guard; updater enabled.
 - React handles iframe login and `/authenticate` POST; the iframe posts the token directly to Tauri via IPC. Tauri stores the token securely in the macOS Keychain and restores it on boot. React does not persist or read the token and instead uses a tokenless `get_auth_status` IPC.
 - Endpoints provided via `VITE_API_BASE_URL` and `VITE_EARTHENWARE_URL` (used by both React and Tauri).
@@ -77,24 +77,22 @@ sequenceDiagram
   - IPC commands: `save_auth_token`, `clear_auth_token`, `get_auth_status` (returns `{ authenticated, display_name }` without exposing the token)
   - React never persists or reads the token; the Earthenware iframe posts the token to Tauri via IPC
   - Iframe origin check uses `new URL(VITE_EARTHENWARE_URL).origin` against `event.origin`
-  - On 401 from the API, Tauri emits `auth:invalidated` and updates `auth:status`
+- On 401/403 from the API, Tauri clears the token, emits `auth:invalidated`, updates `auth:status`, and brings the app window to the foreground for re‑login
 
 #### 2) Loop A: Config → osquery → Local Store (SQLite)
 
-- Expected: Results are written to a local SQLite queue every cycle.
-- Current: Results are posted immediately; no local persistence.
-- Gaps: No SQLite database/schema for results and metadata.
-- Recommendations:
-  - Add SQLite via `tauri-plugin-sql` with schema, e.g.:
-    - `results(id INTEGER PK, table TEXT, json TEXT, created_at DATETIME, handled BOOLEAN DEFAULT 0, handled_at DATETIME NULL)`
-    - `metadata(key TEXT PK, value TEXT)` (store `last_upload_at`)
-  - Insert all osquery rows as unhandled on each cycle
+- Status: Implemented
+  - On each cycle, the agent GETs `/klaayguard/config` with the bearer token, runs `osqueryi` accordingly, and inserts all rows into SQLite `results` with fields: `id`, `table_name`, `json`, `run_id`, `created_at`, `handled`, `handled_at`.
+  - A `run_id` (UUID) groups all rows generated in a single execution.
+  - DB mode: file‑backed by default in development at `~/Library/Application Support/com.klaay.app/klaayguard.db`; optional memory mode via `KLAAYGUARD_DB_MODE=memory`.
+  - Non‑overlapping 15‑minute scheduler; emits `collection:success` with `{ run_id, inserted_rows }`.
+  - On 401/403 during config fetch, the token is cleared and the app focuses for re‑login (cycle aborts).
 
 #### 3) Loop B: Upload Pending → Mark Handled → Update last_upload_at
 
 - Expected: Every cycle, select pending rows (`handled=false` and `created_at > last_upload_at`), POST, mark handled, update `last_upload_at`.
-- Current: Immediate POST after collection only; no pending queue; no `last_upload_at`.
-- Gaps: No durability, idempotency, partial-batch handling, or retry/backoff.
+- Current: Queue exists and is being populated by Loop A; uploader not implemented yet; `metadata.last_upload_at` not set.
+- Gaps: Idempotent upload, partial‑batch handling, retry/backoff logic are pending.
 - Recommendations:
   - Implement a separate uploader that drains batches from SQLite, marks handled in a transaction, and sets `metadata.last_upload_at=now()`
   - Add exponential backoff on transient failures; never drop data
@@ -102,9 +100,9 @@ sequenceDiagram
 #### 4) Background Execution and System Sleep
 
 - Expected: Runs without UI; robust to sleep/wake.
-- Current: Runs in Tauri without UI; during sleep, timers pause and resume on wake.
-- Gaps: Without a queue, missed data can be lost; no explicit backlog drain strategy.
-- Recommendations: Rely on SQLite queue and drain backlog on wake/start; optionally assert power during active runs (advanced macOS) if necessary.
+- Current: Runs in Tauri without UI; during sleep, timers pause and resume on wake. Queue is present (SQLite `results`), so data accumulates durably while offline.
+- Gaps: Backlog drain/upload strategy depends on Loop B implementation.
+- Recommendations: Drain backlog on wake/start via Loop B; optionally assert power during active runs (advanced macOS) if necessary.
 
 #### 5) Environment Management (Dev/Staging/Prod)
 
@@ -133,11 +131,10 @@ sequenceDiagram
 - Iframe origin checks: Compare `new URL(VITE_EARTHENWARE_URL).origin` with `event.origin` to avoid subtle mismatches.
 - Observability: Add structured logs and Sentry breadcrumbs in Tauri for config/collect/upload stages, including status codes and retry counts.
 
-### Summary of Required Changes
+### Status Summary & Next Steps
 
-- Secure, durable Tauri token storage (Keychain) and boot-time restore; Tauri authoritative for auth state
-- Introduce SQLite queue (`results`, `metadata.last_upload_at`); separate uploader with mark-as-handled and retry/backoff
-- First-class environment setup via `.env.*` (dev/staging/prod) for both API and Earthenware; optional `VITE_ENVIRONMENT`
-- Keep data loops fully within Tauri; React limited to authentication UX and optional display
-- Accept OS sleep; ensure backlog drain on wake/start
-- Keep LaunchAgent autostart; optionally add `StartInterval`; restrict CI to Apple Silicon
+- Token storage and boot‑time restore are implemented; 401/403 invalidation focuses the app for re‑login.
+- SQLite queue is implemented (`results` now populated on every cycle). Add `metadata.last_upload_at` during Loop B.
+- Next: Implement Loop B uploader with mark‑as‑handled and retry/backoff.
+- Ensure `.env.*` alignment for API/Earthenware; keep loops and auth strictly in Tauri.
+- Accept OS sleep; backlog will be drained once Loop B lands. LaunchAgent remains as is; Apple Silicon targeting unchanged.

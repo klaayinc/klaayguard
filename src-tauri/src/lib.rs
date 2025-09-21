@@ -13,12 +13,14 @@
 //! - System tray provides controlled access to app functionality
 
 use keyring::Entry;
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
-use std::{collections::HashMap, fs, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 // Re-introduced minimal osquery commands used by the UI.
 
@@ -28,6 +30,7 @@ pub struct AppState {
     pub api_base_url: RwLock<String>,
     pub last_run_at: RwLock<Option<std::time::Instant>>,
     pub last_attempt_at: RwLock<Option<std::time::Instant>>,
+    pub db_path: RwLock<Option<String>>, // file-backed SQLite path
 }
 
 const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
@@ -132,7 +135,10 @@ struct AuthStatus {
 }
 
 #[tauri::command]
-async fn get_auth_status(state: tauri::State<'_, Arc<AppState>>) -> Result<AuthStatus, String> {
+async fn get_auth_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<AuthStatus, String> {
     let token_opt = state.auth_token.read().await.clone();
     if token_opt.is_none() {
         return Ok(AuthStatus {
@@ -152,32 +158,44 @@ async fn get_auth_status(state: tauri::State<'_, Arc<AppState>>) -> Result<AuthS
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(body) => {
-                let attrs = body
-                    .get("data")
-                    .and_then(|d| d.get("attributes"))
-                    .cloned()
-                    .unwrap_or(json!({}));
-                let first = attrs
-                    .get("first_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let last = attrs
-                    .get("last_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let email = attrs.get("email").and_then(|v| v.as_str());
-                let full = format!("{} {}", first, last).trim().to_string();
-                if !full.is_empty() {
-                    Some(full)
-                } else {
-                    email.map(|s| s.to_string())
+        Ok(resp) => {
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
+            {
+                // Invalidate and prompt login
+                invalidate_auth(&app, &state).await.ok();
+                None
+            } else if resp.status().is_success() {
+                match resp.json::<Value>().await {
+                    Ok(body) => {
+                        let attrs = body
+                            .get("data")
+                            .and_then(|d| d.get("attributes"))
+                            .cloned()
+                            .unwrap_or(json!({}));
+                        let first = attrs
+                            .get("first_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let last = attrs
+                            .get("last_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let email = attrs.get("email").and_then(|v| v.as_str());
+                        let full = format!("{} {}", first, last).trim().to_string();
+                        if !full.is_empty() {
+                            Some(full)
+                        } else {
+                            email.map(|s| s.to_string())
+                        }
+                    }
+                    Err(_) => None,
                 }
+            } else {
+                None
             }
-            Err(_) => None,
-        },
-        _ => None,
+        }
+        Err(_) => None,
     };
     Ok(AuthStatus {
         authenticated: true,
@@ -232,6 +250,11 @@ async fn execute_query(
 
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     *state.auth_token.write().await = None;
+    let _ = delete_token_from_keychain();
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     Ok(())
@@ -261,11 +284,13 @@ async fn run_cycle(
         .await
         .map_err(|e| e.to_string())?;
 
-    if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+    if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        || cfg_resp.status() == reqwest::StatusCode::FORBIDDEN
+    {
         invalidate_auth(app, state).await?;
         let _ = app.emit(
             "collection:error",
-            json!({ "stage": "config", "status": 401 }),
+            json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
         );
         return Ok(());
     }
@@ -306,59 +331,14 @@ async fn run_cycle(
     // 2) osquery
     let results = execute_query(app.clone(), tables).await?;
 
-    // 3) device uuid
-    let device_uuid = get_device_uuid(app.clone())
-        .await
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    // 4) format payload like UI
-    let mut formatted: Vec<Value> = Vec::new();
-    for (table_name, entries) in results {
-        if let Some(arr) = entries.as_array() {
-            for entry in arr {
-                formatted.push(json!({
-                    "type": table_name,
-                    "attributes": entry
-                }));
-            }
-        }
-    }
-
-    let body = json!({
-        "device_uuid": device_uuid,
-        "data": formatted
-    });
-
-    // POST /klaayguard/data
-    let post_resp = client
-        .post(format!("{}/klaayguard/data", base))
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if post_resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        invalidate_auth(app, state).await?;
-        let _ = app.emit(
-            "collection:error",
-            json!({ "stage": "post", "status": 401 }),
-        );
-        return Ok(());
-    }
-
-    if post_resp.status().is_success() {
-        *state.last_run_at.write().await = Some(std::time::Instant::now());
-        let _ = app.emit("collection:success", ());
-    } else {
-        let _ = app.emit(
-            "collection:error",
-            json!({
-                "stage": "post",
-                "status": post_resp.status().as_u16()
-            }),
-        );
-    }
+    // 3) Persist results to SQLite (Loop A)
+    let run_id = Uuid::new_v4().to_string();
+    let inserted = persist_results_to_sqlite(app, state, &run_id, &results).await?;
+    *state.last_run_at.write().await = Some(std::time::Instant::now());
+    let _ = app.emit(
+        "collection:success",
+        json!({ "inserted_rows": inserted, "run_id": run_id }),
+    );
 
     Ok(())
 }
@@ -391,6 +371,101 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             }
         }
     });
+}
+
+fn get_sqlite_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    // Mode selection: default file for development, memory for production unless overridden
+    let mode = std::env::var("KLAAYGUARD_DB_MODE").unwrap_or_else(|_| "file".to_string());
+    if mode.eq_ignore_ascii_case("memory") {
+        // Indicate memory by returning a special :memory: path
+        return Ok(PathBuf::from(":memory:"));
+    }
+    let mut base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir error: {}", e))?;
+    let file_override = std::env::var("KLAAYGUARD_DB_PATH").ok();
+    if let Some(p) = file_override {
+        return Ok(PathBuf::from(p));
+    }
+    base.push("klaayguard.db");
+    Ok(base)
+}
+
+fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
+    let db_path = get_sqlite_path(app)?;
+    if db_path != PathBuf::from(":memory:") {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create_dir_all for db parent failed: {}", e))?;
+        }
+    }
+    let mut conn = if db_path == PathBuf::from(":memory:") {
+        Connection::open_in_memory().map_err(|e| e.to_string())?
+    } else {
+        Connection::open(&db_path).map_err(|e| e.to_string())?
+    };
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode=WAL;
+        PRAGMA foreign_keys=ON;
+        CREATE TABLE IF NOT EXISTS results (
+          id INTEGER PRIMARY KEY,
+          table_name TEXT NOT NULL,
+          json TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          handled INTEGER DEFAULT 0,
+          handled_at DATETIME NULL
+        );
+        CREATE TABLE IF NOT EXISTS metadata (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL
+        );
+        "#,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn persist_results_to_sqlite(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    run_id: &str,
+    results: &HashMap<String, Value>,
+) -> Result<usize, String> {
+    let db_path = {
+        let current = state.db_path.read().await.clone();
+        if let Some(p) = current {
+            PathBuf::from(p)
+        } else {
+            get_sqlite_path(app)?
+        }
+    };
+    let mut conn = if db_path == PathBuf::from(":memory:") {
+        Connection::open_in_memory().map_err(|e| e.to_string())?
+    } else {
+        Connection::open(&db_path).map_err(|e| e.to_string())?
+    };
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut inserted = 0usize;
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO results (table_name, json, run_id) VALUES (?1, ?2, ?3)")
+            .map_err(|e| e.to_string())?;
+        for (table, value) in results.iter() {
+            if let Some(arr) = value.as_array() {
+                for row in arr {
+                    let row_str = serde_json::to_string(row).map_err(|e| e.to_string())?;
+                    stmt.execute(params![table.as_str(), row_str.as_str(), run_id])
+                        .map_err(|e| e.to_string())?;
+                    inserted += 1;
+                }
+            }
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(inserted)
 }
 
 /// Installs a launch agent for automatic startup on macOS.
@@ -544,6 +619,7 @@ pub fn run() {
         api_base_url: RwLock::new(api_base),
         last_run_at: RwLock::new(None),
         last_attempt_at: RwLock::new(None),
+        db_path: RwLock::new(None),
     });
 
     let app = tauri::Builder::default()
@@ -693,6 +769,18 @@ pub fn run() {
                 let _ = app.emit("auth:status", json!({ "authenticated": true }));
             } else {
                 let _ = app.emit("auth:status", json!({ "authenticated": false }));
+            }
+
+            // Initialize SQLite (file-backed) path and schema
+            if let Err(e) = init_sqlite(&app.handle()) {
+                eprintln!("Failed to initialize SQLite: {}", e);
+            } else {
+                if let Some(p) = get_sqlite_path(&app.handle()).ok() {
+                    tauri::async_runtime::block_on(async {
+                        *state_for_loop.db_path.write().await =
+                            Some(p.to_string_lossy().to_string());
+                    });
+                }
             }
 
             spawn_background_loop(app_handle, state_for_loop);
