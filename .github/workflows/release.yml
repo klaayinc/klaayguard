@@ -51,17 +51,23 @@ jobs:
       fail-fast: false
       matrix:
         build: [development, staging, production]
-        platform: [macos-arm, macos-x64, ubuntu]
+        platform: [macos-arm, macos-x64, ubuntu, ubuntu-arm64, windows]
         include:
           - platform: macos-arm # for Arm based macs (M1 and above).
             runner: macos-latest
-            args: "--target aarch64-apple-darwin --bundles app"
+            args: "--target aarch64-apple-darwin"
           - platform: macos-x64 # for Intel based macs.
             runner: macos-latest
             args: "--target x86_64-apple-darwin"
           - platform: ubuntu
             runner: ubuntu-22.04
             args: "--bundles deb rpm"
+          - platform: ubuntu-arm64
+            runner: ubuntu-22.04
+            args: "--target aarch64-unknown-linux-gnu --bundles deb rpm"
+          - platform: windows
+            runner: windows-latest
+            args: ""
 
           - build: development
             api_url: "http://localhost:3000"
@@ -102,11 +108,82 @@ jobs:
         # webkitgtk 4.0 is for Tauri v1 - webkitgtk 4.1 is for Tauri v2.
         # You can remove the one that doesn't apply to your app to speed up the workflow a bit.
 
+      - name: (Ubuntu arm64) install cross toolchain
+        if: ${{ matrix.platform == 'ubuntu-arm64' }}
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+
       - name: install frontend dependencies
         run: yarn install # change this to npm, pnpm or bun depending on which one you use.
 
-      - name: Setup osquery binaries
+      - name: Setup osquery binaries (macOS/Linux)
+        if: ${{ matrix.runner != 'windows-latest' }}
         run: yarn setup-osquery
+
+      - name: Setup osquery binary (Windows via GitHub Releases)
+        if: ${{ matrix.runner == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Read OSQUERY_VERSION from Rakefile to stay in sync
+          $rake = Get-Content Rakefile -Raw
+          $m = Select-String -InputObject $rake -Pattern 'OSQUERY_VERSION\s*=\s*"([0-9\.]+)"' -AllMatches | Select-Object -First 1
+          if (-not $m) { throw "Unable to parse OSQUERY_VERSION from Rakefile" }
+          $ver = $m.Matches[0].Groups[1].Value
+          Write-Host "Using OSQUERY_VERSION=$ver"
+
+          $tagUrl = "https://api.github.com/repos/osquery/osquery/releases/tags/$ver"
+          $json = Invoke-RestMethod -Uri $tagUrl
+          if (-not $json.assets) { throw "No assets found for osquery $ver" }
+          $asset = $json.assets | Where-Object { $_.name -match "windows_x86_64\.zip$" } | Select-Object -First 1
+          if (-not $asset) { throw "No windows_x86_64.zip asset for osquery $ver" }
+          # Download checksum file if present and verify zip
+          $shaAsset = $json.assets | Where-Object { $_.name -match "sha256" } | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path tmp | Out-Null
+          $zipPath = "tmp/osquery-windows_x86_64-$ver.zip"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath
+          if ($shaAsset) {
+            $shaPath = "tmp/" + $shaAsset.name
+            Invoke-WebRequest -Uri $shaAsset.browser_download_url -OutFile $shaPath
+            $expected = (Get-Content $shaPath) | ForEach-Object { if ($_ -match "([0-9a-fA-F]{64}).*windows_x86_64.zip") { $Matches[1].ToLower() } }
+            if (-not $expected) { Write-Host "No matching checksum line found for windows_x86_64.zip" } else {
+              $actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+              if ($actual -ne $expected) { throw "Checksum mismatch for osquery windows zip: expected $expected got $actual" }
+              Write-Host "Verified checksum for Windows zip"
+            }
+          }
+          Expand-Archive -Path $zipPath -DestinationPath tmp/osquery -Force
+          $src = Get-ChildItem -Path tmp/osquery -Recurse -Filter osqueryd.exe | Select-Object -First 1
+          if (-not $src) { throw "osqueryd.exe not found in expanded archive" }
+          New-Item -ItemType Directory -Force -Path src-tauri/vendor | Out-Null
+          Copy-Item -Force $src.FullName "src-tauri/vendor/osqueryi-x86_64-pc-windows-msvc.exe"
+          Write-Host "Prepared Windows sidecar from GitHub Releases"
+
+      - name: Verify sidecar binaries exist (macOS/Linux)
+        if: ${{ matrix.runner != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Listing vendor sidecars:"
+          ls -l src-tauri/vendor || true
+          if [ "${{ matrix.platform }}" = "ubuntu" ]; then
+            test -f src-tauri/vendor/osqueryi-x86_64-unknown-linux-gnu || (echo "Missing Linux x86_64 sidecar" && exit 1)
+          elif [ "${{ matrix.platform }}" = "ubuntu-arm64" ]; then
+            test -f src-tauri/vendor/osqueryi-aarch64-unknown-linux-gnu || (echo "Missing Linux aarch64 sidecar" && exit 1)
+          else
+            test -f src-tauri/vendor/osqueryi-aarch64-apple-darwin || (echo "Missing macOS arm64 sidecar" && exit 1)
+            test -f src-tauri/vendor/osqueryi-x86_64-apple-darwin || (echo "Missing macOS x64 sidecar" && exit 1)
+          fi
+
+      - name: Verify sidecar binary exists (Windows)
+        if: ${{ matrix.runner == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (!(Test-Path "src-tauri/vendor/osqueryi-x86_64-pc-windows-msvc.exe")) { throw "Missing Windows x64 sidecar" }
 
       - name: Sync version across all files
         run: yarn sync-version
@@ -136,7 +213,8 @@ jobs:
           echo "CERT_ID is $CERT_ID"
           echo "Certificate imported."
 
-      - name: Build Tauri (env-aware)
+      - name: Build Tauri (env-aware) (macOS/Linux)
+        if: ${{ matrix.runner != 'windows-latest' }}
         env:
           KLAAY_ENV: ${{ matrix.build }}
           VITE_API_BASE_URL: ${{ matrix.api_url }}
@@ -152,11 +230,31 @@ jobs:
           if [ "${{ matrix.platform }}" = "ubuntu" ]; then
             # Build Linux bundles (defaults cover .AppImage/.deb/.rpm via bundle.targets=all)
             yarn tauri:build ${{ matrix.args }}
+          elif [ "${{ matrix.platform }}" = "ubuntu-arm64" ]; then
+            # Cross-build Linux aarch64 bundles
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+            yarn tauri:build ${{ matrix.args }}
           else
             yarn tauri:build ${{ matrix.args }}
           fi
 
-      - name: Rename and upload artifacts to single release
+      - name: Build Tauri (env-aware) (Windows)
+        if: ${{ matrix.runner == 'windows-latest' }}
+        shell: pwsh
+        env:
+          KLAAY_ENV: ${{ matrix.build }}
+          VITE_API_BASE_URL: ${{ matrix.api_url }}
+          VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
+          VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          node scripts/tauri-build.cjs ${{ matrix.args }}
+
+      - name: Rename and upload artifacts to single release (macOS/Linux)
+        if: ${{ matrix.runner != 'windows-latest' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
@@ -174,38 +272,96 @@ jobs:
           find src-tauri/target -type f \( -name "*.dmg" -o -name "*.app" -o -name "*.tar.gz" -o -name "*.sig" \) | head -20
 
           if [ "${{ matrix.platform }}" = "macos-x64" ]; then
-            # DMG for x64
-            echo "Looking for x86_64 DMG files..."
-            echo "Searching in: src-tauri/target/x86_64-apple-darwin"
-            echo "All DMG files in target:"
-            find src-tauri/target/x86_64-apple-darwin -name "*.dmg" -type f || echo "No DMG files found"
-            
-            DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -type f -name "KlaayGuard_*.dmg" | head -n1)
-            echo "Found DMG: '${DMG_PATH:-None}'"
-            
+            echo "Looking for macOS x64 DMG first (deterministic paths)"
+            DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
+            if [ -z "${DMG_PATH:-}" ]; then
+              echo "Fallback: search any DMG under x86_64-apple-darwin"
+              DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -name "*.dmg" -type f | head -n1 || true)
+            fi
             if [ -n "${DMG_PATH:-}" ]; then
-              RENAMED_DMG="KlaayGuard_${VERSION}_x64_${{ matrix.build }}.dmg"
+              RENAMED_DMG="KlaayGuard_${VERSION}_macOS_x64_${{ matrix.build }}.dmg"
               cp "$DMG_PATH" "$RENAMED_DMG"
               uploaded+=("$RENAMED_DMG")
               echo "Added to upload: $RENAMED_DMG"
             else
-              echo "No DMG file found with pattern 'KlaayGuard_*.dmg'"
-              echo "Trying alternative patterns:"
-              find src-tauri/target/x86_64-apple-darwin -name "*KlaayGuard*.dmg" -type f || echo "No files with *KlaayGuard*.dmg"
-              find src-tauri/target/x86_64-apple-darwin -name "*.dmg" -type f || echo "No .dmg files at all"
+              echo "DMG not found; attempting .app.tar.gz fallback"
+              APP_TGZ_PATH=$(find src-tauri/target/x86_64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
+              if [ -n "${APP_TGZ_PATH:-}" ]; then
+                RENAMED_TGZ="KlaayGuard_${VERSION}_macOS_x64_${{ matrix.build }}.app.tar.gz"
+                cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
+                uploaded+=("$RENAMED_TGZ")
+                echo "Added to upload: $RENAMED_TGZ"
+              else
+                echo "No macOS x64 artifact found"
+              fi
             fi
           fi
 
+      - name: Rename and upload artifacts to single release (Windows)
+        if: ${{ matrix.runner == 'windows-latest' }}
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $VERSION = Get-Content VERSION -Raw
+          $VERSION = $VERSION.Trim()
+
+          Write-Host "Authenticating gh"
+          echo $env:GITHUB_TOKEN | gh auth login --with-token | Out-Null
+
+          $uploaded = @()
+          $base = "src-tauri/target/release/bundle"
+
+          # Prefer MSI, fallback to NSIS exe
+          $msi = Get-ChildItem -Path "$base/msi" -Filter *.msi -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) {
+            $renamed = "KlaayGuard_${VERSION}_Windows_x64_${{ matrix.build }}.msi"
+            Copy-Item $msi.FullName $renamed -Force
+            $uploaded += $renamed
+            Write-Host "Added to upload: $renamed"
+          } else {
+            $nsis = Get-ChildItem -Path "$base/nsis" -Filter *.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($nsis) {
+              $renamed = "KlaayGuard_${VERSION}_Windows_x64_${{ matrix.build }}.exe"
+              Copy-Item $nsis.FullName $renamed -Force
+              $uploaded += $renamed
+              Write-Host "Added to upload: $renamed"
+            } else {
+              Write-Host "No Windows installer artifact found"
+            }
+          }
+
+          if ($uploaded.Count -gt 0) {
+            gh release upload "$env:RELEASE_TAG" $uploaded --clobber
+          } else {
+            Write-Host "No artifacts found to upload for Windows ${{ matrix.build }}"
+          }
+
           if [ "${{ matrix.platform }}" = "macos-arm" ]; then
-            # aarch64 .app.tar.gz files (automatically created by Tauri)
-            echo "Looking for aarch64 .app.tar.gz files..."
-            APP_TGZ_PATH=$(find src-tauri/target/aarch64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1)
-            echo "Found .app.tar.gz: ${APP_TGZ_PATH:-'None'}"
-            if [ -n "${APP_TGZ_PATH:-}" ]; then
-              RENAMED_TGZ="KlaayGuard_${VERSION}_aarch64_${{ matrix.build }}.app.tar.gz"
-              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
-              uploaded+=("$RENAMED_TGZ")
-              echo "Added to upload: $RENAMED_TGZ"
+            echo "Looking for macOS arm64 DMG first (deterministic paths)"
+            DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
+            if [ -z "${DMG_PATH:-}" ]; then
+              echo "Fallback: search any DMG under aarch64-apple-darwin"
+              DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -name "*.dmg" -type f | head -n1 || true)
+            fi
+            if [ -n "${DMG_PATH:-}" ]; then
+              RENAMED_DMG="KlaayGuard_${VERSION}_macOS_arm64_${{ matrix.build }}.dmg"
+              cp "$DMG_PATH" "$RENAMED_DMG"
+              uploaded+=("$RENAMED_DMG")
+              echo "Added to upload: $RENAMED_DMG"
+            else
+              echo "DMG not found; attempting .app.tar.gz fallback"
+              APP_TGZ_PATH=$(find src-tauri/target/aarch64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
+              if [ -n "${APP_TGZ_PATH:-}" ]; then
+                RENAMED_TGZ="KlaayGuard_${VERSION}_macOS_arm64_${{ matrix.build }}.app.tar.gz"
+                cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
+                uploaded+=("$RENAMED_TGZ")
+                echo "Added to upload: $RENAMED_TGZ"
+              else
+                echo "No macOS arm64 artifact found"
+              fi
             fi
           fi
 
@@ -215,7 +371,7 @@ jobs:
             # AppImage
             APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1 || true)
             if [ -n "${APPIMAGE:-}" ]; then
-              RENAMED_APPIMAGE="KlaayGuard_${VERSION}_x86_64_${{ matrix.build }}.AppImage"
+              RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
               cp "$APPIMAGE" "$RENAMED_APPIMAGE"
               uploaded+=("$RENAMED_APPIMAGE")
               echo "Added to upload: $RENAMED_APPIMAGE"
@@ -223,7 +379,7 @@ jobs:
             # deb
             DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
             if [ -n "${DEB:-}" ]; then
-              RENAMED_DEB="KlaayGuard_${VERSION}_x86_64_${{ matrix.build }}.deb"
+              RENAMED_DEB="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.deb"
               cp "$DEB" "$RENAMED_DEB"
               uploaded+=("$RENAMED_DEB")
               echo "Added to upload: $RENAMED_DEB"
@@ -231,7 +387,26 @@ jobs:
             # rpm
             RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
             if [ -n "${RPM:-}" ]; then
-              RENAMED_RPM="KlaayGuard_${VERSION}_x86_64_${{ matrix.build }}.rpm"
+              RENAMED_RPM="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.rpm"
+              cp "$RPM" "$RENAMED_RPM"
+              uploaded+=("$RENAMED_RPM")
+              echo "Added to upload: $RENAMED_RPM"
+            fi
+          elif [ "${{ matrix.platform }}" = "ubuntu-arm64" ]; then
+            echo "Looking for Linux arm64 artifacts (.deb/.rpm)"
+            BASE_DIR="src-tauri/target/aarch64-unknown-linux-gnu/release/bundle"
+            # deb
+            DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
+            if [ -n "${DEB:-}" ]; then
+              RENAMED_DEB="KlaayGuard_${VERSION}_Linux_arm64_${{ matrix.build }}.deb"
+              cp "$DEB" "$RENAMED_DEB"
+              uploaded+=("$RENAMED_DEB")
+              echo "Added to upload: $RENAMED_DEB"
+            fi
+            # rpm
+            RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
+            if [ -n "${RPM:-}" ]; then
+              RENAMED_RPM="KlaayGuard_${VERSION}_Linux_arm64_${{ matrix.build }}.rpm"
               cp "$RPM" "$RENAMED_RPM"
               uploaded+=("$RENAMED_RPM")
               echo "Added to upload: $RENAMED_RPM"
