@@ -33,6 +33,8 @@ pub struct AppState {
     pub last_attempt_at: RwLock<Option<std::time::Instant>>,
     pub db_path: RwLock<Option<String>>, // file-backed SQLite path
     pub upload_in_progress: RwLock<bool>,
+    // Prevent repeated Keychain delete prompts by ensuring we only delete once per session
+    pub keychain_cleared_this_session: RwLock<bool>,
 }
 
 const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
@@ -80,6 +82,8 @@ async fn save_auth_token(
     token: String,
 ) -> Result<(), String> {
     *state.auth_token.write().await = Some(token.clone());
+    // Reset the session guard; we have a fresh token now
+    *state.keychain_cleared_this_session.write().await = false;
     let _ = save_token_to_keychain(&token);
     Ok(())
 }
@@ -87,7 +91,12 @@ async fn save_auth_token(
 #[tauri::command]
 async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     *state.auth_token.write().await = None;
-    let _ = delete_token_from_keychain();
+    // Allow a single delete per session to avoid repeated Keychain prompts
+    let already_cleared = *state.keychain_cleared_this_session.read().await;
+    if !already_cleared {
+        let _ = delete_token_from_keychain();
+        *state.keychain_cleared_this_session.write().await = true;
+    }
     Ok(())
 }
 
@@ -252,7 +261,12 @@ async fn execute_query(
 
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     *state.auth_token.write().await = None;
-    let _ = delete_token_from_keychain();
+    // Delete the token at most once per session to reduce prompts
+    let already_cleared = *state.keychain_cleared_this_session.read().await;
+    if !already_cleared {
+        let _ = delete_token_from_keychain();
+        *state.keychain_cleared_this_session.write().await = true;
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
@@ -917,6 +931,7 @@ pub fn run() {
         last_attempt_at: RwLock::new(None),
         db_path: RwLock::new(None),
         upload_in_progress: RwLock::new(false),
+        keychain_cleared_this_session: RwLock::new(false),
     });
 
     let app = tauri::Builder::default()
