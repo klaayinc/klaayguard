@@ -236,10 +236,21 @@ async fn execute_query(
         let output = cmd.output().await.map_err(|e| e.to_string())?;
 
         if !output.status.success() {
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let stderr_lc = stderr_str.to_ascii_lowercase();
+            // Gracefully handle missing/unsupported tables by recording an empty result set
+            if stderr_lc.contains("no such table")
+                || stderr_lc.contains("no such column")
+                || stderr_lc.contains("no such module")
+            {
+                all_results.insert(table_name, serde_json::json!([]));
+                continue;
+            }
             return Err(format!(
-                "exit code {:?}: {}",
+                "table {} failed (exit code {:?}): {}",
+                table_name,
                 output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
+                stderr_str
             ));
         }
 
