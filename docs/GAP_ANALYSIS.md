@@ -133,6 +133,8 @@ sequenceDiagram
 
 #### 6) Tauri Autostart and Process Management
 
+- Status: Implemented
+
 - Expected: Auto-start and keep running; lean on native mechanisms.
 - Current: LaunchAgent (`RunAtLoad`, `KeepAlive=true`, `StartInterval=300s`), hide-on-close, no Quit menu, duplicate-instance guard, updater. Installer is idempotent: compares existing plist content and reloads only when changed.
 - Gaps: None critical; optional use of `tauri-plugin-autostart` for Windows/Linux if cross-platform autostart is later required.
