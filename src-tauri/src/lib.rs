@@ -368,6 +368,8 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
         let _ = delete_token_from_keychain();
         *state.keychain_cleared_this_session.write().await = true;
     }
+    // Log locally so focus reasons are visible in KlaayGuard.log
+    log::warn!("Authentication invalidated; focusing window for re-login");
     // Use debounced focus to avoid excessive window focusing on repeated failures
     focus_window_with_debounce(app, state).await;
     let _ = app.emit("auth:invalidated", ());
@@ -406,6 +408,8 @@ async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState
             let _ = window.show();
             let _ = window.set_focus();
         }
+        // Log locally so that focus triggered by background errors is visible in log file
+        log::warn!("Focusing main window due to background error (debounced)");
         *state.last_focus_at.write().await = Some(now);
         let _ = app.emit(
             "focus:on_failure",
@@ -425,6 +429,8 @@ async fn emit_error_and_focus(
     let _ = app.emit(event, payload.clone());
     // Report to Sentry as an error-level event with context
     let serialized = payload.to_string();
+    // Also log locally to KlaayGuard.log for visibility when window focuses
+    log::error!("error_event:{}, payload:{}", event, serialized);
     sentry::capture_message(
         &format!("error_event:{}, payload:{}", event, serialized),
         Level::Error,
@@ -773,7 +779,7 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
         // immediate drain
-            if let Err(e) = run_upload_cycle(&app, &state, &client).await {
+        if let Err(e) = run_upload_cycle(&app, &state, &client).await {
             log::error!("initial upload cycle error: {}", e);
             emit_error_and_focus(
                 &app,
@@ -1452,7 +1458,11 @@ pub fn run() {
         .manage(state.clone())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_log::Builder::new().level(log::LevelFilter::Info).build())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
