@@ -25,10 +25,25 @@ end
 def download_checksums_file
     assets = fetch_release_assets
     checksum_asset = assets.find { |a| a["name"] =~ /sha256/i }
-    raise "No SHA256 checksum asset found for osquery #{OSQUERY_VERSION}" unless checksum_asset
-    path = File.join(DIR_TMP, checksum_asset["name"])
-    File.write(path, URI.open(checksum_asset["browser_download_url"]).read)
-    path
+    if checksum_asset
+        path = File.join(DIR_TMP, checksum_asset["name"])
+        File.write(path, URI.open(checksum_asset["browser_download_url"]).read)
+        return path
+    end
+
+    # Fallback: Some releases embed per-asset SHA256 digests instead of publishing a checksum file.
+    # Build a synthetic checksums file from the assets' digest fields.
+    generated_path = File.join(DIR_TMP, "osquery-#{OSQUERY_VERSION}-SHA256SUMS.generated.txt")
+    lines = assets
+        .select { |a| a["digest"].to_s.start_with?("sha256:") && a["name"] }
+        .map do |a|
+            sha = a["digest"].sub(/^sha256:/, "").downcase
+            filename = File.basename(a["name"])
+            "#{sha}  #{filename}\n"
+        end
+    raise "No SHA256 digests available for osquery #{OSQUERY_VERSION}" if lines.empty?
+    File.write(generated_path, lines.join)
+    generated_path
 end
 
 def parse_checksums(path)
