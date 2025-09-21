@@ -150,6 +150,8 @@ sequenceDiagram
 
 #### 8) Build Targets & Sidecars
 
+- Status: Implemented
+
 - Supported build targets are constrained by availability of the `osqueryi` sidecar bundled via `bundle.externalBin`:
 
   | OS            | CPU     | Rust target triple        | Sidecar packaged                           | Notes                       |
