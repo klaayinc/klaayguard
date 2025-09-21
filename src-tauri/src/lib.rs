@@ -1463,6 +1463,14 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .build(),
         )
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // If another instance is attempted, bring existing window to front
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+            log::info!("single_instance: secondary launch routed to primary instance");
+        }))
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
@@ -1476,28 +1484,7 @@ pub fn run() {
             }
 
             // Check if we're already running as a regular process to prevent duplicates
-            #[cfg(target_os = "macos")]
-            {
-                let current_pid = std::process::id();
-                let output = std::process::Command::new("pgrep")
-                    .args(&["-f", "KlaayGuard"])
-                    .output();
-
-                if let Ok(output) = output {
-                    if output.status.success() {
-                        let other_count = String::from_utf8_lossy(&output.stdout)
-                            .lines()
-                            .filter_map(|line| line.trim().parse::<u32>().ok())
-                            .filter(|pid| *pid != current_pid)
-                            .count();
-
-                        // If another KlaayGuard process is running (excluding this one), exit this instance
-                        if other_count > 0 {
-                            std::process::exit(0);
-                        }
-                    }
-                }
-            }
+            // Duplicate instance prevention handled by single-instance plugin; remove manual pgrep/exit logic
 
             tauri::async_runtime::spawn(async move {
                 update(handle2).await.unwrap_or_else(|e| {
