@@ -12,6 +12,7 @@
 //! - Background operation ensures continuous monitoring
 //! - System tray provides controlled access to app functionality
 
+use keyring::Entry;
 use serde_json::{json, Value};
 use std::{collections::HashMap, fs, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -29,6 +30,36 @@ pub struct AppState {
     pub last_attempt_at: RwLock<Option<std::time::Instant>>,
 }
 
+const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
+const KEYCHAIN_ACCOUNT: &str = "auth_token";
+
+fn keyring_entry() -> Result<Entry, String> {
+    Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+        .map_err(|e| format!("keychain new entry error: {}", e))
+}
+
+fn save_token_to_keychain(token: &str) -> Result<(), String> {
+    keyring_entry()?
+        .set_password(token)
+        .map_err(|e| format!("keychain set_password error: {}", e))
+}
+
+fn load_token_from_keychain() -> Result<Option<String>, String> {
+    match keyring_entry()?.get_password() {
+        Ok(p) => Ok(Some(p)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keychain get_password error: {}", e)),
+    }
+}
+
+fn delete_token_from_keychain() -> Result<(), String> {
+    match keyring_entry()?.delete_password() {
+        Ok(_) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete_password error: {}", e)),
+    }
+}
+
 #[tauri::command]
 async fn set_api_base_url(
     state: tauri::State<'_, Arc<AppState>>,
@@ -43,13 +74,15 @@ async fn save_auth_token(
     state: tauri::State<'_, Arc<AppState>>,
     token: String,
 ) -> Result<(), String> {
-    *state.auth_token.write().await = Some(token);
+    *state.auth_token.write().await = Some(token.clone());
+    let _ = save_token_to_keychain(&token);
     Ok(())
 }
 
 #[tauri::command]
 async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
     *state.auth_token.write().await = None;
+    let _ = delete_token_from_keychain();
     Ok(())
 }
 
@@ -90,6 +123,66 @@ async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
         .ok_or_else(|| "Couldn't find device uuid".to_string())?;
 
     Ok(uuid.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct AuthStatus {
+    authenticated: bool,
+    display_name: Option<String>,
+}
+
+#[tauri::command]
+async fn get_auth_status(state: tauri::State<'_, Arc<AppState>>) -> Result<AuthStatus, String> {
+    let token_opt = state.auth_token.read().await.clone();
+    if token_opt.is_none() {
+        return Ok(AuthStatus {
+            authenticated: false,
+            display_name: None,
+        });
+    }
+    let base = state.api_base_url.read().await.clone();
+    let token = token_opt.unwrap();
+    let client = reqwest::Client::builder()
+        .user_agent("klaayguard/0.1")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let name = match client
+        .get(format!("{}/me", base))
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(body) => {
+                let attrs = body
+                    .get("data")
+                    .and_then(|d| d.get("attributes"))
+                    .cloned()
+                    .unwrap_or(json!({}));
+                let first = attrs
+                    .get("first_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let last = attrs
+                    .get("last_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let email = attrs.get("email").and_then(|v| v.as_str());
+                let full = format!("{} {}", first, last).trim().to_string();
+                if !full.is_empty() {
+                    Some(full)
+                } else {
+                    email.map(|s| s.to_string())
+                }
+            }
+            Err(_) => None,
+        },
+        _ => None,
+    };
+    Ok(AuthStatus {
+        authenticated: true,
+        display_name: name,
+    })
 }
 
 #[tauri::command]
@@ -140,6 +233,7 @@ async fn execute_query(
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     *state.auth_token.write().await = None;
     let _ = app.emit("auth:invalidated", ());
+    let _ = app.emit("auth:status", json!({ "authenticated": false }));
     Ok(())
 }
 
@@ -590,6 +684,17 @@ pub fn run() {
             // Spawn background monitoring loop
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
+
+            // Load token from keychain at startup and emit status
+            if let Ok(Some(tok)) = load_token_from_keychain() {
+                tauri::async_runtime::block_on(async {
+                    *state_for_loop.auth_token.write().await = Some(tok);
+                });
+                let _ = app.emit("auth:status", json!({ "authenticated": true }));
+            } else {
+                let _ = app.emit("auth:status", json!({ "authenticated": false }));
+            }
+
             spawn_background_loop(app_handle, state_for_loop);
 
             Ok(())
@@ -601,7 +706,8 @@ pub fn run() {
             save_auth_token,
             clear_auth_token,
             set_api_base_url,
-            get_next_run_in_seconds
+            get_next_run_in_seconds,
+            get_auth_status
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");

@@ -1,7 +1,6 @@
 
 import React, { createContext, useState, useContext, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { jwtDecode } from "jwt-decode";
 const BASE_URL = import.meta.env.VITE_API_BASE_URL as string;
 if (!BASE_URL) {
   throw new Error("VITE_API_BASE_URL is required");
@@ -86,14 +85,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   }
 
-  const decodeTokenManually = (token: string) => {
-    try {
-      const payload = jwtDecode(token);
-      return payload;
-    } catch {
-      return null;
-    }
-  };
+  // Token decoding removed; React should not inspect the token
 
   async function authenticateUser(
     username: string,
@@ -142,32 +134,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
         const jwtToken = responseData.data.attributes.token;
         if (jwtToken) {
           setToken(jwtToken);
-          localStorage.setItem("jwtToken", jwtToken);
           void invoke("save_auth_token", { token: jwtToken }).catch(() => {});
         }
 
-        const account = decodeTokenManually(jwtToken) as Record<string, unknown>;
+        setIsAccountConfigRequired(false);
+        navigate("/welcome");
 
-        if (!account?.account_id) {
-          setIsAccountConfigRequired(true);
-          navigate("/account-setup", {
-            state: {
-              username: username,
-              password: password,
-            },
-          });
-        } else {
-          setIsAccountConfigRequired(false);
-          navigate("/welcome");
-        }
-
-        // Resolve display name from /me endpoint
-        if (jwtToken) {
-          const name = await fetchUserNameFromMe(jwtToken);
-          setUserName(name ?? username);
-        } else {
-          setUserName(username);
-        }
+        // Resolve display name later via get_auth_status; set fallback now
+        setUserName(username);
 
         setIsAuthenticated(true);
         setError("");
@@ -181,38 +155,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   useEffect(() => {
     const initializeApp = async () => {
-      const savedToken = localStorage.getItem("jwtToken");
       const currentPath = window.location.pathname;
       void invoke("set_api_base_url", { base: BASE_URL }).catch(() => {});
 
-      if (savedToken) {
-        // Best-effort derive a display name from JWT if available
-        const decoded = ((): Record<string, unknown> | null => {
-          try { return decodeTokenManually(savedToken) as Record<string, unknown>; } catch { return null; }
-        })();
-        if (decoded) {
-          const nameCandidate = (decoded as Record<string, unknown>)?.name as string | undefined;
-          const emailCandidate = (decoded as Record<string, unknown>)?.email as string | undefined;
-          const n = nameCandidate || emailCandidate || null;
-          if (n) setUserName(String(n));
+      try {
+        const status = await invoke<{ authenticated: boolean; display_name: string | null }>("get_auth_status");
+        if (status.authenticated) {
+          setIsAuthenticated(true);
+          if (status.display_name) setUserName(status.display_name);
+          if (currentPath === "/signin") navigate("/welcome");
+        } else {
+          setIsAuthenticated(false);
+          navigate("/signin");
         }
-
-        setToken(savedToken);
-        setIsAuthenticated(true);
-        void invoke("save_auth_token", { token: savedToken }).catch(() => {});
-        try {
-          const name = await fetchUserNameFromMe(savedToken);
-          if (name) setUserName(name);
-        } catch {}
-
-        if (currentPath == "/signin") {
-          if (isAccountConfigRequired) {
-            navigate("/account-setup");
-          } else {
-            navigate("/welcome");
-          }
-        }
-      } else {
+      } catch {
         navigate("/signin");
       }
     };
@@ -220,30 +176,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     initializeApp();
   }, []);
 
-  // Listen for storage changes to handle token updates from iframe
-  useEffect(() => {
-    const handleStorageChange = (e: StorageEvent) => {
-      if (e.key === "jwtToken" && e.newValue) {
-        const newToken = e.newValue;
-        setToken(newToken);
-        setIsAuthenticated(true);
-        
-        // Save token to Tauri backend
-        void invoke("save_auth_token", { token: newToken }).catch(() => {});
-        
-        // Fetch user name
-        void fetchUserNameFromMe(newToken).then(name => {
-          if (name) setUserName(name);
-        });
-        
-        // Navigate to welcome screen
-        navigate("/welcome");
-      }
-    };
-
-    window.addEventListener("storage", handleStorageChange);
-    return () => window.removeEventListener("storage", handleStorageChange);
-  }, [navigate]);
+  // Removed localStorage listener; iframe now sends token directly to Tauri
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -277,7 +210,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   const logout = () => {
     setToken(null);
     setIsAuthenticated(false);
-    localStorage.removeItem("jwtToken");
     try {
       void invoke("clear_auth_token");
     } catch (_e) {

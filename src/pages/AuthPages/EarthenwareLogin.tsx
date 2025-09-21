@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
+import { invoke } from "@tauri-apps/api/core";
 
 const EARTHENWARE_URL = import.meta.env.VITE_EARTHENWARE_URL as string;
 if (!EARTHENWARE_URL) {
@@ -22,7 +23,8 @@ export default function EarthenwareLogin() {
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
       // Only accept messages from Earthenware origin
-      if (event.origin !== EARTHENWARE_URL) {
+      const expectedOrigin = new URL(EARTHENWARE_URL).origin;
+      if (event.origin !== expectedOrigin) {
         return;
       }
 
@@ -30,19 +32,16 @@ export default function EarthenwareLogin() {
 
       if (type === "AUTH_SUCCESS") {
         // Handle successful authentication
-        const { token: authToken, needsAccountSelection } = data;
-        
-        // Store the token in localStorage (this will be picked up by AuthContext)
-        localStorage.setItem("jwtToken", authToken);
-        
-        // If account selection is needed, we might need to handle that
-        // For now, just proceed with authentication
-        if (needsAccountSelection) {
-          console.log("Account selection needed, but proceeding with authentication");
-        }
-        
-        // Trigger authentication check in the context
-        window.location.reload();
+        const { token: authToken } = data;
+
+        // Persist token in Tauri backend (Keychain) and navigate
+        void invoke("save_auth_token", { token: authToken })
+          .then(() => {
+            navigate("/welcome");
+          })
+          .catch(() => {
+            // If saving fails, stay on signin
+          });
       } else if (type === "AUTH_ERROR") {
         // Handle authentication error
         console.error("Authentication error:", data.error);
