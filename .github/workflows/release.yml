@@ -32,21 +32,28 @@ jobs:
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
       - name: Create draft release if missing
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          if gh release view "${{ steps.set_tag.outputs.tag }}" >/dev/null 2>&1; then
+          if gh release view "${{ steps.set_tag.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release ${{ steps.set_tag.outputs.tag }} already exists"
           else
             gh release create "${{ steps.set_tag.outputs.tag }}" \
               --title "KlaayGuard v${{ steps.set_tag.outputs.version }}" \
               --notes "See the assets to download this version and install." \
-              --draft
+              --draft \
+              --repo "$GITHUB_REPOSITORY"
           fi
 
   publish-tauri:
     needs: create-release
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -256,14 +263,10 @@ jobs:
       - name: Rename and upload artifacts (macOS x64)
         if: ${{ matrix.platform == 'macos-x64' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           set -euo pipefail
           VERSION=$(cat VERSION)
-
-          # Authenticate gh (uses GITHUB_TOKEN)
-          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
 
           uploaded=()
 
@@ -292,8 +295,8 @@ jobs:
           fi
 
           if [ ${#uploaded[@]} -gt 0 ]; then
-            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
-            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+            echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else
             echo "No artifacts found to upload for macOS x64 ${{ matrix.build }}"
           fi
@@ -301,13 +304,10 @@ jobs:
       - name: Rename and upload artifacts (macOS arm64)
         if: ${{ matrix.platform == 'macos-arm' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           set -euo pipefail
           VERSION=$(cat VERSION)
-
-          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
 
           uploaded=()
 
@@ -336,8 +336,8 @@ jobs:
           fi
 
           if [ ${#uploaded[@]} -gt 0 ]; then
-            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
-            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+            echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else
             echo "No artifacts found to upload for macOS arm64 ${{ matrix.build }}"
           fi
@@ -345,13 +345,10 @@ jobs:
       - name: Rename and upload artifacts (Linux x86_64)
         if: ${{ matrix.platform == 'ubuntu' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           set -euo pipefail
           VERSION=$(cat VERSION)
-
-          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
 
           uploaded=()
           BASE_DIR="src-tauri/target/release/bundle"
@@ -382,8 +379,8 @@ jobs:
           fi
 
           if [ ${#uploaded[@]} -gt 0 ]; then
-            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
-            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+            echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else
             echo "No artifacts found to upload for Linux x86_64 ${{ matrix.build }}"
           fi
@@ -391,13 +388,10 @@ jobs:
       - name: Rename and upload artifacts (Linux arm64)
         if: ${{ matrix.platform == 'ubuntu-arm64' }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           set -euo pipefail
           VERSION=$(cat VERSION)
-
-          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
 
           uploaded=()
           BASE_DIR="src-tauri/target/aarch64-unknown-linux-gnu/release/bundle"
@@ -420,8 +414,8 @@ jobs:
           fi
 
           if [ ${#uploaded[@]} -gt 0 ]; then
-            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
-            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+            echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
           else
             echo "No artifacts found to upload for Linux arm64 ${{ matrix.build }}"
           fi
@@ -430,15 +424,11 @@ jobs:
         if: ${{ matrix.runner == 'windows-latest' }}
         shell: pwsh
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
           $VERSION = Get-Content VERSION -Raw
           $VERSION = $VERSION.Trim()
-
-          Write-Host "Authenticating gh"
-          echo $env:GITHUB_TOKEN | gh auth login --with-token | Out-Null
 
           $uploaded = @()
           $base = "src-tauri/target/release/bundle"
@@ -463,7 +453,7 @@ jobs:
           }
 
           if ($uploaded.Count -gt 0) {
-            gh release upload "$env:RELEASE_TAG" $uploaded --clobber
+            gh release upload "$env:RELEASE_TAG" $uploaded --repo "$env:GITHUB_REPOSITORY" --clobber
           } else {
             Write-Host "No artifacts found to upload for Windows ${{ matrix.build }}"
           }
