@@ -33,7 +33,7 @@ jobs:
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
       - name: Create draft release if missing
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           if gh release view "${{ steps.set_tag.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -45,5 +45,3 @@ jobs:
               --draft \
               --repo "$GITHUB_REPOSITORY"
           fi
-
-

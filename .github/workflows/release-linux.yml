@@ -74,6 +74,8 @@ jobs:
 
       - name: Rename and upload artifacts (Linux x86_64)
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           VERSION: ${{ inputs.version }}
         run: |
@@ -189,6 +191,8 @@ jobs:
 
       - name: Rename and upload artifacts (Linux arm64)
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           VERSION: ${{ inputs.version }}
         run: |
@@ -219,5 +223,3 @@ jobs:
           else
             echo "No artifacts found to upload for Linux arm64 ${{ matrix.build }}"
           fi
-
-

@@ -110,6 +110,8 @@ jobs:
 
       - name: Rename and upload artifacts (macOS)
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           VERSION: ${{ inputs.version }}
         run: |
@@ -146,5 +148,3 @@ jobs:
           else
             echo "No artifacts found to upload for macOS ${{ matrix.arch }} ${{ matrix.build }}"
           fi
-
-

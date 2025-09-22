@@ -112,6 +112,8 @@ jobs:
       - name: Rename and upload artifacts (Windows)
         shell: pwsh
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.release_tag }}
           VERSION: ${{ inputs.version }}
         run: |
@@ -144,5 +146,3 @@ jobs:
           } else {
             Write-Host "No artifacts found to upload for Windows ${{ matrix.build }}"
           }
-
-
