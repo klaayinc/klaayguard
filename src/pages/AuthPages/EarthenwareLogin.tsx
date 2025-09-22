@@ -50,7 +50,7 @@ export default function EarthenwareLogin() {
 
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);
-  }, []);
+  }, [navigate]);
 
   // If authenticated, don't render the iframe
   if (isAuthenticated) {
@@ -65,7 +65,9 @@ export default function EarthenwareLogin() {
         className="h-full w-full border-0"
         title="Earthenware Login"
         // Minimize permissions; expand only if strictly required by Earthenware login
-        sandbox="allow-same-origin allow-scripts allow-forms"
+        sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+        // Allow Federated Credential Management (FedCM) for Google Sign-In inside iframe
+        allow="identity-credentials-get"
       />
     </div>
   );
