@@ -1639,6 +1639,22 @@ pub fn run() {
                 log::info!("KlaayGuard configured as background service - hidden from dock");
             }
 
+            // Ensure no window is created before activation policy; create programmatically now
+            if app.get_webview_window("main").is_none() {
+                if let Err(e) = tauri::webview::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::default(),
+                )
+                .title("KlaayGuard")
+                .visible(false)
+                .center()
+                .build()
+                {
+                    log::error!("Failed to create main window: {}", e);
+                }
+            }
+
             // Check if we're already running as a regular process to prevent duplicates
             // Duplicate instance prevention handled by single-instance plugin; remove manual pgrep/exit logic
 

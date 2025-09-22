@@ -10,16 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "KlaayGuard",
-        "width": 800,
-        "height": 600,
-        "visible": false,
-        "center": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

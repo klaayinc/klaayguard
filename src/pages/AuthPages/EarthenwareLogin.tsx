@@ -52,6 +52,21 @@ export default function EarthenwareLogin() {
     return () => window.removeEventListener("message", handleMessage);
   }, [navigate]);
 
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      if (event.source !== iframeRef.current?.contentWindow) return
+      const { type, url } = event.data || {}
+      if (type === 'OPEN_EXTERNAL' && typeof url === 'string') {
+        // Open in default browser via Tauri shell plugin (available in this app)
+        import('@tauri-apps/plugin-shell').then(({ open }) => {
+          void open(url).catch(() => {})
+        })
+      }
+    }
+    window.addEventListener('message', handler)
+    return () => window.removeEventListener('message', handler)
+  }, [])
+
   // If authenticated, don't render the iframe
   if (isAuthenticated) {
     return null;
@@ -65,7 +80,7 @@ export default function EarthenwareLogin() {
         className="h-full w-full border-0"
         title="Earthenware Login"
         // Minimize permissions; expand only if strictly required by Earthenware login
-        sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox"
+            sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation"
         // Allow Federated Credential Management (FedCM) for Google Sign-In inside iframe
         allow="identity-credentials-get"
       />
