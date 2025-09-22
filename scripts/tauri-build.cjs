@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 const { spawnSync } = require('node:child_process')
+const path = require('node:path')
+const fs = require('node:fs')
 
 // KLAAY_ENV determines which environment to build for. Defaults to production.
 // Allowed values: production | staging | development
@@ -38,5 +40,26 @@ if (!hasKey) {
 // Pass through any additional CLI flags (e.g., --target)
 args.push(...passThrough)
 
-const result = spawnSync('tauri', args, { stdio: 'inherit', env: process.env })
-process.exit(result.status || 0)
+function resolveTauriCommand() {
+  const binDir = path.resolve(__dirname, '../node_modules/.bin')
+  const win = process.platform === 'win32'
+  const candidate = path.join(binDir, win ? 'tauri.cmd' : 'tauri')
+  if (fs.existsSync(candidate)) return candidate
+  // Fallback to PATH (works when invoked via yarn where .bin is injected)
+  return 'tauri'
+}
+
+const tauriCmd = resolveTauriCommand()
+const result = spawnSync(tauriCmd, args, { stdio: 'inherit', env: process.env, shell: false })
+
+if (result.error) {
+  console.error(`[tauri-build] Failed to spawn Tauri CLI: ${result.error.message}`)
+  process.exit(1)
+}
+
+if (typeof result.status !== 'number' || result.status !== 0) {
+  console.error(`[tauri-build] Tauri exited with code ${result.status ?? 'unknown'}`)
+  process.exit(result.status ?? 1)
+}
+
+process.exit(0)

@@ -132,6 +132,13 @@ jobs:
       - name: install frontend dependencies
         run: yarn install # change this to npm, pnpm or bun depending on which one you use.
 
+      - name: (Windows) install NSIS and WiX bundlers
+        if: ${{ matrix.runner == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress | Out-Null
+          choco install wixtoolset -y --no-progress | Out-Null
+
       - name: Setup osquery binaries (macOS/Linux)
         if: ${{ matrix.runner != 'windows-latest' }}
         run: yarn setup-osquery
@@ -264,7 +271,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          node scripts/tauri-build.cjs ${{ matrix.args }}
+          yarn tauri:build ${{ matrix.args }}
 
       - name: Rename and upload artifacts (macOS x64)
         if: ${{ matrix.platform == 'macos-x64' }}
