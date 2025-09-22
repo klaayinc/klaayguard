@@ -12,7 +12,7 @@
 //! - Background operation ensures continuous monitoring
 //! - System tray provides controlled access to app functionality
 
-use keyring::Entry;
+mod keychain;
 use rusqlite::{params, Connection, ToSql};
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
@@ -43,35 +43,7 @@ pub struct AppState {
     pub retention_in_progress: RwLock<bool>,
 }
 
-const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
-const KEYCHAIN_ACCOUNT: &str = "auth_token";
-
-fn keyring_entry() -> Result<Entry, String> {
-    Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-        .map_err(|e| format!("keychain new entry error: {}", e))
-}
-
-fn save_token_to_keychain(token: &str) -> Result<(), String> {
-    keyring_entry()?
-        .set_password(token)
-        .map_err(|e| format!("keychain set_password error: {}", e))
-}
-
-fn load_token_from_keychain() -> Result<Option<String>, String> {
-    match keyring_entry()?.get_password() {
-        Ok(p) => Ok(Some(p)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(format!("keychain get_password error: {}", e)),
-    }
-}
-
-fn delete_token_from_keychain() -> Result<(), String> {
-    match keyring_entry()?.delete_password() {
-        Ok(_) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keychain delete_password error: {}", e)),
-    }
-}
+// Keychain access is centralized in src-tauri/src/keychain.rs
 
 fn add_breadcrumb(category: &str, message: &str, level: Level) {
     let mut data = std::collections::BTreeMap::new();
@@ -106,7 +78,7 @@ async fn save_auth_token(
     *state.auth_token.write().await = Some(token.clone());
     // Reset the session guard; we have a fresh token now
     *state.keychain_cleared_this_session.write().await = false;
-    let _ = save_token_to_keychain(&token);
+    let _ = keychain::save_token(&token);
     add_breadcrumb("auth", "token_saved", Level::Info);
     sentry::capture_message("auth_token_saved", Level::Info);
     Ok(())
@@ -118,7 +90,7 @@ async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), 
     // Allow a single delete per session to avoid repeated Keychain prompts
     let already_cleared = *state.keychain_cleared_this_session.read().await;
     if !already_cleared {
-        let _ = delete_token_from_keychain();
+        let _ = keychain::delete_token();
         *state.keychain_cleared_this_session.write().await = true;
     }
     add_breadcrumb("auth", "token_cleared", Level::Info);
@@ -367,7 +339,7 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     // Delete the token at most once per session to reduce prompts
     let already_cleared = *state.keychain_cleared_this_session.read().await;
     if !already_cleared {
-        let _ = delete_token_from_keychain();
+        let _ = keychain::delete_token();
         *state.keychain_cleared_this_session.write().await = true;
     }
     // Log locally and bring the app to focus to prompt re-login
@@ -1695,7 +1667,7 @@ pub fn run() {
 
             // Load token from keychain at startup and emit status BEFORE deciding focus
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
-            if let Ok(Some(tok)) = load_token_from_keychain() {
+            if let Ok(Some(tok)) = keychain::load_token() {
                 tauri::async_runtime::block_on(async {
                     *state_for_loop.auth_token.write().await = Some(tok);
                 });
@@ -1804,15 +1776,7 @@ pub fn run() {
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
 
-            // Load token from keychain at startup and emit status
-            if let Ok(Some(tok)) = load_token_from_keychain() {
-                tauri::async_runtime::block_on(async {
-                    *state_for_loop.auth_token.write().await = Some(tok);
-                });
-                let _ = app.emit("auth:status", json!({ "authenticated": true }));
-            } else {
-                let _ = app.emit("auth:status", json!({ "authenticated": false }));
-            }
+            // (duplicate initial keychain load removed)
 
             // Initialize SQLite (file-backed) path and schema
             if let Err(e) = init_sqlite(&app.handle()) {
