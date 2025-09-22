@@ -6,6 +6,25 @@ def log(msg)
     puts "osquery bundle: #{msg}"
 end
 
+# Simple retry helper with exponential backoff to make downloads resilient to transient SSL/network errors
+def with_retries(max_attempts: 5, base_sleep: 0.5, on: [OpenURI::HTTPError, Errno::ECONNRESET, Errno::ETIMEDOUT, SocketError, OpenSSL::SSL::SSLError])
+    attempts = 0
+    begin
+        attempts += 1
+        yield
+    rescue *on => e
+        if attempts < max_attempts
+            sleep_time = base_sleep * (2 ** (attempts - 1))
+            log "Download failed (#{e.class}: #{e.message}). Retrying in #{sleep_time.round(2)}s... (#{attempts}/#{max_attempts})"
+            sleep sleep_time
+            retry
+        else
+            log "Giving up after #{attempts} attempts due to: #{e.class}: #{e.message}"
+            raise
+        end
+    end
+end
+
 DIR_TMP = "tmp"
 DIR_SIDECAR = "src-tauri/vendor"
 
@@ -94,22 +113,28 @@ LINUX_AARCH64_TARBALL_PATH = File.join(DIR_TMP, LINUX_AARCH64_TARBALL_FILE)
 
 file TARBALL_PATH => [DIR_TMP] do
     log "Downloading tarball.."
-    response = URI.open("https://github.com/osquery/osquery/releases/download/#{OSQUERY_VERSION}/#{TARBALL_FILE}")
-    File.write(TARBALL_PATH, response.read)
+    with_retries do
+        response = URI.open("https://github.com/osquery/osquery/releases/download/#{OSQUERY_VERSION}/#{TARBALL_FILE}")
+        File.write(TARBALL_PATH, response.read)
+    end
     verify_checksum(TARBALL_PATH)
 end 
 
 file LINUX_TARBALL_PATH => [DIR_TMP] do
     log "Downloading linux tarball.."
-    response = URI.open("https://github.com/osquery/osquery/releases/download/#{OSQUERY_VERSION}/#{LINUX_TARBALL_FILE}")
-    File.write(LINUX_TARBALL_PATH, response.read)
+    with_retries do
+        response = URI.open("https://github.com/osquery/osquery/releases/download/#{OSQUERY_VERSION}/#{LINUX_TARBALL_FILE}")
+        File.write(LINUX_TARBALL_PATH, response.read)
+    end
     verify_checksum(LINUX_TARBALL_PATH)
 end
 
 file LINUX_AARCH64_TARBALL_PATH => [DIR_TMP] do
     log "Downloading linux aarch64 tarball.."
-    response = URI.open("https://github.com/osquery/osquery/releases/download/#{OSQUERY_VERSION}/#{LINUX_AARCH64_TARBALL_FILE}")
-    File.write(LINUX_AARCH64_TARBALL_PATH, response.read)
+    with_retries do
+        response = URI.open("https://github.com/osquery/osquery/releases/download/#{OSQUERY_VERSION}/#{LINUX_AARCH64_TARBALL_FILE}")
+        File.write(LINUX_AARCH64_TARBALL_PATH, response.read)
+    end
     verify_checksum(LINUX_AARCH64_TARBALL_PATH)
 end
 
@@ -179,9 +204,35 @@ end
 
 task :clean do
     sh "rm -rf tmp"
-    sh "rm -f src-tauri/vendor/osqueryi*"
 end
 
-task default: [OSQUERYI_PATH, OSQUERYI_LINUX_X64_PATH, OSQUERYI_LINUX_AARCH64_PATH]
+def vendor_binaries
+    [
+        "#{OSQUERYI_PATH}-aarch64-apple-darwin",
+        "#{OSQUERYI_PATH}-x86_64-apple-darwin",
+        OSQUERYI_LINUX_X64_PATH,
+        OSQUERYI_LINUX_AARCH64_PATH,
+    ]
+end
+
+task :verify do
+    missing = vendor_binaries.reject { |p| File.exist?(p) && File.size?(p) }
+    if missing.empty?
+        log "All vendor binaries present: #{vendor_binaries.map { |p| File.basename(p) }.join(", ")}"
+    else
+        raise <<~MSG
+        Missing vendor binaries:\n  - #{missing.join("\n  - ")}
+        Run `rake refresh_binaries` locally to fetch and commit them to the repo (preferably via Git LFS).
+        MSG
+    end
+end
+
+task :refresh_binaries => [OSQUERYI_PATH, OSQUERYI_LINUX_X64_PATH, OSQUERYI_LINUX_AARCH64_PATH]
+
+task default: [:verify]
+
+task :clean_vendor do
+    sh "rm -f src-tauri/vendor/osqueryi*"
+end
 
 
