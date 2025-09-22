@@ -253,8 +253,8 @@ jobs:
         run: |
           node scripts/tauri-build.cjs ${{ matrix.args }}
 
-      - name: Rename and upload artifacts to single release (macOS/Linux)
-        if: ${{ matrix.runner != 'windows-latest' }}
+      - name: Rename and upload artifacts (macOS x64)
+        if: ${{ matrix.platform == 'macos-x64' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
@@ -267,34 +267,163 @@ jobs:
 
           uploaded=()
 
-          # Debug: Show what files are available
-          echo "Available files in target directory:"
-          find src-tauri/target -type f \( -name "*.dmg" -o -name "*.app" -o -name "*.tar.gz" -o -name "*.sig" \) | head -20
-
-          if [ "${{ matrix.platform }}" = "macos-x64" ]; then
-            echo "Looking for macOS x64 DMG first (deterministic paths)"
-            DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
-            if [ -z "${DMG_PATH:-}" ]; then
-              echo "Fallback: search any DMG under x86_64-apple-darwin"
-              DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -name "*.dmg" -type f | head -n1 || true)
-            fi
-            if [ -n "${DMG_PATH:-}" ]; then
-              RENAMED_DMG="KlaayGuard_${VERSION}_macOS_x64_${{ matrix.build }}.dmg"
-              cp "$DMG_PATH" "$RENAMED_DMG"
-              uploaded+=("$RENAMED_DMG")
-              echo "Added to upload: $RENAMED_DMG"
+          echo "Looking for macOS x64 DMG first (deterministic paths)"
+          DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
+          if [ -z "${DMG_PATH:-}" ]; then
+            echo "Fallback: search any DMG under x86_64-apple-darwin"
+            DMG_PATH=$(find src-tauri/target/x86_64-apple-darwin -name "*.dmg" -type f | head -n1 || true)
+          fi
+          if [ -n "${DMG_PATH:-}" ]; then
+            RENAMED_DMG="KlaayGuard_${VERSION}_macOS_x64_${{ matrix.build }}.dmg"
+            cp "$DMG_PATH" "$RENAMED_DMG"
+            uploaded+=("$RENAMED_DMG")
+            echo "Added to upload: $RENAMED_DMG"
+          else
+            echo "DMG not found; attempting .app.tar.gz fallback"
+            APP_TGZ_PATH=$(find src-tauri/target/x86_64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
+            if [ -n "${APP_TGZ_PATH:-}" ]; then
+              RENAMED_TGZ="KlaayGuard_${VERSION}_macOS_x64_${{ matrix.build }}.app.tar.gz"
+              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
+              uploaded+=("$RENAMED_TGZ")
+              echo "Added to upload: $RENAMED_TGZ"
             else
-              echo "DMG not found; attempting .app.tar.gz fallback"
-              APP_TGZ_PATH=$(find src-tauri/target/x86_64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
-              if [ -n "${APP_TGZ_PATH:-}" ]; then
-                RENAMED_TGZ="KlaayGuard_${VERSION}_macOS_x64_${{ matrix.build }}.app.tar.gz"
-                cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
-                uploaded+=("$RENAMED_TGZ")
-                echo "Added to upload: $RENAMED_TGZ"
-              else
-                echo "No macOS x64 artifact found"
-              fi
+              echo "No macOS x64 artifact found"
             fi
+          fi
+
+          if [ ${#uploaded[@]} -gt 0 ]; then
+            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+          else
+            echo "No artifacts found to upload for macOS x64 ${{ matrix.build }}"
+          fi
+
+      - name: Rename and upload artifacts (macOS arm64)
+        if: ${{ matrix.platform == 'macos-arm' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(cat VERSION)
+
+          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
+
+          uploaded=()
+
+          echo "Looking for macOS arm64 DMG first (deterministic paths)"
+          DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
+          if [ -z "${DMG_PATH:-}" ]; then
+            echo "Fallback: search any DMG under aarch64-apple-darwin"
+            DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -name "*.dmg" -type f | head -n1 || true)
+          fi
+          if [ -n "${DMG_PATH:-}" ]; then
+            RENAMED_DMG="KlaayGuard_${VERSION}_macOS_arm64_${{ matrix.build }}.dmg"
+            cp "$DMG_PATH" "$RENAMED_DMG"
+            uploaded+=("$RENAMED_DMG")
+            echo "Added to upload: $RENAMED_DMG"
+          else
+            echo "DMG not found; attempting .app.tar.gz fallback"
+            APP_TGZ_PATH=$(find src-tauri/target/aarch64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
+            if [ -n "${APP_TGZ_PATH:-}" ]; then
+              RENAMED_TGZ="KlaayGuard_${VERSION}_macOS_arm64_${{ matrix.build }}.app.tar.gz"
+              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
+              uploaded+=("$RENAMED_TGZ")
+              echo "Added to upload: $RENAMED_TGZ"
+            else
+              echo "No macOS arm64 artifact found"
+            fi
+          fi
+
+          if [ ${#uploaded[@]} -gt 0 ]; then
+            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+          else
+            echo "No artifacts found to upload for macOS arm64 ${{ matrix.build }}"
+          fi
+
+      - name: Rename and upload artifacts (Linux x86_64)
+        if: ${{ matrix.platform == 'ubuntu' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(cat VERSION)
+
+          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
+
+          uploaded=()
+          BASE_DIR="src-tauri/target/release/bundle"
+
+          # AppImage
+          APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1 || true)
+          if [ -n "${APPIMAGE:-}" ]; then
+            RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
+            cp "$APPIMAGE" "$RENAMED_APPIMAGE"
+            uploaded+=("$RENAMED_APPIMAGE")
+            echo "Added to upload: $RENAMED_APPIMAGE"
+          fi
+          # deb
+          DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
+          if [ -n "${DEB:-}" ]; then
+            RENAMED_DEB="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.deb"
+            cp "$DEB" "$RENAMED_DEB"
+            uploaded+=("$RENAMED_DEB")
+            echo "Added to upload: $RENAMED_DEB"
+          fi
+          # rpm
+          RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
+          if [ -n "${RPM:-}" ]; then
+            RENAMED_RPM="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.rpm"
+            cp "$RPM" "$RENAMED_RPM"
+            uploaded+=("$RENAMED_RPM")
+            echo "Added to upload: $RENAMED_RPM"
+          fi
+
+          if [ ${#uploaded[@]} -gt 0 ]; then
+            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+          else
+            echo "No artifacts found to upload for Linux x86_64 ${{ matrix.build }}"
+          fi
+
+      - name: Rename and upload artifacts (Linux arm64)
+        if: ${{ matrix.platform == 'ubuntu-arm64' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.create-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          VERSION=$(cat VERSION)
+
+          echo "$GITHUB_TOKEN" | gh auth login --with-token >/dev/null 2>&1 || true
+
+          uploaded=()
+          BASE_DIR="src-tauri/target/aarch64-unknown-linux-gnu/release/bundle"
+
+          # deb
+          DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
+          if [ -n "${DEB:-}" ]; then
+            RENAMED_DEB="KlaayGuard_${VERSION}_Linux_arm64_${{ matrix.build }}.deb"
+            cp "$DEB" "$RENAMED_DEB"
+            uploaded+=("$RENAMED_DEB")
+            echo "Added to upload: $RENAMED_DEB"
+          fi
+          # rpm
+          RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
+          if [ -n "${RPM:-}" ]; then
+            RENAMED_RPM="KlaayGuard_${VERSION}_Linux_arm64_${{ matrix.build }}.rpm"
+            cp "$RPM" "$RENAMED_RPM"
+            uploaded+=("$RENAMED_RPM")
+            echo "Added to upload: $RENAMED_RPM"
+          fi
+
+          if [ ${#uploaded[@]} -gt 0 ]; then
+            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
+          else
+            echo "No artifacts found to upload for Linux arm64 ${{ matrix.build }}"
           fi
 
       - name: Rename and upload artifacts to single release (Windows)
@@ -338,84 +467,3 @@ jobs:
           } else {
             Write-Host "No artifacts found to upload for Windows ${{ matrix.build }}"
           }
-
-          if [ "${{ matrix.platform }}" = "macos-arm" ]; then
-            echo "Looking for macOS arm64 DMG first (deterministic paths)"
-            DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
-            if [ -z "${DMG_PATH:-}" ]; then
-              echo "Fallback: search any DMG under aarch64-apple-darwin"
-              DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin -name "*.dmg" -type f | head -n1 || true)
-            fi
-            if [ -n "${DMG_PATH:-}" ]; then
-              RENAMED_DMG="KlaayGuard_${VERSION}_macOS_arm64_${{ matrix.build }}.dmg"
-              cp "$DMG_PATH" "$RENAMED_DMG"
-              uploaded+=("$RENAMED_DMG")
-              echo "Added to upload: $RENAMED_DMG"
-            else
-              echo "DMG not found; attempting .app.tar.gz fallback"
-              APP_TGZ_PATH=$(find src-tauri/target/aarch64-apple-darwin -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
-              if [ -n "${APP_TGZ_PATH:-}" ]; then
-                RENAMED_TGZ="KlaayGuard_${VERSION}_macOS_arm64_${{ matrix.build }}.app.tar.gz"
-                cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
-                uploaded+=("$RENAMED_TGZ")
-                echo "Added to upload: $RENAMED_TGZ"
-              else
-                echo "No macOS arm64 artifact found"
-              fi
-            fi
-          fi
-
-          if [ "${{ matrix.platform }}" = "ubuntu" ]; then
-            echo "Looking for Linux artifacts (.AppImage/.deb/.rpm)"
-            BASE_DIR="src-tauri/target/release/bundle"
-            # AppImage
-            APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1 || true)
-            if [ -n "${APPIMAGE:-}" ]; then
-              RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
-              cp "$APPIMAGE" "$RENAMED_APPIMAGE"
-              uploaded+=("$RENAMED_APPIMAGE")
-              echo "Added to upload: $RENAMED_APPIMAGE"
-            fi
-            # deb
-            DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
-            if [ -n "${DEB:-}" ]; then
-              RENAMED_DEB="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.deb"
-              cp "$DEB" "$RENAMED_DEB"
-              uploaded+=("$RENAMED_DEB")
-              echo "Added to upload: $RENAMED_DEB"
-            fi
-            # rpm
-            RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
-            if [ -n "${RPM:-}" ]; then
-              RENAMED_RPM="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.rpm"
-              cp "$RPM" "$RENAMED_RPM"
-              uploaded+=("$RENAMED_RPM")
-              echo "Added to upload: $RENAMED_RPM"
-            fi
-          elif [ "${{ matrix.platform }}" = "ubuntu-arm64" ]; then
-            echo "Looking for Linux arm64 artifacts (.deb/.rpm)"
-            BASE_DIR="src-tauri/target/aarch64-unknown-linux-gnu/release/bundle"
-            # deb
-            DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
-            if [ -n "${DEB:-}" ]; then
-              RENAMED_DEB="KlaayGuard_${VERSION}_Linux_arm64_${{ matrix.build }}.deb"
-              cp "$DEB" "$RENAMED_DEB"
-              uploaded+=("$RENAMED_DEB")
-              echo "Added to upload: $RENAMED_DEB"
-            fi
-            # rpm
-            RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
-            if [ -n "${RPM:-}" ]; then
-              RENAMED_RPM="KlaayGuard_${VERSION}_Linux_arm64_${{ matrix.build }}.rpm"
-              cp "$RPM" "$RENAMED_RPM"
-              uploaded+=("$RENAMED_RPM")
-              echo "Added to upload: $RENAMED_RPM"
-            fi
-          fi
-
-          if [ ${#uploaded[@]} -gt 0 ]; then
-            echo "Uploading to release $RELEASE_TAG: ${uploaded[*]}"
-            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --clobber
-          else
-            echo "No artifacts found to upload for matrix=${{ matrix.platform }} ${{ matrix.build }}"
-          fi

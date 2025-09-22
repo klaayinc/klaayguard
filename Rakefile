@@ -209,87 +209,40 @@ file OSQUERYI_LINUX_AARCH64_PATH => [OSQUERYD_LINUX_AARCH64_PATH] do
     sh "cp #{OSQUERYD_LINUX_AARCH64_PATH} #{OSQUERYI_LINUX_AARCH64_PATH}"
 end
 
-## --- Windows (zip) (discover assets from GitHub API; used only on refresh_binaries) ---
-def find_asset_by(regex)
-    fetch_release_assets.find { |a| a["name"] =~ regex }
-end
-
-WINDOWS_X64_ZIP_ASSET = find_asset_by(/windows.*(x86_64|amd64).*\.zip/i)
-WINDOWS_AARCH64_ZIP_ASSET = find_asset_by(/windows.*(aarch64|arm64).*\.zip/i)
-
-if WINDOWS_X64_ZIP_ASSET
-    WINDOWS_X64_ZIP_FILE = WINDOWS_X64_ZIP_ASSET["name"]
-    WINDOWS_X64_ZIP_PATH = File.join(DIR_TMP, WINDOWS_X64_ZIP_FILE)
-
-    file WINDOWS_X64_ZIP_PATH => [DIR_TMP] do
-        log "Downloading windows x86_64 zip.."
-        with_retries do
-            File.write(WINDOWS_X64_ZIP_PATH, URI.open(WINDOWS_X64_ZIP_ASSET["browser_download_url"]).read)
-        end
-        verify_checksum(WINDOWS_X64_ZIP_PATH)
-    end
-
-    file OSQUERYD_WINDOWS_X64_PATH => [WINDOWS_X64_ZIP_PATH] do
-        log "Extracting windows x86_64 zip.."
-        extract_dir = File.join(DIR_TMP, "windows-x86_64")
-        sh "rm -rf #{extract_dir}"
-        sh "mkdir -p #{extract_dir}"
-        sh "unzip -o #{WINDOWS_X64_ZIP_PATH} -d #{extract_dir}"
-        exe = Dir.glob(File.join(extract_dir, "**", "osqueryd.exe")).first
-        raise "osqueryd.exe not found in windows x86_64 zip" unless exe
-        sh "cp \"#{exe}\" #{OSQUERYD_WINDOWS_X64_PATH}"
-        sh "chmod +x #{OSQUERYD_WINDOWS_X64_PATH}"
-    end
-
-    file OSQUERYI_WINDOWS_X64_PATH => [OSQUERYD_WINDOWS_X64_PATH] do
-        sh "mkdir -p #{DIR_SIDECAR}"
-        sh "cp #{OSQUERYD_WINDOWS_X64_PATH} #{OSQUERYI_WINDOWS_X64_PATH}"
-    end
-end
-
-if WINDOWS_AARCH64_ZIP_ASSET
-    WINDOWS_AARCH64_ZIP_FILE = WINDOWS_AARCH64_ZIP_ASSET["name"]
-    WINDOWS_AARCH64_ZIP_PATH = File.join(DIR_TMP, WINDOWS_AARCH64_ZIP_FILE)
-
-    file WINDOWS_AARCH64_ZIP_PATH => [DIR_TMP] do
-        log "Downloading windows aarch64 zip.."
-        with_retries do
-            File.write(WINDOWS_AARCH64_ZIP_PATH, URI.open(WINDOWS_AARCH64_ZIP_ASSET["browser_download_url"]).read)
-        end
-        verify_checksum(WINDOWS_AARCH64_ZIP_PATH)
-    end
-
-    file OSQUERYD_WINDOWS_AARCH64_PATH => [WINDOWS_AARCH64_ZIP_PATH] do
-        log "Extracting windows aarch64 zip.."
-        extract_dir = File.join(DIR_TMP, "windows-aarch64")
-        sh "rm -rf #{extract_dir}"
-        sh "mkdir -p #{extract_dir}"
-        sh "unzip -o #{WINDOWS_AARCH64_ZIP_PATH} -d #{extract_dir}"
-        exe = Dir.glob(File.join(extract_dir, "**", "osqueryd.exe")).first
-        raise "osqueryd.exe not found in windows aarch64 zip" unless exe
-        sh "cp \"#{exe}\" #{OSQUERYD_WINDOWS_AARCH64_PATH}"
-        sh "chmod +x #{OSQUERYD_WINDOWS_AARCH64_PATH}"
-    end
-
-    file OSQUERYI_WINDOWS_AARCH64_PATH => [OSQUERYD_WINDOWS_AARCH64_PATH] do
-        sh "mkdir -p #{DIR_SIDECAR}"
-        sh "cp #{OSQUERYD_WINDOWS_AARCH64_PATH} #{OSQUERYI_WINDOWS_AARCH64_PATH}"
-    end
-end
+## --- Windows binaries ---
+# Rakefile never downloads Windows assets. CI prepares the Windows sidecar in
+# src-tauri/vendor ahead of build, and developers commit updates when needed.
 
 task :clean do
     sh "rm -rf tmp"
 end
 
 def vendor_binaries
-    [
-        "#{OSQUERYI_PATH}-aarch64-apple-darwin",
-        "#{OSQUERYI_PATH}-x86_64-apple-darwin",
-        OSQUERYI_LINUX_X64_PATH,
-        OSQUERYI_LINUX_AARCH64_PATH,
-        OSQUERYI_WINDOWS_X64_PATH,
-        OSQUERYI_WINDOWS_AARCH64_PATH,
-    ]
+    # Verify only the binaries relevant to the current platform/arch.
+    # CI should rely on the vendored sidecars in src-tauri/vendor and never download on demand.
+    platform = RUBY_PLATFORM
+    if platform =~ /darwin/
+        [
+            "#{OSQUERYI_PATH}-aarch64-apple-darwin",
+            "#{OSQUERYI_PATH}-x86_64-apple-darwin",
+        ]
+    elsif platform =~ /linux/
+        arch = begin
+            `uname -m`.strip
+        rescue
+            ""
+        end
+        if arch =~ /(aarch64|arm64)/
+            [OSQUERYI_LINUX_AARCH64_PATH]
+        else
+            [OSQUERYI_LINUX_X64_PATH]
+        end
+    elsif platform =~ /mswin|mingw|cygwin/
+        # GitHub Windows runners are x64; verify that one
+        [OSQUERYI_WINDOWS_X64_PATH]
+    else
+        raise "Unsupported platform for vendor binary verification: #{platform}"
+    end
 end
 
 task :verify do
@@ -304,7 +257,7 @@ task :verify do
     end
 end
 
-task :refresh_binaries => [OSQUERYI_PATH, OSQUERYI_LINUX_X64_PATH, OSQUERYI_LINUX_AARCH64_PATH, OSQUERYI_WINDOWS_X64_PATH, OSQUERYI_WINDOWS_AARCH64_PATH].compact
+task :refresh_binaries => [OSQUERYI_PATH, OSQUERYI_LINUX_X64_PATH, OSQUERYI_LINUX_AARCH64_PATH]
 
 task default: [:verify]
 
