@@ -3,6 +3,7 @@ require "json"
 require "digest"
 require "socket"
 require "openssl"
+require "shellwords"
 
 def log(msg)
     puts "osquery bundle: #{msg}"
@@ -309,6 +310,56 @@ task default: [:verify]
 
 task :clean_vendor do
     sh "rm -f src-tauri/vendor/osqueryi*"
+end
+
+# Validate that all expected download URLs are reachable with curl
+task :check_urls do
+    urls = []
+
+    # Constructed release asset URLs (direct downloads)
+    base = "https://github.com/osquery/osquery/releases/download/#{OSQUERY_VERSION}"
+    urls << File.join(base, TARBALL_FILE)
+    urls << File.join(base, LINUX_TARBALL_FILE)
+    urls << File.join(base, LINUX_AARCH64_TARBALL_FILE)
+
+    # Dynamically discovered assets (Windows zips, checksums file if present)
+    begin
+        assets = fetch_release_assets
+        checksum_asset = assets.find { |a| a["name"] =~ /sha256/i }
+        urls << checksum_asset["browser_download_url"] if checksum_asset
+
+        win_x64 = assets.find { |a| a["name"] =~ /windows.*(x86_64|amd64).*\.zip/i }
+        win_arm = assets.find { |a| a["name"] =~ /windows.*(aarch64|arm64).*\.zip/i }
+        urls << win_x64["browser_download_url"] if win_x64
+        urls << win_arm["browser_download_url"] if win_arm
+    rescue => e
+        log "Warning: could not query GitHub release assets: #{e.class}: #{e.message}"
+    end
+
+    urls.compact!
+    urls.uniq!
+
+    log "Checking #{urls.length} URLs for osquery #{OSQUERY_VERSION}..."
+    failed = []
+    urls.each do |u|
+        escaped = Shellwords.escape(u)
+        # Use curl with retries; HEAD request (-I), fail on HTTP errors (-f)
+        ok = system("curl -sS -I -f --retry 3 --retry-delay 1 --max-time 20 #{escaped} > /dev/null")
+        if ok
+            log "OK: #{u}"
+        else
+            log "FAIL: #{u}"
+            failed << u
+        end
+    end
+
+    if failed.any?
+        raise <<~MSG
+        One or more URLs are not reachable (HTTP error):\n  - #{failed.join("\n  - ")}
+        MSG
+    else
+        log "All URLs are valid."
+    end
 end
 
 
