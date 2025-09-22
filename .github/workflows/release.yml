@@ -118,9 +118,15 @@ jobs:
       - name: (Ubuntu arm64) install cross toolchain
         if: ${{ matrix.platform == 'ubuntu-arm64' }}
         run: |
-          sudo dpkg --add-architecture arm64
+          # Avoid adding a foreign architecture which triggers broken arm64 indices
+          # on some GitHub runner mirrors (404 from security.ubuntu.com).
+          # Installing the cross toolchain does not require enabling arm64.
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            pkg-config-aarch64-linux-gnu
           rustup target add aarch64-unknown-linux-gnu
 
       - name: install frontend dependencies
