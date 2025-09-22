@@ -43,14 +43,42 @@ args.push(...passThrough)
 function resolveTauriCommand() {
   const binDir = path.resolve(__dirname, '../node_modules/.bin')
   const win = process.platform === 'win32'
-  const candidate = path.join(binDir, win ? 'tauri.cmd' : 'tauri')
-  if (fs.existsSync(candidate)) return candidate
+  
+  if (win) {
+    // On Windows, try multiple candidates
+    const candidates = [
+      path.join(binDir, 'tauri.cmd'),
+      path.join(binDir, 'tauri'),
+      path.resolve(__dirname, '../node_modules/@tauri-apps/cli-win32-x64-msvc/tauri.exe'),
+      path.resolve(__dirname, '../node_modules/@tauri-apps/cli/tauri.js')
+    ]
+    
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        console.log(`[tauri-build] Using Tauri CLI: ${candidate}`)
+        return candidate
+      }
+    }
+  } else {
+    const candidate = path.join(binDir, 'tauri')
+    if (fs.existsSync(candidate)) return candidate
+  }
+  
   // Fallback to PATH (works when invoked via yarn where .bin is injected)
   return 'tauri'
 }
 
 const tauriCmd = resolveTauriCommand()
-const result = spawnSync(tauriCmd, args, { stdio: 'inherit', env: process.env, shell: false })
+console.log(`[tauri-build] Resolved Tauri command: ${tauriCmd}`)
+console.log(`[tauri-build] Command exists: ${fs.existsSync(tauriCmd)}`)
+console.log(`[tauri-build] Platform: ${process.platform}`)
+console.log(`[tauri-build] Args: ${args.join(' ')}`)
+
+const result = spawnSync(tauriCmd, args, { 
+  stdio: 'inherit', 
+  env: process.env, 
+  shell: process.platform === 'win32' // Use shell on Windows
+})
 
 if (result.error) {
   console.error(`[tauri-build] Failed to spawn Tauri CLI: ${result.error.message}`)

@@ -50,6 +50,19 @@ jobs:
       - name: install frontend dependencies
         run: yarn install
 
+      - name: Install Windows-specific Tauri CLI
+        run: |
+          yarn add --dev @tauri-apps/cli-win32-x64-msvc@2.5.0
+
+      - name: Verify Tauri CLI installation
+        run: |
+          if (Test-Path "node_modules/@tauri-apps/cli-win32-x64-msvc/tauri.exe") {
+            Write-Host "Windows Tauri CLI found: node_modules/@tauri-apps/cli-win32-x64-msvc/tauri.exe"
+          } else {
+            Write-Host "Windows Tauri CLI not found, checking alternatives..."
+            Get-ChildItem -Path "node_modules/@tauri-apps" -Recurse -Filter "tauri*" | ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          }
+
       - name: Setup osquery binary (Windows via GitHub Releases)
         shell: pwsh
         run: |
