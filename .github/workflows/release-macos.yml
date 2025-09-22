@@ -1,0 +1,150 @@
+name: "release-macos"
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      version:
+        required: true
+        type: string
+
+jobs:
+  build-upload:
+    name: macOS ${{ matrix.arch }} (${{ matrix.build }})
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [development, staging, production]
+        arch: [arm64, x64]
+        include:
+          - build: development
+            api_url: "http://localhost:3000"
+            earthenware_url: "http://localhost:5173"
+          - build: staging
+            api_url: "https://api.klaay.dev"
+            earthenware_url: "https://app.klaay.dev"
+          - build: production
+            api_url: "https://api.klaay.com"
+            earthenware_url: "https://app.klaay.com"
+          - arch: arm64
+            target: aarch64-apple-darwin
+            dmg_dir: src-tauri/target/aarch64-apple-darwin
+            artifact_suffix: macOS_arm64
+          - arch: x64
+            target: x86_64-apple-darwin
+            dmg_dir: src-tauri/target/x86_64-apple-darwin
+            artifact_suffix: macOS_x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: install frontend dependencies
+        run: yarn install
+
+      - name: Setup osquery binaries (macOS)
+        run: yarn setup-osquery
+
+      - name: Verify sidecar binaries exist (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Listing vendor sidecars:"
+          ls -l src-tauri/vendor || true
+          test -f src-tauri/vendor/osqueryi-aarch64-apple-darwin || (echo "Missing macOS arm64 sidecar" && exit 1)
+          test -f src-tauri/vendor/osqueryi-x86_64-apple-darwin || (echo "Missing macOS x64 sidecar" && exit 1)
+
+      - name: Sync version across all files
+        run: yarn sync-version
+
+      - name: (Mac) Import Apple Developer Certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo $APPLE_CERTIFICATE | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
+
+      - name: (Mac) Verify Certificate
+        run: |
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
+          CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
+          echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
+          echo "CERT_ID is $CERT_ID"
+          echo "Certificate imported."
+
+      - name: Build Tauri (macOS)
+        env:
+          KLAAY_ENV: ${{ matrix.build }}
+          VITE_API_BASE_URL: ${{ matrix.api_url }}
+          VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
+          VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          yarn tauri:build --target ${{ matrix.target }}
+
+      - name: Rename and upload artifacts (macOS)
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          uploaded=()
+
+          echo "Looking for macOS DMG first (deterministic paths)"
+          DMG_PATH=$(find ${{ matrix.dmg_dir }} -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
+          if [ -z "${DMG_PATH:-}" ]; then
+            echo "Fallback: search any DMG under ${{ matrix.dmg_dir }}"
+            DMG_PATH=$(find ${{ matrix.dmg_dir }} -name "*.dmg" -type f | head -n1 || true)
+          fi
+          if [ -n "${DMG_PATH:-}" ]; then
+            RENAMED_DMG="KlaayGuard_${VERSION}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.dmg"
+            cp "$DMG_PATH" "$RENAMED_DMG"
+            uploaded+=("$RENAMED_DMG")
+            echo "Added to upload: $RENAMED_DMG"
+          else
+            echo "DMG not found; attempting .app.tar.gz fallback"
+            APP_TGZ_PATH=$(find ${{ matrix.dmg_dir }} -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
+            if [ -n "${APP_TGZ_PATH:-}" ]; then
+              RENAMED_TGZ="KlaayGuard_${VERSION}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.app.tar.gz"
+              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
+              uploaded+=("$RENAMED_TGZ")
+              echo "Added to upload: $RENAMED_TGZ"
+            else
+              echo "No macOS artifact found"
+            fi
+          fi
+
+          if [ ${#uploaded[@]} -gt 0 ]; then
+            echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
+            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            echo "No artifacts found to upload for macOS ${{ matrix.arch }} ${{ matrix.build }}"
+          fi
+
+

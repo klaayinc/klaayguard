@@ -1,0 +1,49 @@
+name: "prepare-release"
+
+on:
+  workflow_call:
+    outputs:
+      tag:
+        description: "Release tag to use for uploads"
+        value: ${{ jobs.prepare.outputs.tag }}
+      version:
+        description: "Version read from VERSION file"
+        value: ${{ jobs.prepare.outputs.version }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.set_tag.outputs.tag }}
+      version: ${{ steps.set_tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Compute version and tag
+        id: set_tag
+        run: |
+          VERSION=$(cat VERSION)
+          TAG="app-v${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+      - name: Create draft release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          if gh release view "${{ steps.set_tag.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${{ steps.set_tag.outputs.tag }} already exists"
+          else
+            gh release create "${{ steps.set_tag.outputs.tag }}" \
+              --title "KlaayGuard v${{ steps.set_tag.outputs.version }}" \
+              --notes "See the assets to download this version and install." \
+              --draft \
+              --repo "$GITHUB_REPOSITORY"
+          fi
+
+
