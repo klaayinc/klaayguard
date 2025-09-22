@@ -157,7 +157,7 @@ jobs:
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             libc6-dev-arm64-cross \
-            pkg-config-aarch64-linux-gnu
+            pkg-config
           rustup target add aarch64-unknown-linux-gnu
 
       - name: install frontend dependencies
@@ -187,6 +187,7 @@ jobs:
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
           export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+          export PKG_CONFIG_PATH=/usr/aarch64-linux-gnu/lib/pkgconfig
           yarn tauri:build --target aarch64-unknown-linux-gnu --bundles deb rpm
 
       - name: Rename and upload artifacts (Linux arm64)
