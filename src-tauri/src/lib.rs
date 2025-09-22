@@ -1648,6 +1648,8 @@ pub fn run() {
                 )
                 .title("KlaayGuard")
                 .visible(false)
+                .inner_size(520.0, 680.0)
+                .min_inner_size(480.0, 600.0)
                 .center()
                 .build()
                 {
