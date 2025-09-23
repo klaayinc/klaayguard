@@ -61,6 +61,64 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
     });
 }
 
+/// Attempts to extract a JWT token from a klaayguard:// deep link URL and persist it
+fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
+    // Expect formats like: klaayguard://auth-callback?token=JWT
+    if !url.starts_with("klaayguard://") {
+        return;
+    }
+    let token_opt = {
+        // Find the query string
+        let qs = url.splitn(2, '?').nth(1).unwrap_or("");
+        let mut out: Option<String> = None;
+        for pair in qs.split('&') {
+            let mut it = pair.splitn(2, '=');
+            let k = it.next().unwrap_or("");
+            let v = it.next().unwrap_or("");
+            if k == "token" {
+                // Basic percent-decoding for spaces and plus; JWTs rarely need full decoding
+                let decoded = v.replace("%20", " ").replace("+", " ");
+                out = Some(decoded);
+                break;
+            }
+        }
+        out
+    };
+
+    if let Some(tok) = token_opt {
+        // Basic shape validation: three segments separated by '.'
+        let dot_count = tok.matches('.').count();
+        if dot_count != 2 {
+            add_breadcrumb("auth", "deep_link_invalid_token_shape", Level::Warning);
+            return;
+        }
+        // Save to memory and keychain
+        tauri::async_runtime::block_on(async {
+            *state.auth_token.write().await = Some(tok.clone());
+            *state.keychain_cleared_this_session.write().await = false;
+        });
+        let _ = keychain::save_token(&tok);
+        let _ = app.emit("auth:status", json!({ "authenticated": true }));
+        add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
+        sentry::capture_message("deep_link_token_saved", Level::Info);
+        // Optionally hide the window if it is visible
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.hide();
+        }
+    }
+}
+
+/// Scan process args for a klaayguard deep link and handle it
+fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    let args: Vec<String> = std::env::args().collect();
+    for a in args {
+        if a.starts_with("klaayguard://") {
+            handle_deep_link_url(app, state, &a);
+            break;
+        }
+    }
+}
+
 #[tauri::command]
 async fn set_api_base_url(
     state: tauri::State<'_, Arc<AppState>>,
@@ -1613,12 +1671,18 @@ pub fn run() {
                 .level(log::LevelFilter::Info)
                 .build(),
         )
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // On secondary launch, show the existing window; only focus if sign-in is required
-            let needs_login = {
-                let st = app.state::<Arc<AppState>>().inner().clone();
-                tauri::async_runtime::block_on(async { st.auth_token.read().await.is_none() })
-            };
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // Handle deep link if present in args (secondary launches)
+            let st = app.state::<Arc<AppState>>().inner().clone();
+            for a in args {
+                if a.starts_with("klaayguard://") {
+                    handle_deep_link_url(&app, &st, &a);
+                    break;
+                }
+            }
+            // Only focus if sign-in is required
+            let needs_login =
+                tauri::async_runtime::block_on(async { st.auth_token.read().await.is_none() });
             if let Some(window) = app.get_webview_window("main") {
                 if needs_login {
                     let _ = window.show();
@@ -1707,6 +1771,9 @@ pub fn run() {
                     log::info!("KlaayGuard started - running in background (no focus)");
                 }
             }
+
+            // Handle deep link if app was launched by klaayguard:// URL (first instance)
+            try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
 
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
