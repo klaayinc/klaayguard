@@ -28,7 +28,33 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "macOS": {}
+    "macOS": {
+      "infoPlist": {
+        "CFBundleURLTypes": [
+          {
+            "CFBundleURLName": "com.klaay.klaayguard.auth",
+            "CFBundleURLSchemes": ["klaayguard"]
+          }
+        ]
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsi"
+      }
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "share/applications/klaayguard.desktop": "./linux/klaayguard.desktop"
+        }
+      },
+      "appimage": {
+        "files": {
+          "share/applications/klaayguard.desktop": "./linux/klaayguard.desktop"
+        }
+      }
+    }
   },
   "plugins": {
     "updater": {
