@@ -1922,16 +1922,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error building tauri application");
 
-    app.run(|app_handle, event| match event {
+    app.run(|_app_handle, event| match event {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         tauri::RunEvent::Opened { urls } => {
             // macOS open-url events deliver here; handle klaayguard:// URLs at runtime
             if !urls.is_empty() {
-                let st = app_handle.state::<Arc<AppState>>().inner().clone();
+                let st = _app_handle.state::<Arc<AppState>>().inner().clone();
                 for u in urls {
                     let s = u.to_string();
                     log::info!("run_event_opened url={}", s);
-                    handle_deep_link_url(&app_handle, &st, &s);
+                    handle_deep_link_url(&_app_handle, &st, &s);
                 }
             }
         }
