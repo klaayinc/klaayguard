@@ -28,16 +28,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "macOS": {
-      "infoPlist": {
-        "CFBundleURLTypes": [
-          {
-            "CFBundleURLName": "com.klaay.klaayguard.auth",
-            "CFBundleURLSchemes": ["klaayguard"]
-          }
-        ]
-      }
-    },
     "windows": {
       "nsis": {
         "installerHooks": "./windows/hooks.nsi"

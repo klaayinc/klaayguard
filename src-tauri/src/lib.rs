@@ -65,8 +65,10 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
 fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
     // Expect formats like: klaayguard://auth-callback?token=JWT
     if !url.starts_with("klaayguard://") {
+        log::info!("deep_link_ignored_non_scheme url={}", url);
         return;
     }
+    log::info!("deep_link_received url={}", url);
     let token_opt = {
         // Find the query string
         let qs = url.splitn(2, '?').nth(1).unwrap_or("");
@@ -90,29 +92,44 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
         let dot_count = tok.matches('.').count();
         if dot_count != 2 {
             add_breadcrumb("auth", "deep_link_invalid_token_shape", Level::Warning);
+            log::warn!("deep_link_invalid_token_shape dot_count={}", dot_count);
             return;
         }
         // Save to memory and keychain
+        log::info!(
+            "deep_link_token_parsed length={} saving_to_keychain",
+            tok.len()
+        );
         tauri::async_runtime::block_on(async {
             *state.auth_token.write().await = Some(tok.clone());
             *state.keychain_cleared_this_session.write().await = false;
         });
         let _ = keychain::save_token(&tok);
+        log::info!("deep_link_token_saved_to_keychain");
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
         add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
         sentry::capture_message("deep_link_token_saved", Level::Info);
         // Optionally hide the window if it is visible
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.hide();
+            log::info!("deep_link_window_hidden_after_auth");
         }
+    } else {
+        log::warn!("deep_link_missing_token_param");
     }
 }
 
 /// Scan process args for a klaayguard deep link and handle it
 fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>) {
     let args: Vec<String> = std::env::args().collect();
+    log::info!(
+        "process_args count={} sample_arg1={}",
+        args.len(),
+        args.get(1).cloned().unwrap_or_default()
+    );
     for a in args {
         if a.starts_with("klaayguard://") {
+            log::info!("deep_link_found_in_process_args");
             handle_deep_link_url(app, state, &a);
             break;
         }
@@ -1674,8 +1691,14 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Handle deep link if present in args (secondary launches)
             let st = app.state::<Arc<AppState>>().inner().clone();
+            log::info!(
+                "single_instance_args count={} sample_arg0={}",
+                args.len(),
+                args.get(0).cloned().unwrap_or_default()
+            );
             for a in args {
                 if a.starts_with("klaayguard://") {
+                    log::info!("single_instance_deep_link_received");
                     handle_deep_link_url(&app, &st, &a);
                     break;
                 }
@@ -1899,5 +1922,18 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error building tauri application");
 
-    app.run(|_app_handle, _event| {});
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::Opened { urls } => {
+            // macOS open-url events deliver here; handle klaayguard:// URLs at runtime
+            if !urls.is_empty() {
+                let st = app_handle.state::<Arc<AppState>>().inner().clone();
+                for u in urls {
+                    let s = u.to_string();
+                    log::info!("run_event_opened url={}", s);
+                    handle_deep_link_url(&app_handle, &st, &s);
+                }
+            }
+        }
+        _ => {}
+    });
 }

@@ -68,10 +68,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let unlistenStatus: (() => void) | undefined;
     (async () => {
       try {
         unlisten = await listen("auth:invalidated", () => {
           logout();
+        });
+      } catch {
+        // ignore
+      }
+      try {
+        unlistenStatus = await listen("auth:status", async (event) => {
+          const payload = (event as unknown as { payload?: { authenticated?: boolean } }).payload;
+          const authenticated = !!(payload && payload.authenticated);
+          setIsAuthenticated(authenticated);
+          if (authenticated) {
+            try {
+              const status = await invoke<{ authenticated: boolean; display_name: string | null }>("get_auth_status");
+              if (status.display_name) setUserName(status.display_name);
+            } catch {
+              // ignore name fetch
+            }
+            navigate("/welcome");
+          } else {
+            navigate("/signin");
+          }
         });
       } catch {
         // ignore
@@ -81,6 +102,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     return () => {
       if (unlisten) {
         try { unlisten(); } catch { /* noop */ }
+      }
+      if (unlistenStatus) {
+        try { unlistenStatus(); } catch { /* noop */ }
       }
     };
   }, []);
