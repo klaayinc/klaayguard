@@ -1923,6 +1923,7 @@ pub fn run() {
         .expect("error building tauri application");
 
     app.run(|app_handle, event| match event {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         tauri::RunEvent::Opened { urls } => {
             // macOS open-url events deliver here; handle klaayguard:// URLs at runtime
             if !urls.is_empty() {
