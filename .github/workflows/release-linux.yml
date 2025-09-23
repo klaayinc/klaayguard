@@ -152,13 +152,15 @@ jobs:
 
       - name: (Ubuntu arm64) install cross toolchain
         run: |
+          # Enable multiarch for ARM64 packages
+          sudo dpkg --add-architecture arm64
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             g++-aarch64-linux-gnu \
             libc6-dev-arm64-cross \
             pkg-config \
-            pkg-config-aarch64-linux-gnu \
+            libgtk-3-dev:arm64 \
             libwebkit2gtk-4.0-dev:arm64 \
             libappindicator3-dev:arm64 \
             librsvg2-dev:arm64
@@ -191,9 +193,8 @@ jobs:
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
           export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
           export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
-          export PKG_CONFIG_PATH=/usr/aarch64-linux-gnu/lib/pkgconfig
-          export PKG_CONFIG_ALLOW_CROSS_aarch64_unknown_linux_gnu=1
-          export PKG_CONFIG_aarch64_unknown_linux_gnu=aarch64-linux-gnu-pkg-config
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
           yarn tauri:build --target aarch64-unknown-linux-gnu --bundles deb rpm
 
       - name: Rename and upload artifacts (Linux arm64)
