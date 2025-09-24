@@ -1428,10 +1428,22 @@ async fn install_launch_agent() -> Result<String, String> {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "/Applications/KlaayGuard.app".to_string())
         };
+        // Determine API base for env injection in LaunchAgent
+        let api_base_for_plist: String = std::env::var("VITE_API_BASE_URL")
+            .ok()
+            .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
+            .unwrap_or_else(|| "https://api.klaay.com".to_string());
+
+        let log_dir = home_dir.join("Library/Logs/KlaayGuard");
+        fs::create_dir_all(&log_dir)
+            .map_err(|e| format!("Failed to create log directory: {}", e))?;
+
         let plist_content = include_str!("../resources/com.klaay.klaayguard.plist")
             .replace("__LABEL__", label)
             .replace("__OPEN_PATH__", "/usr/bin/open")
-            .replace("__APP_PATH__", &app_path);
+            .replace("__APP_PATH__", &app_path)
+            .replace("__VITE_API_BASE_URL__", &api_base_for_plist)
+            .replace("__LOG_DIR__", &log_dir.to_string_lossy());
 
         let mut needs_reload = true;
         if let Ok(existing) = fs::read_to_string(&plist_path) {
