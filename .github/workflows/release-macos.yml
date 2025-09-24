@@ -41,6 +41,8 @@ jobs:
             artifact_suffix: macOS_x64
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: setup node
         uses: actions/setup-node@v4

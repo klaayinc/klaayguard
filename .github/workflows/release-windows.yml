@@ -32,6 +32,8 @@ jobs:
             earthenware_url: "https://app.klaay.com"
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: setup node
         uses: actions/setup-node@v4

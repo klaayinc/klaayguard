@@ -246,13 +246,25 @@ def vendor_binaries
 end
 
 task :verify do
-    missing = vendor_binaries.reject { |p| File.exist?(p) && File.size?(p) }
+    # Treat Git LFS pointer files as missing
+    def lfs_pointer?(path)
+        return false unless File.exist?(path) && File.size?(path)
+        begin
+            File.open(path, 'rb') { |f| f.read(256).to_s.include?('git-lfs.github.com/spec/v1') }
+        rescue
+            false
+        end
+    end
+
+    missing = vendor_binaries.reject { |p| File.exist?(p) && File.size?(p) && !lfs_pointer?(p) }
+
     if missing.empty?
-        log "All vendor binaries present: #{vendor_binaries.map { |p| File.basename(p) }.join(", ")}"
+        log "All vendor binaries present and not LFS pointers: #{vendor_binaries.map { |p| File.basename(p) }.join(", ")}"
     else
         raise <<~MSG
-        Missing vendor binaries:\n  - #{missing.join("\n  - ")}
-        Run `rake refresh_binaries` locally to fetch and commit them to the repo (preferably via Git LFS).
+        Missing or invalid vendor binaries (LFS pointers or absent):\n  - #{missing.join("\n  - ")}
+        Ensure Git LFS is installed and pulled (e.g., `git lfs install && git lfs pull`).
+        If needed, run `rake refresh_binaries` locally to fetch and commit them (preferably via Git LFS).
         MSG
     end
 end
