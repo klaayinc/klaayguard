@@ -45,8 +45,8 @@ winapi = { version = "0.3", features = ["winbase", "processenv"] }
 nix = "0.26"  # For Unix-specific system calls if needed
 
 
-[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
-tauri-plugin-updater = "2"
+#[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# Updater disabled
 
 # Enable all Tauri features needed for each platform
 [features]

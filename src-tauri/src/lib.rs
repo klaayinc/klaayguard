@@ -21,7 +21,6 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 // removed autostart plugin; using manual LaunchAgent management
 use tauri_plugin_shell::ShellExt;
-use tauri_plugin_updater::UpdaterExt;
 // use tauri_plugin_log::LogTarget; // use defaults
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -523,19 +522,20 @@ struct UploadRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UploadRowPayload {
-    id: i64,
-    table_name: String,
-    json: Value,
-    run_id: String,
-    created_at: String,
+struct DataItem {
+    #[serde(rename = "type")]
+    r#type: String,
+    attributes: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UploadPayload {
-    device_id: String,
-    batch_id: String,
-    rows: Vec<UploadRowPayload>,
+struct DataPayload {
+    device_uuid: String,
+    data: Vec<DataItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jsonapi: Option<serde_json::Value>,
 }
 
 async fn get_db_path_cached(
@@ -727,27 +727,24 @@ async fn run_upload_cycle(
         Level::Info,
     );
     sentry::capture_message("upload_pending_rows", Level::Info);
-    let device_id = get_device_uuid_internal(app)
+    let device_uuid = get_device_uuid_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
-    let batch_id = Uuid::new_v4().to_string();
-    let mut payload_rows: Vec<UploadRowPayload> = Vec::with_capacity(rows.len());
+    let mut items: Vec<DataItem> = Vec::with_capacity(rows.len());
     let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
     for r in rows {
         ids.push(r.id);
         let parsed_json: Value = serde_json::from_str(&r.json).unwrap_or(json!({"_raw": r.json}));
-        payload_rows.push(UploadRowPayload {
-            id: r.id,
-            table_name: r.table_name,
-            json: parsed_json,
-            run_id: r.run_id,
-            created_at: r.created_at,
+        items.push(DataItem {
+            r#type: r.table_name,
+            attributes: parsed_json,
         });
     }
-    let payload = UploadPayload {
-        device_id,
-        batch_id,
-        rows: payload_rows,
+    let payload = DataPayload {
+        device_uuid,
+        data: items,
+        meta: None,
+        jsonapi: None,
     };
     let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
     let retry_delays = [60u64, 120u64];
@@ -1595,35 +1592,6 @@ async fn get_runtime_status(
     })
 }
 
-/// Handles automatic updates for security patches and bug fixes.
-///
-/// This function checks for available updates and automatically downloads and installs them.
-/// The app will restart after a successful update to ensure the latest security patches
-/// are active.
-async fn update(app: tauri::AppHandle) -> tauri_plugin_updater::Result<()> {
-    if let Some(update) = app.updater()?.check().await? {
-        let mut downloaded = 0;
-
-        // alternatively we could also call update.download() and update.install() separately
-        update
-            .download_and_install(
-                |chunk_length, content_length| {
-                    downloaded += chunk_length;
-                    println!("downloaded {downloaded} from {content_length:?}");
-                },
-                || {
-                    println!("download finished");
-                },
-            )
-            .await?;
-
-        println!("update installed");
-        app.restart();
-    }
-
-    Ok(())
-}
-
 /// Main entry point for the KlaayGuard security monitoring application.
 ///
 /// This function initializes the Tauri application with security-focused configuration:
@@ -1715,9 +1683,8 @@ pub fn run() {
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
-            let handle2 = app.handle().clone();
+            let _handle2 = app.handle().clone();
 
             // Hide the app from the dock on macOS for security monitoring
             #[cfg(target_os = "macos")]
@@ -1747,12 +1714,7 @@ pub fn run() {
             // Check if we're already running as a regular process to prevent duplicates
             // Duplicate instance prevention handled by single-instance plugin; remove manual pgrep/exit logic
 
-            tauri::async_runtime::spawn(async move {
-                update(handle2).await.unwrap_or_else(|e| {
-                    log::error!("Failed to check for updates: {}", e);
-                    sentry::capture_message(&format!("update_check_failed:{}", e), Level::Error);
-                });
-            });
+            // Updater disabled: no background update check
 
             // Install and kickstart LaunchAgent with KeepAlive
             #[cfg(target_os = "macos")]
