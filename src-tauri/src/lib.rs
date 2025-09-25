@@ -237,7 +237,9 @@ async fn get_auth_status(
         .map_err(|e| e.to_string())?;
     add_breadcrumb("auth", "me_request_start", Level::Info);
     sentry::capture_message("auth_me_request_start", Level::Info);
-    let name = match client
+
+    // Determine authentication state and display name from /me
+    let (is_authenticated, name): (bool, Option<String>) = match client
         .get(format!("{}/me", base))
         .bearer_auth(&token)
         .send()
@@ -256,7 +258,7 @@ async fn get_auth_status(
                 invalidate_auth(&app, &state).await.ok();
                 add_breadcrumb("auth", "auth_invalidated_on_me", Level::Warning);
                 sentry::capture_message("auth_invalidated_on_me", Level::Warning);
-                None
+                (false, None)
             } else if resp.status().is_success() {
                 match resp.json::<Value>().await {
                     Ok(body) => {
@@ -275,26 +277,29 @@ async fn get_auth_status(
                             .unwrap_or("");
                         let email = attrs.get("email").and_then(|v| v.as_str());
                         let full = format!("{} {}", first, last).trim().to_string();
-                        if !full.is_empty() {
+                        let name = if !full.is_empty() {
                             Some(full)
                         } else {
                             email.map(|s| s.to_string())
-                        }
+                        };
+                        (true, name)
                     }
-                    Err(_) => None,
+                    Err(_) => (true, None),
                 }
             } else {
-                None
+                // Non-401/403 error; consider unauthenticated
+                (false, None)
             }
         }
         Err(e) => {
             add_breadcrumb("auth", &format!("me_request_error:{}", e), Level::Warning);
             sentry::capture_message("auth_me_request_error", Level::Warning);
-            None
+            (false, None)
         }
     };
+
     Ok(AuthStatus {
-        authenticated: true,
+        authenticated: is_authenticated,
         display_name: name,
     })
 }
