@@ -523,6 +523,7 @@ struct UploadRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonApiResource {
+    #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(rename = "type")]
     r#type: String,
