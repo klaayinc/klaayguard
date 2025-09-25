@@ -522,16 +522,16 @@ struct UploadRow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataItem {
+struct JsonApiResource {
+    id: Option<String>,
     #[serde(rename = "type")]
     r#type: String,
     attributes: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataPayload {
-    device_uuid: String,
-    data: Vec<DataItem>,
+struct JsonApiPayload {
+    data: Vec<JsonApiResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     meta: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -730,21 +730,21 @@ async fn run_upload_cycle(
     let device_uuid = get_device_uuid_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
-    let mut items: Vec<DataItem> = Vec::with_capacity(rows.len());
+    let mut items: Vec<JsonApiResource> = Vec::with_capacity(rows.len());
     let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
     for r in rows {
         ids.push(r.id);
         let parsed_json: Value = serde_json::from_str(&r.json).unwrap_or(json!({"_raw": r.json}));
-        items.push(DataItem {
+        items.push(JsonApiResource {
+            id: None,
             r#type: r.table_name,
             attributes: parsed_json,
         });
     }
-    let payload = DataPayload {
-        device_uuid,
+    let payload = JsonApiPayload {
         data: items,
-        meta: None,
-        jsonapi: None,
+        meta: Some(json!({ "device_uuid": device_uuid })),
+        jsonapi: Some(json!({ "version": "1.0" })),
     };
     let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
     let retry_delays = [60u64, 120u64];
@@ -752,6 +752,7 @@ async fn run_upload_cycle(
     loop {
         let send_result = client
             .post(format!("{}/klaayguard/data", base))
+            .header(reqwest::header::CONTENT_TYPE, "application/vnd.api+json")
             .bearer_auth(&token)
             .json(&payload)
             .send()
