@@ -172,7 +172,7 @@ async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), 
     Ok(())
 }
 
-/// Returns seconds until next scheduled run (900s interval).
+/// Returns seconds until next scheduled run (120s default interval).
 /// -1 indicates not signed in (no token yet). 0 means due now or overdue.
 #[tauri::command]
 async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Result<i64, String> {
@@ -181,7 +181,7 @@ async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Resu
     }
     // Use last attempt time so countdown advances even if last run failed
     let last = *state.last_attempt_at.read().await;
-    let interval = std::time::Duration::from_secs(15 * 60);
+    let interval = std::time::Duration::from_secs(collection_interval_seconds());
     if let Some(last) = last {
         let elapsed = last.elapsed();
         if elapsed >= interval {
@@ -457,6 +457,13 @@ fn retention_interval_seconds() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(24 * 60 * 60)
+}
+
+fn collection_interval_seconds() -> u64 {
+    std::env::var("KLAAYGUARD_COLLECTION_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(120)
 }
 
 fn prune_batch_rows() -> i64 {
@@ -875,11 +882,11 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             )
             .await;
         }
-        // interval loop (15 minutes)
+        // interval loop (default 2 minutes)
         let interval_secs: u64 = std::env::var("KLAAYGUARD_UPLOAD_INTERVAL_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(15 * 60);
+            .unwrap_or(120);
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         // initialize last upload tick to now
         *state.last_upload_tick_at.write().await = Some(std::time::Instant::now());
@@ -1121,7 +1128,8 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             .await;
         }
 
-        let mut interval = tokio::time::interval(Duration::from_secs(15 * 60));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(collection_interval_seconds()));
         loop {
             interval.tick().await;
             // detect potential wake by long elapsed since last attempt
@@ -1561,7 +1569,7 @@ async fn get_runtime_status(
             Some(-1)
         } else {
             let last = *state.last_attempt_at.read().await;
-            let interval = std::time::Duration::from_secs(15 * 60);
+            let interval = std::time::Duration::from_secs(collection_interval_seconds());
             if let Some(last) = last {
                 let elapsed = last.elapsed();
                 if elapsed >= interval {
