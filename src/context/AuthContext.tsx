@@ -47,6 +47,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
     const initializeApp = async () => {
       const currentPath = window.location.pathname;
       try {
+        // Check arch mismatch immediately and route to error page if needed
+        try {
+          const arch = await invoke<{ mismatch: boolean; built: string; host: string }>("get_arch_status");
+          if (arch.mismatch) {
+            try { await invoke("uninstall_launch_agent"); } catch { /* ignore */ }
+            const built = encodeURIComponent(arch.built || "unknown");
+            const host = encodeURIComponent(arch.host || "unknown");
+            navigate(`/arch-mismatch?built=${built}&host=${host}`);
+            return;
+          }
+        } catch {
+          // ignore arch status failures
+        }
         const status = await invoke<{ authenticated: boolean; display_name: string | null }>("get_auth_status");
         if (status.authenticated) {
           setIsAuthenticated(true);
@@ -69,6 +82,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let unlistenStatus: (() => void) | undefined;
+    let unlistenArch: (() => void) | undefined;
     (async () => {
       try {
         unlisten = await listen("auth:invalidated", () => {
@@ -97,6 +111,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
       } catch {
         // ignore
       }
+      try {
+        unlistenArch = await listen("arch:mismatch", async (event) => {
+          const p = (event as unknown as { payload?: { built?: string; host?: string } }).payload || {};
+          const built = encodeURIComponent(p.built || "unknown");
+          const host = encodeURIComponent(p.host || "unknown");
+          try {
+            // Attempt to remove LaunchAgent to let user fully quit
+            await invoke("uninstall_launch_agent");
+          } catch {
+            // ignore
+          }
+          navigate(`/arch-mismatch?built=${built}&host=${host}`);
+        });
+      } catch {
+        // ignore
+      }
     })();
 
     return () => {
@@ -105,6 +135,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
       }
       if (unlistenStatus) {
         try { unlistenStatus(); } catch { /* noop */ }
+      }
+      if (unlistenArch) {
+        try { unlistenArch(); } catch { /* noop */ }
       }
     };
   }, []);

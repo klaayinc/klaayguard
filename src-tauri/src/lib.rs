@@ -1539,6 +1539,58 @@ async fn install_launch_agent() -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+async fn uninstall_launch_agent() -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::fs;
+        let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
+        let launch_agents_dir = home_dir.join("Library/LaunchAgents");
+        let label = "com.klaay.klaayguard";
+        let plist_path = launch_agents_dir.join(format!("{}.plist", label));
+        let uid = nix::unistd::getuid().as_raw();
+        let domain = format!("gui/{}", uid);
+
+        // Try to bootout if loaded
+        let _ = std::process::Command::new("launchctl")
+            .args(&["bootout", &format!("{}/{}", domain, label)])
+            .output();
+
+        // Remove plist file
+        if plist_path.exists() {
+            if let Err(e) = fs::remove_file(&plist_path) {
+                return Err(format!("Failed to remove launch agent plist: {}", e));
+            }
+        }
+
+        Ok("LaunchAgent uninstalled".to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Launch agent uninstallation is only supported on macOS".to_string())
+    }
+}
+
+#[derive(Serialize)]
+struct ArchStatus {
+    mismatch: bool,
+    built: String,
+    host: String,
+}
+
+#[tauri::command]
+async fn get_arch_status() -> Result<ArchStatus, String> {
+    let mismatch = std::env::var("KLAAY_ARCH_MISMATCH").ok().as_deref() == Some("1");
+    let built =
+        std::env::var("KLAAY_ARCH_BUILT").unwrap_or_else(|_| std::env::consts::ARCH.to_string());
+    let host = std::env::var("KLAAY_ARCH_HOST").unwrap_or_else(|_| "unknown".to_string());
+    Ok(ArchStatus {
+        mismatch,
+        built,
+        host,
+    })
+}
+
 #[derive(Serialize)]
 struct RuntimeStatusLoops {
     collection_seconds_since_last_run: Option<u64>,
@@ -1763,6 +1815,25 @@ pub fn run() {
                 }
             }
 
+            // Emit arch mismatch to UI if flagged by main.rs
+            if std::env::var("KLAAY_ARCH_MISMATCH").ok().as_deref() == Some("1") {
+                let built = std::env::var("KLAAY_ARCH_BUILT")
+                    .unwrap_or_else(|_| std::env::consts::ARCH.to_string());
+                let host =
+                    std::env::var("KLAAY_ARCH_HOST").unwrap_or_else(|_| "unknown".to_string());
+                let _ = app.emit(
+                    "arch:mismatch",
+                    serde_json::json!({ "built": built, "host": host }),
+                );
+                // Show window to present error page
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                // Do not start background loops; return early
+                return Ok(());
+            }
+
             // Check if we're already running as a regular process to prevent duplicates
             // Duplicate instance prevention handled by single-instance plugin; remove manual pgrep/exit logic
 
@@ -1931,6 +2002,8 @@ pub fn run() {
             get_next_run_in_seconds,
             get_auth_status,
             install_launch_agent,
+            uninstall_launch_agent,
+            get_arch_status,
             get_runtime_status
         ])
         .build(tauri::generate_context!())

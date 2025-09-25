@@ -5,6 +5,7 @@ import { AuthProvider } from "./context/AuthContext";
 import { ToastContainer } from "react-toastify";
 import AccountSetup from "./pages/AuthPages/AccountSetup";
 import WelcomeScreen from "./pages/AuthPages/WelcomeScreen";
+import ArchMismatch from "./pages/System/ArchMismatch";
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
           <Route path="/signin" element={<EarthenwareLogin />} />
           <Route path="/account-setup" element={<AccountSetup />} />
           <Route path="/welcome" element={<WelcomeScreen />} />
+          <Route path="/arch-mismatch" element={<ArchMismatch />} />
         </Routes>
       </AuthProvider>
     </BrowserRouter>
