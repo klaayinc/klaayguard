@@ -463,7 +463,7 @@ fn collection_interval_seconds() -> u64 {
     std::env::var("KLAAYGUARD_COLLECTION_INTERVAL_SECONDS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(120)
+        .unwrap_or(900)
 }
 
 fn prune_batch_rows() -> i64 {
@@ -883,11 +883,11 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             )
             .await;
         }
-        // interval loop (default 2 minutes)
+        // interval loop (default 15 minutes)
         let interval_secs: u64 = std::env::var("KLAAYGUARD_UPLOAD_INTERVAL_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(120);
+            .unwrap_or(900);
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         // initialize last upload tick to now
         *state.last_upload_tick_at.write().await = Some(std::time::Instant::now());
