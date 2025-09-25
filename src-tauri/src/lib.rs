@@ -1065,6 +1065,18 @@ async fn run_cycle(
     );
     sentry::capture_message("collection_persisted", Level::Info);
 
+    // Trigger uploader immediately after successful collection to restart retry loop (B)
+    if let Err(e) = run_upload_cycle(app, state, client).await {
+        log::error!("upload cycle (post-collection) error: {}", e);
+        emit_error_and_focus(
+            app,
+            state,
+            "upload:error",
+            json!({ "stage": "internal", "error": e, "post_collection": true }),
+        )
+        .await;
+    }
+
     Ok(())
 }
 
