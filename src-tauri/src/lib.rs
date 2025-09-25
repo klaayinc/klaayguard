@@ -799,6 +799,7 @@ async fn run_upload_cycle(
                 if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED {
                     mark_rows_handled_and_advance_watermark(app, state, &ids).await?;
                     let _ = app.emit("upload:success", json!({ "count": ids.len() }));
+                    log::info!("upload_success submitted_count={}", ids.len());
                     add_breadcrumb(
                         "upload",
                         &format!("success_count:{}", ids.len()),
@@ -1078,6 +1079,11 @@ async fn run_cycle(
     let _ = app.emit(
         "collection:success",
         json!({ "inserted_rows": inserted, "run_id": run_id }),
+    );
+    log::info!(
+        "collection_success inserted_rows={} run_id={}",
+        inserted,
+        run_id
     );
     add_breadcrumb(
         "collection",
