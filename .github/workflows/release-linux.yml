@@ -39,9 +39,27 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
+          cache: yarn
+          cache-dependency-path: |
+            yarn.lock
+            package-lock.json
+            pnpm-lock.yaml
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@v0.0.3
+
+      - name: Enable sccache
+        run: |
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
 
       - name: (Ubuntu) install dependencies
         run: |
