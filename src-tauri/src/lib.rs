@@ -750,11 +750,18 @@ async fn run_upload_cycle(
     let retry_delays = [60u64, 120u64];
     let mut attempt: usize = 0;
     loop {
+        // Serialize payload first to avoid reqwest::RequestBuilder.json() overwriting Content-Type
+        let body_json = serde_json::to_vec(&payload).unwrap_or_else(|e| {
+            add_breadcrumb("upload", &format!("serialize_error:{}", e), Level::Error);
+            // Fallback to empty object; server will 400 and we will surface the error
+            b"{}".to_vec()
+        });
         let send_result = client
             .post(format!("{}/klaayguard/data", base))
-            .header(reqwest::header::CONTENT_TYPE, "application/vnd.api+json")
             .bearer_auth(&token)
-            .json(&payload)
+            .header(reqwest::header::CONTENT_TYPE, "application/vnd.api+json")
+            .header(reqwest::header::ACCEPT, "application/vnd.api+json")
+            .body(body_json)
             .send()
             .await;
         match send_result {
