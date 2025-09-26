@@ -196,19 +196,20 @@ async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Resu
 }
 
 #[tauri::command]
-async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["system_info".to_string()];
+/// Gets the hardware serial number from the hardware_info osquery table
+async fn get_device_serial_number(app: tauri::AppHandle) -> Result<String, String> {
+    let tables = vec!["hardware_info".to_string()];
     let query_result = execute_query(app, tables).await?;
 
-    let uuid = query_result
-        .get("system_info")
+    let serial = query_result
+        .get("hardware_info")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|obj| obj.get("uuid"))
+        .and_then(|obj| obj.get("serial_number"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Couldn't find device uuid".to_string())?;
+        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
 
-    Ok(uuid.to_string())
+    Ok(serial.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -690,17 +691,17 @@ async fn mark_rows_handled_and_advance_watermark(
     Ok(())
 }
 
-async fn get_device_uuid_internal(app: &tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["system_info".to_string()];
+async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
+    let tables = vec!["hardware_info".to_string()];
     let result = execute_query(app.clone(), tables).await?;
-    let uuid = result
-        .get("system_info")
+    let serial = result
+        .get("hardware_info")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|obj| obj.get("uuid"))
+        .and_then(|obj| obj.get("serial_number"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Couldn't find device uuid".to_string())?;
-    Ok(uuid.to_string())
+        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
+    Ok(serial.to_string())
 }
 
 async fn run_upload_cycle(
@@ -740,7 +741,7 @@ async fn run_upload_cycle(
         Level::Info,
     );
     sentry::capture_message("upload_pending_rows", Level::Info);
-    let device_uuid = get_device_uuid_internal(app)
+    let device_serial = get_device_serial_number_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
     let mut items: Vec<JsonApiResource> = Vec::with_capacity(rows.len());
@@ -756,7 +757,7 @@ async fn run_upload_cycle(
     }
     let payload = JsonApiPayload {
         data: items,
-        meta: Some(json!({ "device_uuid": device_uuid })),
+        meta: Some(json!({ "device_uuid": device_serial })), // Note: device_uuid field now contains hardware serial number
         jsonapi: Some(json!({ "version": "1.0" })),
     };
     let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
@@ -1995,7 +1996,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             execute_query,
-            get_device_uuid,
+            get_device_serial_number,
             save_auth_token,
             clear_auth_token,
             set_api_base_url,
