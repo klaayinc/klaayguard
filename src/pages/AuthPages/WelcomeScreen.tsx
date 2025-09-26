@@ -49,7 +49,7 @@ export const WelcomeScreen: React.FC = () => {
   }, [secondsLeft, navigate]);
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-8 bg-[#0B223D]">
+    <div className="min-h-screen flex flex-col items-center justify-center p-8 bg-[#0B223D] relative">
       {/* Header with Klaay Logo */}
       <div className="flex items-center justify-center mb-4 text-center">
         <img
@@ -77,6 +77,7 @@ export const WelcomeScreen: React.FC = () => {
         <div />
         {/* Data collection button removed */}
       </div>
+      
     </div>
   );
 };
