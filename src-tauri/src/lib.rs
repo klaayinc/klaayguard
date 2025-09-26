@@ -205,8 +205,22 @@ async fn get_device_serial_number(app: tauri::AppHandle) -> Result<String, Strin
         .get("hardware_info")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|obj| obj.get("serial_number"))
-        .and_then(|v| v.as_str())
+        .and_then(|obj| {
+            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
+            obj.get("serial_number")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    obj.get("hardware_serial")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .or_else(|| {
+                    obj.get("hardware_uuid")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+        })
         .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
 
     Ok(serial.to_string())
@@ -698,8 +712,22 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
         .get("hardware_info")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|obj| obj.get("serial_number"))
-        .and_then(|v| v.as_str())
+        .and_then(|obj| {
+            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
+            obj.get("serial_number")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    obj.get("hardware_serial")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .or_else(|| {
+                    obj.get("hardware_uuid")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+        })
         .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
     Ok(serial.to_string())
 }
