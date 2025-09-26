@@ -38,7 +38,7 @@ export default function EarthenwareLogin() {
   };
 
   return (
-    <div className="h-screen w-screen flex items-center justify-center bg-[#0B223D]">
+    <div className="h-screen w-screen flex items-center justify-center bg-[#0B223D] relative">
       <div className="max-w-md w-full text-center p-8">
         <div className="flex items-center justify-center mb-6">
           <img src={klaayLogo} alt="Klaay Logo" className="w-12 h-12 mr-3" />

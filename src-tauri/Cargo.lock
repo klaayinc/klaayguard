@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "KlaayGuard"
-version = "0.1.10"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -14,6 +14,7 @@ dependencies = [
  "nix 0.26.4",
  "reqwest",
  "rusqlite",
+ "semver",
  "sentry",
  "serde",
  "serde_json",

@@ -1,6 +1,6 @@
 [package]
 name = "KlaayGuard"
-version = "0.1.10"
+version = "0.1.12"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -13,6 +13,7 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "klaay_guard_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -37,6 +38,7 @@ sentry = "0.42.0"
 keyring = "2"
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 uuid = { version = "1", features = ["v4"] }
+semver = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase", "processenv"] }

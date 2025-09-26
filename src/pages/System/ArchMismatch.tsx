@@ -8,7 +8,7 @@ export default function ArchMismatch() {
   const host = params.get("host") || "unknown";
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 p-6">
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 p-6 relative">
       <div className="max-w-md w-full bg-white shadow rounded-lg p-6">
         <h1 className="text-xl font-semibold mb-2">Architecture Mismatch</h1>
         <p className="text-sm text-gray-700 mb-4">

@@ -196,25 +196,47 @@ async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Resu
 }
 
 #[tauri::command]
-async fn get_device_uuid(app: tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["system_info".to_string()];
+/// Gets the hardware serial number from the hardware_info osquery table
+async fn get_device_serial_number(app: tauri::AppHandle) -> Result<String, String> {
+    let tables = vec!["hardware_info".to_string()];
     let query_result = execute_query(app, tables).await?;
 
-    let uuid = query_result
-        .get("system_info")
+    let serial = query_result
+        .get("hardware_info")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|obj| obj.get("uuid"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Couldn't find device uuid".to_string())?;
+        .and_then(|obj| {
+            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
+            obj.get("serial_number")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    obj.get("hardware_serial")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .or_else(|| {
+                    obj.get("hardware_uuid")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+        })
+        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
 
-    Ok(uuid.to_string())
+    Ok(serial.to_string())
 }
 
 #[derive(serde::Serialize)]
 struct AuthStatus {
     authenticated: bool,
     display_name: Option<String>,
+}
+
+#[tauri::command]
+async fn get_app_version() -> Result<String, String> {
+    let version = env!("CARGO_PKG_VERSION").to_string();
+    log::info!("📱 Frontend requested app version: {}", version);
+    Ok(version)
 }
 
 #[tauri::command]
@@ -690,17 +712,31 @@ async fn mark_rows_handled_and_advance_watermark(
     Ok(())
 }
 
-async fn get_device_uuid_internal(app: &tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["system_info".to_string()];
+async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
+    let tables = vec!["hardware_info".to_string()];
     let result = execute_query(app.clone(), tables).await?;
-    let uuid = result
-        .get("system_info")
+    let serial = result
+        .get("hardware_info")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
-        .and_then(|obj| obj.get("uuid"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Couldn't find device uuid".to_string())?;
-    Ok(uuid.to_string())
+        .and_then(|obj| {
+            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
+            obj.get("serial_number")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    obj.get("hardware_serial")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+                .or_else(|| {
+                    obj.get("hardware_uuid")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                })
+        })
+        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
+    Ok(serial.to_string())
 }
 
 async fn run_upload_cycle(
@@ -740,14 +776,27 @@ async fn run_upload_cycle(
         Level::Info,
     );
     sentry::capture_message("upload_pending_rows", Level::Info);
-    let device_uuid = get_device_uuid_internal(app)
+    let device_serial = get_device_serial_number_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
     let mut items: Vec<JsonApiResource> = Vec::with_capacity(rows.len());
     let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
     for r in rows {
         ids.push(r.id);
-        let parsed_json: Value = serde_json::from_str(&r.json).unwrap_or(json!({"_raw": r.json}));
+        let mut parsed_json: Value =
+            serde_json::from_str(&r.json).unwrap_or(json!({"_raw": r.json}));
+
+        // Add the collected_at timestamp to the attributes
+        if let Some(attributes) = parsed_json.as_object_mut() {
+            attributes.insert("collected_at".to_string(), json!(r.created_at));
+        } else {
+            // If parsed_json is not an object, create a new object with the raw data and timestamp
+            parsed_json = json!({
+                "_raw": r.json,
+                "collected_at": r.created_at
+            });
+        }
+
         items.push(JsonApiResource {
             id: None,
             r#type: r.table_name,
@@ -756,7 +805,7 @@ async fn run_upload_cycle(
     }
     let payload = JsonApiPayload {
         data: items,
-        meta: Some(json!({ "device_uuid": device_uuid })),
+        meta: Some(json!({ "device_uuid": device_serial })), // Note: device_uuid field now contains hardware serial number
         jsonapi: Some(json!({ "version": "1.0" })),
     };
     let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
@@ -1696,6 +1745,381 @@ async fn get_runtime_status(
     })
 }
 
+#[derive(serde::Deserialize)]
+struct ReleaseAsset {
+    id: u64,
+    name: String,
+    // Include other fields for deserialization but mark as unused
+    #[serde(rename = "original_name")]
+    _original_name: Option<String>,
+    #[serde(rename = "content_type")]
+    _content_type: Option<String>,
+    #[serde(rename = "size")]
+    _size: Option<u64>,
+    #[serde(rename = "digest")]
+    _digest: Option<String>,
+    #[serde(rename = "sha256")]
+    _sha256: Option<String>,
+    #[serde(rename = "browser_download_url")]
+    _browser_download_url: Option<String>,
+    #[serde(rename = "api_asset_url")]
+    _api_asset_url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReleaseInfo {
+    #[serde(rename = "name")]
+    _name: Option<String>,
+    version: String, // This is the tag_name from GitHub
+    assets: Vec<ReleaseAsset>,
+}
+
+fn get_api_base_url() -> String {
+    // Use the same logic as the main app startup
+    std::env::var("VITE_API_BASE_URL")
+        .ok()
+        .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
+        .unwrap_or_else(|| "https://api.klaay.com".to_string())
+}
+
+async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, String> {
+    let current_version = env!("CARGO_PKG_VERSION");
+    log::info!(
+        "🔍 Starting update check - current version: {}",
+        current_version
+    );
+    log::info!(
+        "🌐 Checking for updates from API: {}/klaayguard/updates/latest",
+        api_base
+    );
+
+    let client = reqwest::Client::new();
+
+    // Get latest release info
+    let response = client
+        .get(&format!("{}/klaayguard/updates/latest", api_base))
+        .send()
+        .await
+        .map_err(|e| {
+            log::error!("❌ Failed to check for updates: {}", e);
+            format!("Failed to check for updates: {}", e)
+        })?;
+
+    log::info!("📡 API response status: {}", response.status());
+
+    if !response.status().is_success() {
+        let error_msg = format!("Update check failed with status: {}", response.status());
+        log::error!("❌ {}", error_msg);
+        return Err(error_msg);
+    }
+
+    let release: ReleaseInfo = response.json().await.map_err(|e| {
+        log::error!("❌ Failed to parse release info: {}", e);
+        format!("Failed to parse release info: {}", e)
+    })?;
+
+    log::info!(
+        "📦 Found release: {} with {} assets",
+        release.version,
+        release.assets.len()
+    );
+    for (i, asset) in release.assets.iter().enumerate() {
+        log::info!("  Asset {}: {} (ID: {})", i + 1, asset.name, asset.id);
+        if let Some(orig_name) = &asset._original_name {
+            log::info!("    Original name: {}", orig_name);
+        }
+    }
+
+    // Normalize versions by removing 'v' prefix for comparison
+    let normalized_current = current_version.trim_start_matches('v');
+    let normalized_release = release.version.trim_start_matches('v');
+
+    // Parse versions as semantic versions for proper comparison
+    let current_semver = match semver::Version::parse(normalized_current) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!(
+                "❌ Failed to parse current version '{}': {}",
+                normalized_current,
+                e
+            );
+            return Err(format!(
+                "Invalid current version format: {}",
+                normalized_current
+            ));
+        }
+    };
+
+    let release_semver = match semver::Version::parse(normalized_release) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!(
+                "❌ Failed to parse release version '{}': {}",
+                normalized_release,
+                e
+            );
+            return Err(format!(
+                "Invalid release version format: {}",
+                normalized_release
+            ));
+        }
+    };
+
+    // Only suggest update if release version is newer
+    if release_semver > current_semver {
+        log::info!(
+            "🆚 Version comparison: {} < {} (update available)",
+            current_version,
+            release.version
+        );
+
+        // Find the DMG asset for macOS
+        // Check both the user-friendly name and original name for DMG files
+        if let Some(dmg_asset) = release.assets.iter().find(|asset| {
+            asset.name.ends_with(".dmg")
+                || asset.name.contains("MacOS")
+                || asset
+                    ._original_name
+                    .as_ref()
+                    .map_or(false, |orig| orig.ends_with(".dmg"))
+        }) {
+            log::info!(
+                "✅ Found DMG asset: {} (ID: {})",
+                dmg_asset.name,
+                dmg_asset.id
+            );
+            log::info!(
+                "🚀 Update available: {} -> {}",
+                current_version,
+                release.version
+            );
+            return Ok(Some(dmg_asset.id.to_string()));
+        } else {
+            log::warn!("⚠️  No DMG asset found in release assets");
+        }
+    } else if release_semver < current_semver {
+        log::info!(
+            "✅ No update needed - current version {} is newer than release {}",
+            current_version,
+            release.version
+        );
+    } else {
+        log::info!(
+            "✅ No update needed - already at latest version: {}",
+            current_version
+        );
+    }
+
+    Ok(None)
+}
+
+#[tauri::command]
+async fn check_for_updates_command() -> Result<Option<String>, String> {
+    let api_base = get_api_base_url();
+    log::info!("🌐 Manual update check using API base URL: {}", api_base);
+    check_for_updates_internal(&api_base).await
+}
+
+async fn download_and_install_update_internal(
+    api_base: &str,
+    asset_id: &str,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    log::info!(
+        "📥 Starting download and install process for asset ID: {}",
+        asset_id
+    );
+
+    let client = reqwest::Client::new();
+
+    // Download the DMG
+    let download_url = format!("{}/klaayguard/download/{}", api_base, asset_id);
+    log::info!("🌐 Download URL: {}", download_url);
+
+    let response = client.get(&download_url).send().await.map_err(|e| {
+        log::error!("❌ Failed to download update: {}", e);
+        format!("Failed to download update: {}", e)
+    })?;
+
+    log::info!("📡 Download response status: {}", response.status());
+
+    if !response.status().is_success() {
+        let error_msg = format!("Download failed with status: {}", response.status());
+        log::error!("❌ {}", error_msg);
+        return Err(error_msg);
+    }
+
+    // Get the download path
+    let downloads_dir = dirs::download_dir().ok_or_else(|| {
+        log::error!("❌ Could not find downloads directory");
+        "Could not find downloads directory"
+    })?;
+    let dmg_path = downloads_dir.join("KlaayGuard-update.dmg");
+
+    log::info!("💾 Downloading to: {:?}", dmg_path);
+
+    // Save the DMG file
+    let mut file = std::fs::File::create(&dmg_path).map_err(|e| {
+        log::error!("❌ Failed to create update file: {}", e);
+        format!("Failed to create update file: {}", e)
+    })?;
+
+    let bytes = response.bytes().await.map_err(|e| {
+        log::error!("❌ Download error: {}", e);
+        format!("Download error: {}", e)
+    })?;
+
+    log::info!("📊 Downloaded {} bytes", bytes.len());
+
+    std::io::Write::write_all(&mut file, &bytes).map_err(|e| {
+        log::error!("❌ Write error: {}", e);
+        format!("Write error: {}", e)
+    })?;
+
+    log::info!("✅ Update downloaded successfully to: {:?}", dmg_path);
+
+    // Mount the DMG and replace the app
+    log::info!("🔄 Starting application replacement process...");
+    replace_application(&dmg_path, app).await?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn download_and_install_update(
+    asset_id: String,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let api_base = get_api_base_url();
+    log::info!("🌐 Manual update download using API base URL: {}", api_base);
+    download_and_install_update_internal(&api_base, &asset_id, &app).await
+}
+
+async fn replace_application(
+    dmg_path: &std::path::Path,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    log::info!("💿 Mounting DMG: {:?}", dmg_path);
+
+    // Mount the DMG
+    let mount_output = std::process::Command::new("hdiutil")
+        .args(&["attach", dmg_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| {
+            log::error!("❌ Failed to mount DMG: {}", e);
+            format!("Failed to mount DMG: {}", e)
+        })?;
+
+    if !mount_output.status.success() {
+        let error_msg = "Failed to mount DMG".to_string();
+        log::error!(
+            "❌ {} - hdiutil output: {}",
+            error_msg,
+            String::from_utf8_lossy(&mount_output.stderr)
+        );
+        return Err(error_msg);
+    }
+
+    // Extract mount point from hdiutil output
+    let mount_output_str = String::from_utf8_lossy(&mount_output.stdout);
+    log::info!("📋 hdiutil output: {}", mount_output_str);
+
+    let mount_point = mount_output_str
+        .lines()
+        .find(|line| line.contains("/Volumes/"))
+        .ok_or_else(|| {
+            log::error!("❌ Could not find mount point in hdiutil output");
+            "Could not find mount point"
+        })?
+        .split('\t')
+        .last()
+        .ok_or_else(|| {
+            log::error!("❌ Could not parse mount point from line");
+            "Could not parse mount point"
+        })?;
+
+    log::info!("📍 Mount point: {}", mount_point);
+
+    let source_app = std::path::Path::new(mount_point).join("KlaayGuard.app");
+    let target_app = std::path::Path::new("/Applications/KlaayGuard.app");
+
+    log::info!("📂 Source app: {:?}", source_app);
+    log::info!("📂 Target app: {:?}", target_app);
+
+    // Check if source app exists
+    if !source_app.exists() {
+        let error_msg = format!("Source app not found at: {:?}", source_app);
+        log::error!("❌ {}", error_msg);
+        return Err(error_msg);
+    }
+
+    // Remove old app and copy new one
+    if target_app.exists() {
+        log::info!("🗑️  Removing old app from: {:?}", target_app);
+        std::fs::remove_dir_all(target_app).map_err(|e| {
+            log::error!("❌ Failed to remove old app: {}", e);
+            format!("Failed to remove old app: {}", e)
+        })?;
+        log::info!("✅ Old app removed successfully");
+    } else {
+        log::info!("ℹ️  No existing app found at target location");
+    }
+
+    log::info!(
+        "📋 Copying new app from {:?} to {:?}",
+        source_app,
+        target_app
+    );
+    let copy_result = std::process::Command::new("cp")
+        .args(&[
+            "-R",
+            source_app.to_str().unwrap(),
+            target_app.to_str().unwrap(),
+        ])
+        .status()
+        .map_err(|e| {
+            log::error!("❌ Failed to copy new app: {}", e);
+            format!("Failed to copy new app: {}", e)
+        })?;
+
+    if !copy_result.success() {
+        let error_msg = "Failed to copy new app - cp command failed".to_string();
+        log::error!("❌ {}", error_msg);
+        return Err(error_msg);
+    }
+
+    log::info!("✅ New app copied successfully");
+
+    // Unmount the DMG
+    log::info!("💿 Unmounting DMG from: {}", mount_point);
+    let unmount_result = std::process::Command::new("hdiutil")
+        .args(&["detach", mount_point])
+        .status()
+        .map_err(|e| {
+            log::error!("❌ Failed to unmount DMG: {}", e);
+            format!("Failed to unmount DMG: {}", e)
+        })?;
+
+    if !unmount_result.success() {
+        log::warn!("⚠️  DMG unmount failed, but continuing...");
+    } else {
+        log::info!("✅ DMG unmounted successfully");
+    }
+
+    // Remove the DMG file
+    log::info!("🗑️  Removing temporary DMG file: {:?}", dmg_path);
+    if let Err(e) = std::fs::remove_file(dmg_path) {
+        log::warn!("⚠️  Failed to remove DMG file: {}", e);
+        // Don't fail the whole process for this
+    } else {
+        log::info!("✅ Temporary DMG file removed");
+    }
+
+    log::info!("🎉 Application updated successfully! Restarting...");
+
+    // Restart the application
+    app.restart();
+}
 /// Main entry point for the KlaayGuard security monitoring application.
 ///
 /// This function initializes the Tauri application with security-focused configuration:
@@ -1837,7 +2261,24 @@ pub fn run() {
             // Check if we're already running as a regular process to prevent duplicates
             // Duplicate instance prevention handled by single-instance plugin; remove manual pgrep/exit logic
 
-            // Updater disabled: no background update check
+            // Check for updates on startup and install automatically
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                log::info!("🚀 Starting automatic update check on app startup");
+                let api_base = get_api_base_url();
+                log::info!("🌐 Using API base URL: {}", api_base);
+                if let Ok(Some(asset_id)) = check_for_updates_internal(&api_base).await {
+                    log::info!("🔄 Update available, starting download and install process...");
+                    if let Err(e) =
+                        download_and_install_update_internal(&api_base, &asset_id, &app_handle)
+                            .await
+                    {
+                        log::error!("💥 Auto-update failed: {}", e);
+                    }
+                } else {
+                    log::info!("✅ No updates available - app is up to date");
+                }
+            });
 
             // Install and kickstart LaunchAgent with KeepAlive
             #[cfg(target_os = "macos")]
@@ -1995,16 +2436,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             execute_query,
-            get_device_uuid,
+            get_device_serial_number,
             save_auth_token,
             clear_auth_token,
             set_api_base_url,
             get_next_run_in_seconds,
             get_auth_status,
+            get_app_version,
             install_launch_agent,
             uninstall_launch_agent,
             get_arch_status,
-            get_runtime_status
+            get_runtime_status,
+            check_for_updates_command,
+            download_and_install_update
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");
