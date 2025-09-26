@@ -748,7 +748,20 @@ async fn run_upload_cycle(
     let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
     for r in rows {
         ids.push(r.id);
-        let parsed_json: Value = serde_json::from_str(&r.json).unwrap_or(json!({"_raw": r.json}));
+        let mut parsed_json: Value =
+            serde_json::from_str(&r.json).unwrap_or(json!({"_raw": r.json}));
+
+        // Add the collected_at timestamp to the attributes
+        if let Some(attributes) = parsed_json.as_object_mut() {
+            attributes.insert("collected_at".to_string(), json!(r.created_at));
+        } else {
+            // If parsed_json is not an object, create a new object with the raw data and timestamp
+            parsed_json = json!({
+                "_raw": r.json,
+                "collected_at": r.created_at
+            });
+        }
+
         items.push(JsonApiResource {
             id: None,
             r#type: r.table_name,
