@@ -17,6 +17,7 @@ mod collection;
 mod database;
 mod keychain;
 mod system;
+mod background;
 mod updates;
 mod upload;
 use crate::auth::AuthStatus;
@@ -99,12 +100,7 @@ async fn get_app_version() -> Result<String, String> {
 
 // invalidate_auth moved to auth module
 
-fn wake_gap_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_WAKE_GAP_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(300)
-}
+fn wake_gap_seconds() -> u64 { background::config::wake_gap_seconds() }
 
 fn focus_debounce_seconds() -> u64 {
     std::env::var("KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS")
@@ -113,19 +109,9 @@ fn focus_debounce_seconds() -> u64 {
         .unwrap_or(60)
 }
 
-fn retention_interval_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_RETENTION_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(24 * 60 * 60)
-}
+// retention interval resolved where needed in background::retention
 
-fn collection_interval_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_COLLECTION_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(900)
-}
+fn collection_interval_seconds() -> u64 { background::config::collection_interval_seconds() }
 
 async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState>) {
     let now = std::time::Instant::now();
@@ -436,9 +422,7 @@ fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
     database::initialize(app).map(|_| ())
 }
 
-async fn get_db_size_mb(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<u64, String> {
-    database::size_mb(app, state).await
-}
+// helper moved to background::retention
 
 #[allow(dead_code)]
 async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
@@ -462,77 +446,7 @@ async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resu
     .await
 }
 
-async fn run_retention_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
-    // Prevent overlap
-    if *state.retention_in_progress.read().await {
-        return Ok(());
-    }
-    *state.retention_in_progress.write().await = true;
-    let before = get_db_size_mb(app, state).await.unwrap_or(0);
-    add_breadcrumb("retention", &format!("start_db_mb:{}", before), Level::Info);
-    let summary = database::run_once(
-        app,
-        state,
-        database::config::retention_days(),
-        database::config::max_db_mb(),
-        database::config::prune_batch_rows(),
-    )
-    .await?;
-    let _ = app.emit(
-        "retention:run",
-        json!({
-            "deleted_time_based": summary.deleted_time_based,
-            "deleted_size_based": summary.deleted_size_based,
-            "db_mb_before": summary.db_mb_before,
-            "db_mb_after": summary.db_mb_after,
-        }),
-    );
-    add_breadcrumb(
-        "retention",
-        &format!(
-            "done time_deleted:{} size_deleted:{} db_mb:{}->{}",
-            summary.deleted_time_based,
-            summary.deleted_size_based,
-            summary.db_mb_before,
-            summary.db_mb_after
-        ),
-        Level::Info,
-    );
-    *state.retention_in_progress.write().await = false;
-    Ok(())
-}
-
-fn spawn_retention_loop(app: tauri::AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        // Wait for DB path to be initialized
-        loop {
-            if state.db_path.read().await.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        // Run immediately once
-        if let Err(e) = run_retention_cycle(&app, &state).await {
-            log::error!("retention initial run error: {}", e);
-            let _ = app.emit(
-                "retention:error",
-                json!({ "stage": "initial", "error": e.to_string() }),
-            );
-        }
-        let interval_secs = retention_interval_seconds();
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        loop {
-            interval.tick().await;
-            if let Err(e) = run_retention_cycle(&app, &state).await {
-                log::error!("retention run error: {}", e);
-                let _ = app.emit(
-                    "retention:error",
-                    json!({ "stage": "interval", "error": e.to_string() }),
-                );
-            }
-        }
-    });
-}
+// retention loop moved to crate::background::retention
 
 async fn persist_results_to_sqlite(
     app: &tauri::AppHandle,
@@ -1169,12 +1083,11 @@ pub fn run() {
                 }
             }
 
-            // Spawn collection loop (Loop A)
-            crate::collection::spawn_collection_loop(app_handle.clone(), state_for_loop.clone());
-            // Spawn uploader loop (Loop B)
-            crate::upload::spawn_upload_loop(app_handle.clone(), state_for_loop.clone());
-            // Spawn retention loop (maintenance)
-            spawn_retention_loop(app_handle, state_for_loop);
+            // Start background tasks (collection, upload, retention)
+            let _bg = crate::background::BackgroundTasksManager::start(
+                app_handle,
+                state_for_loop,
+            );
 
             Ok(())
         })

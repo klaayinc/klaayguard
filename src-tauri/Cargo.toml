@@ -44,6 +44,7 @@ thiserror = "1"
 [dev-dependencies]
 httpmock = "0.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serial_test = "3"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase", "processenv"] }

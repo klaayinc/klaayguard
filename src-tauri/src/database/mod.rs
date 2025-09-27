@@ -10,9 +10,7 @@ pub use init::initialize;
 pub use path::resolve_path;
 pub use results::persist_results;
 pub use retention::{prune_size_based, prune_time_based, run_once, size_mb};
-pub use upload::{
-    get_last_upload_at, mark_rows_handled_and_advance_watermark, select_pending_rows,
-};
+pub use upload::{mark_rows_handled_and_advance_watermark, select_pending_rows};
 
 #[cfg(test)]
 mod tests {

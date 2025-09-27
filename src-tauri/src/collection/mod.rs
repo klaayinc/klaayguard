@@ -8,12 +8,7 @@ use tauri::Emitter;
 use crate::{add_breadcrumb, auth, emit_error_and_focus, AppState};
 use tauri_plugin_shell::ShellExt;
 
-fn collection_interval_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_COLLECTION_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(900)
-}
+fn collection_interval_seconds() -> u64 { crate::background::config::collection_interval_seconds() }
 
 #[tauri::command]
 pub async fn get_next_run_in_seconds(

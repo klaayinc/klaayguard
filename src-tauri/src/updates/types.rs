@@ -30,5 +30,3 @@ impl From<std::io::Error> for UpdateError {
         UpdateError::Io(e.to_string())
     }
 }
-
-

@@ -3,12 +3,7 @@ use std::sync::Arc;
 use super::types::UploadRow;
 use crate::AppState;
 
-pub async fn get_last_upload_at(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-) -> Result<String, String> {
-    crate::database::get_last_upload_at(app, state).await
-}
+// Removed redundant wrapper; use crate::database::get_last_upload_at directly
 
 pub async fn select_pending_rows(
     app: &tauri::AppHandle,

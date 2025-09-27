@@ -15,7 +15,6 @@ pub enum SystemError {
     Other(String),
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct Callbacks {
     pub on_show: Arc<dyn Fn(&tauri::AppHandle) + Send + Sync>,
@@ -35,13 +34,11 @@ impl Callbacks {
     }
 }
 
-#[allow(dead_code)]
 pub struct SystemIntegration {
     app: tauri::AppHandle,
 }
 
 impl SystemIntegration {
-    #[allow(dead_code)]
     pub fn init(app: &tauri::AppHandle, callbacks: Callbacks) -> Result<Self, SystemError> {
         tray::register_tray(app, &callbacks)?;
         Ok(Self { app: app.clone() })

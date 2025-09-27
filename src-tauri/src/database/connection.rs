@@ -1,19 +1,9 @@
-use std::{path::PathBuf, sync::Arc};
 use rusqlite::Connection;
+use std::path::PathBuf;
 
-use crate::AppState;
 use super::path::resolve_path;
 
-pub async fn open_from_state(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-) -> Result<Connection, String> {
-    let path = {
-        let current = state.db_path.read().await.clone();
-        if let Some(p) = current { PathBuf::from(p) } else { resolve_path(app)? }
-    };
-    open_from_path(&path)
-}
+// Removed unused open_from_state (callers resolve path via state or use open_from_path)
 
 pub fn open_from_path(path: &PathBuf) -> Result<Connection, String> {
     if *path == PathBuf::from(":memory:") {
@@ -22,5 +12,3 @@ pub fn open_from_path(path: &PathBuf) -> Result<Connection, String> {
         Connection::open(path).map_err(|e| e.to_string())
     }
 }
-
-

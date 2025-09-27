@@ -8,10 +8,7 @@ use crate::{add_breadcrumb, AppState};
 use super::run_upload_cycle;
 
 fn wake_gap_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_WAKE_GAP_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(300)
+    crate::background::config::wake_gap_seconds()
 }
 
 pub fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
@@ -39,10 +36,7 @@ pub fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             .await;
         }
         // interval loop (default 15 minutes)
-        let interval_secs: u64 = std::env::var("KLAAYGUARD_UPLOAD_INTERVAL_SECONDS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(900);
+        let interval_secs: u64 = crate::background::config::upload_interval_seconds();
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         // initialize last upload tick to now
         *state.last_upload_tick_at.write().await = Some(std::time::Instant::now());
@@ -70,7 +64,10 @@ pub fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                 .await;
             }
             if woke {
-                let _ = app.emit("system:wake_detected", serde_json::json!({ "loop": "upload" }));
+                let _ = app.emit(
+                    "system:wake_detected",
+                    serde_json::json!({ "loop": "upload" }),
+                );
                 add_breadcrumb("system", "wake_detected_upload", Level::Info);
                 sentry::capture_message("wake_detected_upload", Level::Info);
                 // immediate extra drain to catch up after wake
@@ -90,5 +87,3 @@ pub fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         }
     });
 }
-
-
