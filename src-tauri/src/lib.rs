@@ -14,9 +14,11 @@
 
 mod auth;
 mod collection;
+mod database;
 mod keychain;
 mod upload;
 use crate::auth::AuthStatus;
+// rusqlite imports kept for legacy compat in this file
 use rusqlite::{params, Connection};
 use sentry::{self, Level};
 use serde::Serialize;
@@ -206,14 +208,7 @@ pub(crate) async fn emit_error_and_focus(
 async fn get_db_path_cached(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
-) -> Result<PathBuf, String> {
-    let current = state.db_path.read().await.clone();
-    if let Some(p) = current {
-        Ok(PathBuf::from(p))
-    } else {
-        get_sqlite_path(app)
-    }
-}
+) -> Result<PathBuf, String> { Ok(database::resolve_path(app)?) }
 
 // moved to upload::store::get_last_upload_at
 
@@ -466,149 +461,23 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
 }
 
 pub(crate) fn get_sqlite_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // Mode selection: default file for development, memory for production unless overridden
-    let mode = std::env::var("KLAAYGUARD_DB_MODE").unwrap_or_else(|_| "file".to_string());
-    if mode.eq_ignore_ascii_case("memory") {
-        // Indicate memory by returning a special :memory: path
-        return Ok(PathBuf::from(":memory:"));
-    }
-    let mut base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir error: {}", e))?;
-    let file_override = std::env::var("KLAAYGUARD_DB_PATH").ok();
-    if let Some(p) = file_override {
-        return Ok(PathBuf::from(p));
-    }
-    base.push("klaayguard.db");
-    Ok(base)
+    database::resolve_path(app)
 }
 
 fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
-    let db_path = get_sqlite_path(app)?;
-    if db_path != PathBuf::from(":memory:") {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create_dir_all for db parent failed: {}", e))?;
-        }
-    }
-    let conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    conn.execute_batch(
-        r#"
-        PRAGMA journal_mode=WAL;
-        PRAGMA foreign_keys=ON;
-        CREATE TABLE IF NOT EXISTS results (
-          id INTEGER PRIMARY KEY,
-          table_name TEXT NOT NULL,
-          json TEXT NOT NULL,
-          run_id TEXT NOT NULL,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          handled INTEGER DEFAULT 0,
-          handled_at DATETIME NULL
-        );
-        CREATE TABLE IF NOT EXISTS metadata (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_results_pending ON results(handled, created_at, id);
-        CREATE INDEX IF NOT EXISTS idx_results_run ON results(run_id);
-        CREATE INDEX IF NOT EXISTS idx_results_handled_at ON results(handled, handled_at);
-        "#,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    database::initialize(app).map(|_| ())
 }
 
 async fn get_db_size_mb(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<u64, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    if db_path == PathBuf::from(":memory:") {
-        // Estimate using page_count * page_size
-        let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let page_count: i64 = conn
-            .query_row("PRAGMA page_count;", [], |r| r.get(0))
-            .unwrap_or(0);
-        let page_size: i64 = conn
-            .query_row("PRAGMA page_size;", [], |r| r.get(0))
-            .unwrap_or(4096);
-        let bytes = page_count.saturating_mul(page_size) as u64;
-        Ok(bytes / (1024 * 1024))
-    } else {
-        let meta = std::fs::metadata(&db_path).map_err(|e| e.to_string())?;
-        Ok(meta.len() / (1024 * 1024))
-    }
+    database::size_mb(app, state).await
 }
 
 async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    let conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    let last_upload = crate::upload::store::get_last_upload_at(app, state).await?;
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days() as i64))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-    let mut total_deleted: usize = 0;
-    loop {
-        let deleted = conn
-            .execute(
-                "DELETE FROM results WHERE id IN (
-                   SELECT id FROM results
-                   WHERE handled=1
-                     AND datetime(created_at) <= datetime(?1)
-                     AND datetime(created_at) <= datetime(?2)
-                   ORDER BY datetime(created_at) ASC, id ASC
-                   LIMIT ?3
-                 )",
-                params![last_upload.as_str(), cutoff.as_str(), prune_batch_rows()],
-            )
-            .map_err(|e| e.to_string())?;
-        total_deleted += deleted as usize;
-        if deleted == 0 {
-            break;
-        }
-    }
-    Ok(total_deleted)
+    database::prune_time_based(app, state, retention_days(), prune_batch_rows()).await
 }
 
 async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    if db_path == PathBuf::from(":memory:") {
-        // No file to size-bound in memory mode; skip
-        return Ok(0);
-    }
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let last_upload = crate::upload::store::get_last_upload_at(app, state).await?;
-    let mut total_deleted: usize = 0;
-    let cap = max_db_mb();
-    loop {
-        let size_now = get_db_size_mb(app, state).await?;
-        if size_now <= cap {
-            break;
-        }
-        let deleted = conn
-            .execute(
-                "DELETE FROM results WHERE id IN (
-                   SELECT id FROM results
-                   WHERE handled=1
-                     AND datetime(created_at) <= datetime(?1)
-                   ORDER BY datetime(created_at) ASC, id ASC
-                   LIMIT ?2
-                 )",
-                params![last_upload.as_str(), prune_batch_rows()],
-            )
-            .map_err(|e| e.to_string())?;
-        total_deleted += deleted as usize;
-        if deleted == 0 {
-            break;
-        }
-    }
-    Ok(total_deleted)
+    database::prune_size_based(app, state, max_db_mb(), prune_batch_rows()).await
 }
 
 async fn run_retention_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
@@ -619,38 +488,31 @@ async fn run_retention_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> R
     *state.retention_in_progress.write().await = true;
     let before = get_db_size_mb(app, state).await.unwrap_or(0);
     add_breadcrumb("retention", &format!("start_db_mb:{}", before), Level::Info);
-    let time_deleted = prune_time_based(app, state).await.unwrap_or(0);
-    let mut after = get_db_size_mb(app, state).await.unwrap_or(before);
-    let mut size_deleted = 0usize;
-    if after > max_db_mb() {
-        size_deleted = prune_size_based(app, state).await.unwrap_or(0);
-        after = get_db_size_mb(app, state).await.unwrap_or(after);
-    }
-    // Optimize lightweight
-    let _ = {
-        let db_path = get_db_path_cached(app, state).await?;
-        let conn = if db_path == PathBuf::from(":memory:") {
-            Connection::open_in_memory().map_err(|e| e.to_string())?
-        } else {
-            Connection::open(&db_path).map_err(|e| e.to_string())?
-        };
-        conn.execute_batch("PRAGMA optimize;").ok();
-        Ok::<(), String>(())
-    };
+    let summary = database::run_once(
+        app,
+        state,
+        retention_days(),
+        max_db_mb(),
+        prune_batch_rows(),
+    )
+    .await?;
     let _ = app.emit(
         "retention:run",
         json!({
-            "deleted_time_based": time_deleted,
-            "deleted_size_based": size_deleted,
-            "db_mb_before": before,
-            "db_mb_after": after,
+            "deleted_time_based": summary.deleted_time_based,
+            "deleted_size_based": summary.deleted_size_based,
+            "db_mb_before": summary.db_mb_before,
+            "db_mb_after": summary.db_mb_after,
         }),
     );
     add_breadcrumb(
         "retention",
         &format!(
             "done time_deleted:{} size_deleted:{} db_mb:{}->{}",
-            time_deleted, size_deleted, before, after
+            summary.deleted_time_based,
+            summary.deleted_size_based,
+            summary.db_mb_before,
+            summary.db_mb_after
         ),
         Level::Info,
     );
@@ -696,38 +558,7 @@ async fn persist_results_to_sqlite(
     run_id: &str,
     results: &HashMap<String, Value>,
 ) -> Result<usize, String> {
-    let db_path = {
-        let current = state.db_path.read().await.clone();
-        if let Some(p) = current {
-            PathBuf::from(p)
-        } else {
-            get_sqlite_path(app)?
-        }
-    };
-    let mut conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut inserted = 0usize;
-    {
-        let mut stmt = tx
-            .prepare("INSERT INTO results (table_name, json, run_id) VALUES (?1, ?2, ?3)")
-            .map_err(|e| e.to_string())?;
-        for (table, value) in results.iter() {
-            if let Some(arr) = value.as_array() {
-                for row in arr {
-                    let row_str = serde_json::to_string(row).map_err(|e| e.to_string())?;
-                    stmt.execute(params![table.as_str(), row_str.as_str(), run_id])
-                        .map_err(|e| e.to_string())?;
-                    inserted += 1;
-                }
-            }
-        }
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(inserted)
+    database::persist_results(app, state, run_id, results).await
 }
 
 /// Installs a launch agent for automatic startup on macOS.

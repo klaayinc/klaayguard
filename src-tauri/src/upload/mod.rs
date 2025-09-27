@@ -13,7 +13,7 @@ pub mod store;
 mod types;
 
 pub use r#loop::spawn_upload_loop;
-pub use types::{JsonApiPayload, JsonApiResource};
+pub use types::{JsonApiPayload, JsonApiResource, UploadRow};
 
 /// Runs a single upload cycle: selects pending rows, builds payload, sends to server, and updates watermark.
 pub async fn run_upload_cycle(
