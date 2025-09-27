@@ -5,7 +5,7 @@ use sentry::Level;
 use serde_json::{json, Value};
 use tauri::Emitter;
 
-use crate::{add_breadcrumb, auth, emit_error_and_focus, run_upload_cycle, AppState};
+use crate::{add_breadcrumb, auth, emit_error_and_focus, AppState};
 use tauri_plugin_shell::ShellExt;
 
 fn collection_interval_seconds() -> u64 {
@@ -312,7 +312,7 @@ pub async fn run_collection_cycle(
     );
     sentry::capture_message("collection_persisted", Level::Info);
 
-    if let Err(e) = run_upload_cycle(app, state, client).await {
+    if let Err(e) = crate::upload::run_upload_cycle(app, state, client).await {
         emit_error_and_focus(
             app,
             state,
