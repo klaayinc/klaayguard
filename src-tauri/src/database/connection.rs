@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-use super::path::resolve_path;
+// removed unused import of resolve_path
 
 // Removed unused open_from_state (callers resolve path via state or use open_from_path)
 

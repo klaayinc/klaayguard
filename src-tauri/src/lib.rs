@@ -13,11 +13,11 @@
 //! - System tray provides controlled access to app functionality
 
 mod auth;
+mod background;
 mod collection;
 mod database;
 mod keychain;
 mod system;
-mod background;
 mod updates;
 mod upload;
 use crate::auth::AuthStatus;
@@ -26,13 +26,13 @@ use crate::system::launch_agent::install_launch_agent;
 use sentry::{self, Level};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tauri::{Emitter, Manager};
 // removed autostart plugin; using manual LaunchAgent management
 // use tauri_plugin_shell::ShellExt; // not used in this file
 // use tauri_plugin_log::LogTarget; // use defaults
 use tokio::sync::RwLock;
-use uuid::Uuid;
+// use uuid::Uuid; // only used in removed helpers
 // use system::launch_agent via full path where needed
 
 // Re-introduced minimal osquery commands used by the UI.
@@ -100,7 +100,9 @@ async fn get_app_version() -> Result<String, String> {
 
 // invalidate_auth moved to auth module
 
-fn wake_gap_seconds() -> u64 { background::config::wake_gap_seconds() }
+fn wake_gap_seconds() -> u64 {
+    background::config::wake_gap_seconds()
+}
 
 fn focus_debounce_seconds() -> u64 {
     std::env::var("KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS")
@@ -111,7 +113,9 @@ fn focus_debounce_seconds() -> u64 {
 
 // retention interval resolved where needed in background::retention
 
-fn collection_interval_seconds() -> u64 { background::config::collection_interval_seconds() }
+fn collection_interval_seconds() -> u64 {
+    background::config::collection_interval_seconds()
+}
 
 async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState>) {
     let now = std::time::Instant::now();
@@ -156,13 +160,13 @@ pub(crate) async fn emit_error_and_focus(
 
 // moved to upload::types::JsonApiPayload
 
-#[allow(dead_code)]
-async fn get_db_path_cached(
+// Remove unused helper: get_db_path_cached
+/* async fn get_db_path_cached(
     app: &tauri::AppHandle,
     _state: &Arc<AppState>,
 ) -> Result<PathBuf, String> {
     Ok(database::resolve_path(app)?)
-}
+} */
 
 // moved to upload::store::get_last_upload_at
 
@@ -172,17 +176,15 @@ async fn get_db_path_cached(
 
 // moved to upload::store::mark_rows_handled_and_advance_watermark
 
-#[allow(dead_code)]
-async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
+/* async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
     crate::collection::get_device_serial_number_internal(app).await
-}
+} */
 
 // moved to upload::run_upload_cycle
 
 // moved to upload::spawn_upload_loop
 
-#[allow(dead_code)]
-async fn run_cycle(
+/* async fn run_cycle(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
     client: &reqwest::Client,
@@ -351,10 +353,9 @@ async fn run_cycle(
     }
 
     Ok(())
-}
+} */
 
-#[allow(dead_code)]
-// deprecated by collection::spawn_collection_loop
+/* // deprecated by collection::spawn_collection_loop
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
@@ -412,7 +413,7 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             }
         }
     });
-}
+} */
 
 pub(crate) fn get_sqlite_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     database::resolve_path(app)
@@ -424,8 +425,7 @@ fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
 
 // helper moved to background::retention
 
-#[allow(dead_code)]
-async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
+/* async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
     database::prune_time_based(
         app,
         state,
@@ -433,10 +433,9 @@ async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resu
         database::config::prune_batch_rows(),
     )
     .await
-}
+} */
 
-#[allow(dead_code)]
-async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
+/* async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
     database::prune_size_based(
         app,
         state,
@@ -444,7 +443,7 @@ async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resu
         database::config::prune_batch_rows(),
     )
     .await
-}
+} */
 
 // retention loop moved to crate::background::retention
 
@@ -989,28 +988,12 @@ pub fn run() {
                 }
             });
 
-            // Create tray menu with security-focused options (no quit option)
-            let show_i = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)
-                .map_err(|e| {
-                    log::error!("Failed to create 'Show' menu item: {}", e);
-                    e
-                })?;
-            let hide_i = tauri::menu::MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)
-                .map_err(|e| {
-                    log::error!("Failed to create 'Hide' menu item: {}", e);
-                    e
-                })?;
-            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &hide_i]).map_err(|e| {
-                log::error!("Failed to create system tray menu: {}", e);
-                e
-            })?;
-
-            // Create tray icon with security monitoring tooltip
-            tauri::tray::TrayIconBuilder::new()
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
+            // Register system tray via system module
+            crate::system::tray::register_tray(
+                &app.handle(),
+                &crate::system::Callbacks::new(
+                    |app| {
                         log::info!("Show window requested from system tray");
-                        // Show window; only force focus if sign-in is required
                         let needs_login = {
                             let st = app.state::<Arc<AppState>>().inner().clone();
                             tauri::async_runtime::block_on(async {
@@ -1018,52 +1001,24 @@ pub fn run() {
                             })
                         };
                         if let Some(window) = app.get_webview_window("main") {
-                            if let Err(e) = window.show() {
-                                log::error!("Failed to show window: {}", e);
-                            } else {
-                                log::info!("Window shown successfully");
-                            }
+                            let _ = window.show();
                             if needs_login {
-                                if let Err(e) = window.set_focus() {
-                                    log::error!("Failed to focus window: {}", e);
-                                }
+                                let _ = window.set_focus();
                             }
                         }
-                    }
-                    "hide" => {
+                    },
+                    |app| {
                         log::info!("Hide window requested from system tray");
                         if let Some(window) = app.get_webview_window("main") {
-                            if let Err(e) = window.hide() {
-                                log::error!("Failed to hide window: {}", e);
-                            } else {
-                                log::info!("Window hidden successfully");
-                            }
+                            let _ = window.hide();
                         }
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| match event {
-                    tauri::tray::TrayIconEvent::Enter { .. } => {
-                        if let Err(e) =
-                            tray.set_tooltip(Some("KlaayGuard - Security Monitoring".to_string()))
-                        {
-                            log::error!("Failed to set tooltip: {}", e);
-                        }
-                    }
-                    tauri::tray::TrayIconEvent::Leave { .. } => {
-                        if let Err(e) = tray.set_tooltip(Some("".to_string())) {
-                            log::error!("Failed to clear tooltip: {}", e);
-                        }
-                    }
-                    _ => {}
-                })
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                .build(app)
-                .map_err(|e| {
-                    log::error!("Failed to create system tray icon: {}", e);
-                    e
-                })?;
+                    },
+                ),
+            )
+            .map_err(|e| {
+                log::error!("Failed to register system tray: {}", e);
+                e
+            })?;
             // Spawn background monitoring loop
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
@@ -1084,10 +1039,7 @@ pub fn run() {
             }
 
             // Start background tasks (collection, upload, retention)
-            let _bg = crate::background::BackgroundTasksManager::start(
-                app_handle,
-                state_for_loop,
-            );
+            let _bg = crate::background::BackgroundTasksManager::start(app_handle, state_for_loop);
 
             Ok(())
         })

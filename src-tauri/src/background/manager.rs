@@ -15,10 +15,7 @@ impl BackgroundTasksManager {
         Self {}
     }
 
-    #[allow(dead_code)]
-    pub fn stop(self) {
-        // No-op for now; loops are unbounded lifetime tasks.
-    }
+    // No stop method; background tasks run for the app lifetime.
 }
 
 #[cfg(test)]

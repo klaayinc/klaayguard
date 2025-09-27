@@ -32,11 +32,14 @@ impl UpdateHttpClient for ReqwestHttpClient {
                 if !resp.status().is_success() {
                     return Err(UpdateError::Http(format!(
                         "status {} from {}",
-                        resp.status(), url
+                        resp.status(),
+                        url
                     )));
                 }
-                let v = resp.json::<T>().await?;
-                Ok::<T, UpdateError>(v)
+                match resp.json::<T>().await {
+                    Ok(v) => Ok::<T, UpdateError>(v),
+                    Err(e) => Err(UpdateError::InvalidResponse(e.to_string())),
+                }
             };
             handle.block_on(fut)
         } else {
@@ -50,11 +53,14 @@ impl UpdateHttpClient for ReqwestHttpClient {
                 if !resp.status().is_success() {
                     return Err(UpdateError::Http(format!(
                         "status {} from {}",
-                        resp.status(), url
+                        resp.status(),
+                        url
                     )));
                 }
-                let v = resp.json::<T>().await?;
-                Ok::<T, UpdateError>(v)
+                match resp.json::<T>().await {
+                    Ok(v) => Ok::<T, UpdateError>(v),
+                    Err(e) => Err(UpdateError::InvalidResponse(e.to_string())),
+                }
             })
         }
     }
@@ -69,7 +75,8 @@ impl UpdateHttpClient for ReqwestHttpClient {
                 if !resp.status().is_success() {
                     return Err(UpdateError::Http(format!(
                         "status {} from {}",
-                        resp.status(), url
+                        resp.status(),
+                        url
                     )));
                 }
                 let b = resp.bytes().await?;
@@ -86,7 +93,8 @@ impl UpdateHttpClient for ReqwestHttpClient {
                 if !resp.status().is_success() {
                     return Err(UpdateError::Http(format!(
                         "status {} from {}",
-                        resp.status(), url
+                        resp.status(),
+                        url
                     )));
                 }
                 let b = resp.bytes().await?;
@@ -160,7 +168,11 @@ impl SystemIntegration for MacSystem {
                 .map_err(|e| UpdateError::System(format!("remove_old: {}", e)))?;
         }
         let status = std::process::Command::new("cp")
-            .args(["-R", source_app.to_str().unwrap(), target_app.to_str().unwrap()])
+            .args([
+                "-R",
+                source_app.to_str().unwrap(),
+                target_app.to_str().unwrap(),
+            ])
             .status()
             .map_err(|e| UpdateError::System(format!("copy_error: {}", e)))?;
         if !status.success() {
@@ -175,7 +187,7 @@ impl SystemIntegration for MacSystem {
             .status()
             .map_err(|e| UpdateError::System(e.to_string()))?;
         if !status.success() {
-            return Err(UpdateError::System("detach_failed".into()))
+            return Err(UpdateError::System("detach_failed".into()));
         }
         Ok(())
     }
@@ -184,5 +196,3 @@ impl SystemIntegration for MacSystem {
         let _ = std::fs::remove_file(p);
     }
 }
-
-

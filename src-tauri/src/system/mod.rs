@@ -1,18 +1,13 @@
 use std::sync::Arc;
 
-#[allow(dead_code)]
 #[derive(thiserror::Error, Debug)]
 pub enum SystemError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("tauri: {0}")]
     Tauri(#[from] tauri::Error),
-    #[error("unsupported: {0}")]
-    Unsupported(&'static str),
     #[error("invalid_state: {0}")]
     InvalidState(&'static str),
-    #[error("other: {0}")]
-    Other(String),
 }
 
 #[derive(Clone)]
@@ -34,36 +29,7 @@ impl Callbacks {
     }
 }
 
-pub struct SystemIntegration {
-    app: tauri::AppHandle,
-}
-
-impl SystemIntegration {
-    pub fn init(app: &tauri::AppHandle, callbacks: Callbacks) -> Result<Self, SystemError> {
-        tray::register_tray(app, &callbacks)?;
-        Ok(Self { app: app.clone() })
-    }
-
-    #[allow(dead_code)]
-    pub fn show_main_window(&self) -> Result<(), SystemError> {
-        window::show_main(&self.app)
-    }
-
-    #[allow(dead_code)]
-    pub fn hide_main_window(&self) -> Result<(), SystemError> {
-        window::hide_main(&self.app)
-    }
-
-    #[allow(dead_code)]
-    pub fn focus_main_window(&self) -> Result<(), SystemError> {
-        window::focus_main(&self.app)
-    }
-
-    #[allow(dead_code)]
-    pub fn toggle_main_window(&self) -> Result<(), SystemError> {
-        window::toggle_main(&self.app)
-    }
-}
+// Removed unused SystemIntegration wrapper; callers should use `tray` and `window` directly.
 
 pub mod launch_agent;
 pub mod tray;

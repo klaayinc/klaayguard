@@ -11,7 +11,6 @@ struct ReleaseAsset {
 
 #[derive(serde::Deserialize)]
 struct ReleaseInfo {
-    #[allow(dead_code)]
     #[serde(rename = "name")]
     _name: Option<String>,
     version: String,

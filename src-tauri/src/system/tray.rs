@@ -28,5 +28,3 @@ pub fn register_tray(app: &tauri::AppHandle, callbacks: &Callbacks) -> Result<()
         .build(app)?;
     Ok(())
 }
-
-
