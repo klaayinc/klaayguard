@@ -16,10 +16,10 @@ mod auth;
 mod collection;
 mod database;
 mod keychain;
+mod updates;
 mod upload;
 use crate::auth::AuthStatus;
 // rusqlite imports kept for legacy compat in this file
-use rusqlite::{params, Connection};
 use sentry::{self, Level};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -78,16 +78,8 @@ async fn set_api_base_url(
 }
 
 // save_auth_token moved to auth module
-
 // clear_auth_token moved to auth module
-
-/// Returns seconds until next scheduled run (120s default interval).
-/// -1 indicates not signed in (no token yet). 0 means due now or overdue.
-// moved to collection::get_next_run_in_seconds
-
-// moved to collection::get_device_serial_number
-
-// AuthStatus moved to auth module
+// get_auth_status moved to auth module
 
 #[tauri::command]
 async fn get_app_version() -> Result<String, String> {
@@ -95,8 +87,6 @@ async fn get_app_version() -> Result<String, String> {
     log::info!("📱 Frontend requested app version: {}", version);
     Ok(version)
 }
-
-// get_auth_status moved to auth module
 
 // moved to collection::execute_query
 
@@ -120,13 +110,6 @@ fn focus_debounce_seconds() -> u64 {
         .unwrap_or(60)
 }
 
-fn retention_days() -> i64 {
-    std::env::var("KLAAYGUARD_RETENTION_DAYS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(30)
-}
-
 fn retention_interval_seconds() -> u64 {
     std::env::var("KLAAYGUARD_RETENTION_INTERVAL_SECONDS")
         .ok()
@@ -139,20 +122,6 @@ fn collection_interval_seconds() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(900)
-}
-
-fn prune_batch_rows() -> i64 {
-    std::env::var("KLAAYGUARD_PRUNE_BATCH_ROWS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(5000)
-}
-
-fn max_db_mb() -> u64 {
-    std::env::var("KLAAYGUARD_MAX_DB_MB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(200)
 }
 
 async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState>) {
@@ -169,15 +138,8 @@ async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.show();
             let _ = window.set_focus();
+            *state.last_focus_at.write().await = Some(now);
         }
-        // Log locally when focusing for user-required action (e.g., sign-in)
-        log::warn!("Focusing main window for user action (debounced)");
-        *state.last_focus_at.write().await = Some(now);
-        let _ = app.emit(
-            "focus:on_failure",
-            json!({ "at": chrono::Utc::now().to_rfc3339() }),
-        );
-        add_breadcrumb("ui", "focus_on_failure", Level::Info);
     }
 }
 
@@ -208,7 +170,9 @@ pub(crate) async fn emit_error_and_focus(
 async fn get_db_path_cached(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
-) -> Result<PathBuf, String> { Ok(database::resolve_path(app)?) }
+) -> Result<PathBuf, String> {
+    Ok(database::resolve_path(app)?)
+}
 
 // moved to upload::store::get_last_upload_at
 
@@ -473,11 +437,23 @@ async fn get_db_size_mb(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result
 }
 
 async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    database::prune_time_based(app, state, retention_days(), prune_batch_rows()).await
+    database::prune_time_based(
+        app,
+        state,
+        database::config::retention_days(),
+        database::config::prune_batch_rows(),
+    )
+    .await
 }
 
 async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    database::prune_size_based(app, state, max_db_mb(), prune_batch_rows()).await
+    database::prune_size_based(
+        app,
+        state,
+        database::config::max_db_mb(),
+        database::config::prune_batch_rows(),
+    )
+    .await
 }
 
 async fn run_retention_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
@@ -491,9 +467,9 @@ async fn run_retention_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> R
     let summary = database::run_once(
         app,
         state,
-        retention_days(),
-        max_db_mb(),
-        prune_batch_rows(),
+        database::config::retention_days(),
+        database::config::max_db_mb(),
+        database::config::prune_batch_rows(),
     )
     .await?;
     let _ = app.emit(
@@ -826,44 +802,10 @@ async fn get_runtime_status(
     })
 }
 
-#[derive(serde::Deserialize)]
-struct ReleaseAsset {
-    id: u64,
-    name: String,
-    // Include other fields for deserialization but mark as unused
-    #[serde(rename = "original_name")]
-    _original_name: Option<String>,
-    #[serde(rename = "content_type")]
-    _content_type: Option<String>,
-    #[serde(rename = "size")]
-    _size: Option<u64>,
-    #[serde(rename = "digest")]
-    _digest: Option<String>,
-    #[serde(rename = "sha256")]
-    _sha256: Option<String>,
-    #[serde(rename = "browser_download_url")]
-    _browser_download_url: Option<String>,
-    #[serde(rename = "api_asset_url")]
-    _api_asset_url: Option<String>,
-}
+// release DTOs and API helper moved to updates module
 
-#[derive(serde::Deserialize)]
-struct ReleaseInfo {
-    #[serde(rename = "name")]
-    _name: Option<String>,
-    version: String, // This is the tag_name from GitHub
-    assets: Vec<ReleaseAsset>,
-}
-
-fn get_api_base_url() -> String {
-    // Use the same logic as the main app startup
-    std::env::var("VITE_API_BASE_URL")
-        .ok()
-        .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
-        .unwrap_or_else(|| "https://api.klaay.com".to_string())
-}
-
-async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, String> {
+// moved to updates::check
+/* async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, String> {
     let current_version = env!("CARGO_PKG_VERSION");
     log::info!(
         "🔍 Starting update check - current version: {}",
@@ -992,16 +934,11 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, St
     }
 
     Ok(None)
-}
+} */
 
-#[tauri::command]
-async fn check_for_updates_command() -> Result<Option<String>, String> {
-    let api_base = get_api_base_url();
-    log::info!("🌐 Manual update check using API base URL: {}", api_base);
-    check_for_updates_internal(&api_base).await
-}
+// re-exported from updates module
 
-async fn download_and_install_update_internal(
+/* async fn download_and_install_update_internal(
     api_base: &str,
     asset_id: &str,
     app: &tauri::AppHandle,
@@ -1064,143 +1001,11 @@ async fn download_and_install_update_internal(
     replace_application(&dmg_path, app).await?;
 
     Ok(())
-}
+} */
 
-#[tauri::command]
-async fn download_and_install_update(
-    asset_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    let api_base = get_api_base_url();
-    log::info!("🌐 Manual update download using API base URL: {}", api_base);
-    download_and_install_update_internal(&api_base, &asset_id, &app).await
-}
+// re-exported from updates module
 
-async fn replace_application(
-    dmg_path: &std::path::Path,
-    app: &tauri::AppHandle,
-) -> Result<(), String> {
-    log::info!("💿 Mounting DMG: {:?}", dmg_path);
-
-    // Mount the DMG
-    let mount_output = std::process::Command::new("hdiutil")
-        .args(&["attach", dmg_path.to_str().unwrap()])
-        .output()
-        .map_err(|e| {
-            log::error!("❌ Failed to mount DMG: {}", e);
-            format!("Failed to mount DMG: {}", e)
-        })?;
-
-    if !mount_output.status.success() {
-        let error_msg = "Failed to mount DMG".to_string();
-        log::error!(
-            "❌ {} - hdiutil output: {}",
-            error_msg,
-            String::from_utf8_lossy(&mount_output.stderr)
-        );
-        return Err(error_msg);
-    }
-
-    // Extract mount point from hdiutil output
-    let mount_output_str = String::from_utf8_lossy(&mount_output.stdout);
-    log::info!("📋 hdiutil output: {}", mount_output_str);
-
-    let mount_point = mount_output_str
-        .lines()
-        .find(|line| line.contains("/Volumes/"))
-        .ok_or_else(|| {
-            log::error!("❌ Could not find mount point in hdiutil output");
-            "Could not find mount point"
-        })?
-        .split('\t')
-        .last()
-        .ok_or_else(|| {
-            log::error!("❌ Could not parse mount point from line");
-            "Could not parse mount point"
-        })?;
-
-    log::info!("📍 Mount point: {}", mount_point);
-
-    let source_app = std::path::Path::new(mount_point).join("KlaayGuard.app");
-    let target_app = std::path::Path::new("/Applications/KlaayGuard.app");
-
-    log::info!("📂 Source app: {:?}", source_app);
-    log::info!("📂 Target app: {:?}", target_app);
-
-    // Check if source app exists
-    if !source_app.exists() {
-        let error_msg = format!("Source app not found at: {:?}", source_app);
-        log::error!("❌ {}", error_msg);
-        return Err(error_msg);
-    }
-
-    // Remove old app and copy new one
-    if target_app.exists() {
-        log::info!("🗑️  Removing old app from: {:?}", target_app);
-        std::fs::remove_dir_all(target_app).map_err(|e| {
-            log::error!("❌ Failed to remove old app: {}", e);
-            format!("Failed to remove old app: {}", e)
-        })?;
-        log::info!("✅ Old app removed successfully");
-    } else {
-        log::info!("ℹ️  No existing app found at target location");
-    }
-
-    log::info!(
-        "📋 Copying new app from {:?} to {:?}",
-        source_app,
-        target_app
-    );
-    let copy_result = std::process::Command::new("cp")
-        .args(&[
-            "-R",
-            source_app.to_str().unwrap(),
-            target_app.to_str().unwrap(),
-        ])
-        .status()
-        .map_err(|e| {
-            log::error!("❌ Failed to copy new app: {}", e);
-            format!("Failed to copy new app: {}", e)
-        })?;
-
-    if !copy_result.success() {
-        let error_msg = "Failed to copy new app - cp command failed".to_string();
-        log::error!("❌ {}", error_msg);
-        return Err(error_msg);
-    }
-
-    log::info!("✅ New app copied successfully");
-
-    // Unmount the DMG
-    log::info!("💿 Unmounting DMG from: {}", mount_point);
-    let unmount_result = std::process::Command::new("hdiutil")
-        .args(&["detach", mount_point])
-        .status()
-        .map_err(|e| {
-            log::error!("❌ Failed to unmount DMG: {}", e);
-            format!("Failed to unmount DMG: {}", e)
-        })?;
-
-    if !unmount_result.success() {
-        log::warn!("⚠️  DMG unmount failed, but continuing...");
-    } else {
-        log::info!("✅ DMG unmounted successfully");
-    }
-
-    // Remove the DMG file
-    log::info!("🗑️  Removing temporary DMG file: {:?}", dmg_path);
-    if let Err(e) = std::fs::remove_file(dmg_path) {
-        log::warn!("⚠️  Failed to remove DMG file: {}", e);
-        // Don't fail the whole process for this
-    } else {
-        log::info!("✅ Temporary DMG file removed");
-    }
-
-    log::info!("🎉 Application updated successfully! Restarting...");
-
-    // Restart the application
-    app.restart();
-}
+// moved to updates::install
 /// Main entry point for the KlaayGuard security monitoring application.
 ///
 /// This function initializes the Tauri application with security-focused configuration:
@@ -1344,22 +1149,7 @@ pub fn run() {
 
             // Check for updates on startup and install automatically
             let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                log::info!("🚀 Starting automatic update check on app startup");
-                let api_base = get_api_base_url();
-                log::info!("🌐 Using API base URL: {}", api_base);
-                if let Ok(Some(asset_id)) = check_for_updates_internal(&api_base).await {
-                    log::info!("🔄 Update available, starting download and install process...");
-                    if let Err(e) =
-                        download_and_install_update_internal(&api_base, &asset_id, &app_handle)
-                            .await
-                    {
-                        log::error!("💥 Auto-update failed: {}", e);
-                    }
-                } else {
-                    log::info!("✅ No updates available - app is up to date");
-                }
-            });
+            crate::updates::bootstrap::bootstrap_on_startup(app_handle);
 
             // Install and kickstart LaunchAgent with KeepAlive
             #[cfg(target_os = "macos")]
@@ -1529,8 +1319,8 @@ pub fn run() {
             uninstall_launch_agent,
             get_arch_status,
             get_runtime_status,
-            check_for_updates_command,
-            download_and_install_update
+            crate::updates::commands::check_for_updates_command,
+            crate::updates::commands::download_and_install_update
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");
