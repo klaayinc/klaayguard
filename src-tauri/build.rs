@@ -6,10 +6,10 @@ fn main() {
         .unwrap_or_else(|| "production".to_string())
         .to_lowercase();
 
-    // Debug output
-    println!("cargo:warning=KLAAY_ENV: {}", klaay_env);
-    println!(
-        "cargo:warning=VITE_API_BASE_URL: {:?}",
+    // Debug output (avoid cargo:warning to keep builds clean)
+    eprintln!("KLAAY_ENV: {}", klaay_env);
+    eprintln!(
+        "VITE_API_BASE_URL: {:?}",
         std::env::var("VITE_API_BASE_URL")
     );
 
@@ -21,16 +21,13 @@ fn main() {
     };
     let api_base = std::env::var("VITE_API_BASE_URL").unwrap_or_else(|_| default_api.to_string());
 
-    // Debug output
-    println!("cargo:warning=default_api: {}", default_api);
-    println!("cargo:warning=final api_base: {}", api_base);
+    // Debug output (avoid cargo:warning to keep builds clean)
+    eprintln!("default_api: {}", default_api);
+    eprintln!("final api_base: {}", api_base);
 
     // Expose compile-time default for Rust side
     println!("cargo:rustc-env=APP_DEFAULT_API_BASE_URL={}", api_base);
-    println!(
-        "cargo:warning=Setting APP_DEFAULT_API_BASE_URL to: {}",
-        api_base
-    );
+    eprintln!("Setting APP_DEFAULT_API_BASE_URL to: {}", api_base);
 
     let mut windows = tauri_build::WindowsAttributes::new();
     windows = windows.app_manifest(

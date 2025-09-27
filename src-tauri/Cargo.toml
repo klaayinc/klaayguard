@@ -39,6 +39,7 @@ keyring = "2"
 rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
 uuid = { version = "1", features = ["v4"] }
 semver = "1.0"
+thiserror = "1"
 
 [dev-dependencies]
 httpmock = "0.7"
