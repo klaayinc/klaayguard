@@ -13,6 +13,7 @@
 //! - System tray provides controlled access to app functionality
 
 mod auth;
+mod collection;
 mod keychain;
 use crate::auth::AuthStatus;
 use rusqlite::{params, Connection, ToSql};
@@ -22,7 +23,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 // removed autostart plugin; using manual LaunchAgent management
-use tauri_plugin_shell::ShellExt;
+// use tauri_plugin_shell::ShellExt; // not used in this file
 // use tauri_plugin_log::LogTarget; // use defaults
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -79,57 +80,9 @@ async fn set_api_base_url(
 
 /// Returns seconds until next scheduled run (120s default interval).
 /// -1 indicates not signed in (no token yet). 0 means due now or overdue.
-#[tauri::command]
-async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Result<i64, String> {
-    if state.auth_token.read().await.is_none() {
-        return Ok(-1);
-    }
-    // Use last attempt time so countdown advances even if last run failed
-    let last = *state.last_attempt_at.read().await;
-    let interval = std::time::Duration::from_secs(collection_interval_seconds());
-    if let Some(last) = last {
-        let elapsed = last.elapsed();
-        if elapsed >= interval {
-            Ok(0)
-        } else {
-            Ok((interval - elapsed).as_secs() as i64)
-        }
-    } else {
-        // first run should happen immediately after login/token
-        Ok(0)
-    }
-}
+// moved to collection::get_next_run_in_seconds
 
-#[tauri::command]
-/// Gets the hardware serial number from the hardware_info osquery table
-async fn get_device_serial_number(app: tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["hardware_info".to_string()];
-    let query_result = execute_query(app, tables).await?;
-
-    let serial = query_result
-        .get("hardware_info")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|obj| {
-            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
-            obj.get("serial_number")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    obj.get("hardware_serial")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-                .or_else(|| {
-                    obj.get("hardware_uuid")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-        })
-        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
-
-    Ok(serial.to_string())
-}
+// moved to collection::get_device_serial_number
 
 // AuthStatus moved to auth module
 
@@ -142,114 +95,11 @@ async fn get_app_version() -> Result<String, String> {
 
 // get_auth_status moved to auth module
 
-#[tauri::command]
-async fn execute_query(
-    app: tauri::AppHandle,
-    table_names: Vec<String>,
-) -> Result<HashMap<String, Value>, String> {
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
-
-    let mut all_results = HashMap::new();
-
-    for table_name in table_names {
-        let cmd = app
-            .shell()
-            .sidecar("osqueryi")
-            .unwrap()
-            .args(["--json", &format!("SELECT * FROM {}", table_name)]);
-
-        let output = cmd.output().await.map_err(|e| e.to_string())?;
-
-        if !output.status.success() {
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            let stderr_lc = stderr_str.to_ascii_lowercase();
-            // Gracefully handle missing/unsupported tables by recording an empty result set
-            if stderr_lc.contains("no such table")
-                || stderr_lc.contains("no such column")
-                || stderr_lc.contains("no such module")
-            {
-                all_results.insert(table_name, serde_json::json!([]));
-                continue;
-            }
-            return Err(format!(
-                "table {} failed (exit code {:?}): {}",
-                table_name,
-                output.status.code(),
-                stderr_str
-            ));
-        }
-
-        let stdout_str = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8 output for table {}: {}", table_name, e))?;
-
-        let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
-            format!(
-                "Failed to parse JSON for table {} (content: '{}'): {}",
-                table_name,
-                stdout_str.trim(),
-                e
-            )
-        })?;
-
-        all_results.insert(table_name, parsed_result);
-    }
-
-    Ok(all_results)
-}
+// moved to collection::execute_query
 
 /// Executes a batch of SQL statements against osquery and returns results keyed by logical id
 /// The vector contains pairs of (logical_id, sql_to_execute).
-async fn execute_sql_batch(
-    app: tauri::AppHandle,
-    queries: Vec<(String, String)>,
-) -> Result<HashMap<String, Value>, String> {
-    let mut all_results: HashMap<String, Value> = HashMap::new();
-
-    for (logical_id, sql) in queries {
-        let cmd = app
-            .shell()
-            .sidecar("osqueryi")
-            .unwrap()
-            .args(["--json", sql.as_str()]);
-
-        let output = cmd.output().await.map_err(|e| e.to_string())?;
-
-        if !output.status.success() {
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            let stderr_lc = stderr_str.to_ascii_lowercase();
-            if stderr_lc.contains("no such table")
-                || stderr_lc.contains("no such column")
-                || stderr_lc.contains("no such module")
-            {
-                all_results.insert(logical_id, serde_json::json!([]));
-                continue;
-            }
-            return Err(format!(
-                "sql for '{}' failed (exit code {:?}): {}",
-                logical_id,
-                output.status.code(),
-                stderr_str
-            ));
-        }
-
-        let stdout_str = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8 output for {}: {}", logical_id, e))?;
-
-        let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
-            format!(
-                "Failed to parse JSON for {} (content: '{}'): {}",
-                logical_id,
-                stdout_str.trim(),
-                e
-            )
-        })?;
-
-        all_results.insert(logical_id, parsed_result);
-    }
-
-    Ok(all_results)
-}
+// moved to collection::execute_sql_batch
 
 // invalidate_auth moved to auth module
 
@@ -512,31 +362,9 @@ async fn mark_rows_handled_and_advance_watermark(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["hardware_info".to_string()];
-    let result = execute_query(app.clone(), tables).await?;
-    let serial = result
-        .get("hardware_info")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|obj| {
-            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
-            obj.get("serial_number")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    obj.get("hardware_serial")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-                .or_else(|| {
-                    obj.get("hardware_uuid")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-        })
-        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
-    Ok(serial.to_string())
+    crate::collection::get_device_serial_number_internal(app).await
 }
 
 async fn run_upload_cycle(
@@ -576,7 +404,7 @@ async fn run_upload_cycle(
         Level::Info,
     );
     sentry::capture_message("upload_pending_rows", Level::Info);
-    let device_serial = get_device_serial_number_internal(app)
+    let device_serial = crate::collection::get_device_serial_number_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
     let mut items: Vec<JsonApiResource> = Vec::with_capacity(rows.len());
@@ -785,6 +613,7 @@ fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     });
 }
 
+#[allow(dead_code)]
 async fn run_cycle(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
@@ -919,7 +748,7 @@ async fn run_cycle(
     // 2) osquery
     add_breadcrumb("collection", "osquery_start", Level::Info);
     sentry::capture_message("collection_osquery_start", Level::Info);
-    let results = execute_sql_batch(app.clone(), queries).await?;
+    let results = crate::collection::execute_sql_batch(app.clone(), queries).await?;
 
     // 3) Persist results to SQLite (Loop A)
     let run_id = Uuid::new_v4().to_string();
@@ -956,6 +785,8 @@ async fn run_cycle(
     Ok(())
 }
 
+#[allow(dead_code)]
+// deprecated by collection::spawn_collection_loop
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
@@ -2225,7 +2056,8 @@ pub fn run() {
                 }
             }
 
-            spawn_background_loop(app_handle.clone(), state_for_loop.clone());
+            // Spawn collection loop (Loop A)
+            crate::collection::spawn_collection_loop(app_handle.clone(), state_for_loop.clone());
             // Spawn uploader loop (Loop B)
             spawn_upload_loop(app_handle.clone(), state_for_loop.clone());
             // Spawn retention loop (maintenance)
@@ -2235,12 +2067,12 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            execute_query,
-            get_device_serial_number,
+            crate::collection::execute_query,
+            crate::collection::get_device_serial_number,
             crate::auth::save_auth_token,
             crate::auth::clear_auth_token,
             set_api_base_url,
-            get_next_run_in_seconds,
+            crate::collection::get_next_run_in_seconds,
             crate::auth::get_auth_status,
             get_app_version,
             install_launch_agent,
