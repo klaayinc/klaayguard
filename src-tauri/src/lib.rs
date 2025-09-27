@@ -12,7 +12,9 @@
 //! - Background operation ensures continuous monitoring
 //! - System tray provides controlled access to app functionality
 
+mod auth;
 mod keychain;
+use crate::auth::AuthStatus;
 use rusqlite::{params, Connection, ToSql};
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
@@ -60,80 +62,7 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
     });
 }
 
-/// Attempts to extract a JWT token from a klaayguard:// deep link URL and persist it
-fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
-    // Expect formats like: klaayguard://auth-callback?token=JWT
-    if !url.starts_with("klaayguard://") {
-        log::info!("deep_link_ignored_non_scheme url={}", url);
-        return;
-    }
-    log::info!("deep_link_received url={}", url);
-    let token_opt = {
-        // Find the query string
-        let qs = url.splitn(2, '?').nth(1).unwrap_or("");
-        let mut out: Option<String> = None;
-        for pair in qs.split('&') {
-            let mut it = pair.splitn(2, '=');
-            let k = it.next().unwrap_or("");
-            let v = it.next().unwrap_or("");
-            if k == "token" {
-                // Basic percent-decoding for spaces and plus; JWTs rarely need full decoding
-                let decoded = v.replace("%20", " ").replace("+", " ");
-                out = Some(decoded);
-                break;
-            }
-        }
-        out
-    };
-
-    if let Some(tok) = token_opt {
-        // Basic shape validation: three segments separated by '.'
-        let dot_count = tok.matches('.').count();
-        if dot_count != 2 {
-            add_breadcrumb("auth", "deep_link_invalid_token_shape", Level::Warning);
-            log::warn!("deep_link_invalid_token_shape dot_count={}", dot_count);
-            return;
-        }
-        // Save to memory and keychain
-        log::info!(
-            "deep_link_token_parsed length={} saving_to_keychain",
-            tok.len()
-        );
-        tauri::async_runtime::block_on(async {
-            *state.auth_token.write().await = Some(tok.clone());
-            *state.keychain_cleared_this_session.write().await = false;
-        });
-        let _ = keychain::save_token(&tok);
-        log::info!("deep_link_token_saved_to_keychain");
-        let _ = app.emit("auth:status", json!({ "authenticated": true }));
-        add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
-        sentry::capture_message("deep_link_token_saved", Level::Info);
-        // Optionally hide the window if it is visible
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.hide();
-            log::info!("deep_link_window_hidden_after_auth");
-        }
-    } else {
-        log::warn!("deep_link_missing_token_param");
-    }
-}
-
-/// Scan process args for a klaayguard deep link and handle it
-fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    let args: Vec<String> = std::env::args().collect();
-    log::info!(
-        "process_args count={} sample_arg1={}",
-        args.len(),
-        args.get(1).cloned().unwrap_or_default()
-    );
-    for a in args {
-        if a.starts_with("klaayguard://") {
-            log::info!("deep_link_found_in_process_args");
-            handle_deep_link_url(app, state, &a);
-            break;
-        }
-    }
-}
+// deep link handling moved to auth module
 
 #[tauri::command]
 async fn set_api_base_url(
@@ -144,33 +73,9 @@ async fn set_api_base_url(
     Ok(())
 }
 
-#[tauri::command]
-async fn save_auth_token(
-    state: tauri::State<'_, Arc<AppState>>,
-    token: String,
-) -> Result<(), String> {
-    *state.auth_token.write().await = Some(token.clone());
-    // Reset the session guard; we have a fresh token now
-    *state.keychain_cleared_this_session.write().await = false;
-    let _ = keychain::save_token(&token);
-    add_breadcrumb("auth", "token_saved", Level::Info);
-    sentry::capture_message("auth_token_saved", Level::Info);
-    Ok(())
-}
+// save_auth_token moved to auth module
 
-#[tauri::command]
-async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    *state.auth_token.write().await = None;
-    // Allow a single delete per session to avoid repeated Keychain prompts
-    let already_cleared = *state.keychain_cleared_this_session.read().await;
-    if !already_cleared {
-        let _ = keychain::delete_token();
-        *state.keychain_cleared_this_session.write().await = true;
-    }
-    add_breadcrumb("auth", "token_cleared", Level::Info);
-    sentry::capture_message("auth_token_cleared", Level::Info);
-    Ok(())
-}
+// clear_auth_token moved to auth module
 
 /// Returns seconds until next scheduled run (120s default interval).
 /// -1 indicates not signed in (no token yet). 0 means due now or overdue.
@@ -226,11 +131,7 @@ async fn get_device_serial_number(app: tauri::AppHandle) -> Result<String, Strin
     Ok(serial.to_string())
 }
 
-#[derive(serde::Serialize)]
-struct AuthStatus {
-    authenticated: bool,
-    display_name: Option<String>,
-}
+// AuthStatus moved to auth module
 
 #[tauri::command]
 async fn get_app_version() -> Result<String, String> {
@@ -239,92 +140,7 @@ async fn get_app_version() -> Result<String, String> {
     Ok(version)
 }
 
-#[tauri::command]
-async fn get_auth_status(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<AuthStatus, String> {
-    let token_opt = state.auth_token.read().await.clone();
-    if token_opt.is_none() {
-        return Ok(AuthStatus {
-            authenticated: false,
-            display_name: None,
-        });
-    }
-    let base = state.api_base_url.read().await.clone();
-    let token = token_opt.unwrap();
-    let client = reqwest::Client::builder()
-        .user_agent("klaayguard/0.1")
-        .build()
-        .map_err(|e| e.to_string())?;
-    add_breadcrumb("auth", "me_request_start", Level::Info);
-    sentry::capture_message("auth_me_request_start", Level::Info);
-
-    // Determine authentication state and display name from /me
-    let (is_authenticated, name): (bool, Option<String>) = match client
-        .get(format!("{}/me", base))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            add_breadcrumb(
-                "auth",
-                &format!("me_response_status:{}", resp.status().as_u16()),
-                Level::Info,
-            );
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                || resp.status() == reqwest::StatusCode::FORBIDDEN
-            {
-                // Invalidate and prompt login
-                invalidate_auth(&app, &state).await.ok();
-                add_breadcrumb("auth", "auth_invalidated_on_me", Level::Warning);
-                sentry::capture_message("auth_invalidated_on_me", Level::Warning);
-                (false, None)
-            } else if resp.status().is_success() {
-                match resp.json::<Value>().await {
-                    Ok(body) => {
-                        let attrs = body
-                            .get("data")
-                            .and_then(|d| d.get("attributes"))
-                            .cloned()
-                            .unwrap_or(json!({}));
-                        let first = attrs
-                            .get("first_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let last = attrs
-                            .get("last_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let email = attrs.get("email").and_then(|v| v.as_str());
-                        let full = format!("{} {}", first, last).trim().to_string();
-                        let name = if !full.is_empty() {
-                            Some(full)
-                        } else {
-                            email.map(|s| s.to_string())
-                        };
-                        (true, name)
-                    }
-                    Err(_) => (true, None),
-                }
-            } else {
-                // Non-401/403 error; consider unauthenticated
-                (false, None)
-            }
-        }
-        Err(e) => {
-            add_breadcrumb("auth", &format!("me_request_error:{}", e), Level::Warning);
-            sentry::capture_message("auth_me_request_error", Level::Warning);
-            (false, None)
-        }
-    };
-
-    Ok(AuthStatus {
-        authenticated: is_authenticated,
-        display_name: name,
-    })
-}
+// get_auth_status moved to auth module
 
 #[tauri::command]
 async fn execute_query(
@@ -435,23 +251,7 @@ async fn execute_sql_batch(
     Ok(all_results)
 }
 
-async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
-    *state.auth_token.write().await = None;
-    // Delete the token at most once per session to reduce prompts
-    let already_cleared = *state.keychain_cleared_this_session.read().await;
-    if !already_cleared {
-        let _ = keychain::delete_token();
-        *state.keychain_cleared_this_session.write().await = true;
-    }
-    // Log locally and bring the app to focus to prompt re-login
-    log::warn!("Authentication invalidated; focusing window for re-login");
-    focus_window_with_debounce(app, state).await;
-    let _ = app.emit("auth:invalidated", ());
-    let _ = app.emit("auth:status", json!({ "authenticated": false }));
-    add_breadcrumb("auth", "auth_invalidated", Level::Warning);
-    sentry::capture_message("auth_invalidated", Level::Warning);
-    Ok(())
-}
+// invalidate_auth moved to auth module
 
 fn wake_gap_seconds() -> u64 {
     std::env::var("KLAAYGUARD_WAKE_GAP_SECONDS")
@@ -837,7 +637,7 @@ async fn run_upload_cycle(
                     || resp.status() == reqwest::StatusCode::FORBIDDEN
                 {
                     add_breadcrumb("upload", "auth_invalidated_on_post", Level::Warning);
-                    invalidate_auth(app, state).await?;
+                    crate::auth::invalidate_auth(app, state).await?;
                     let _ = app.emit(
                         "upload:error",
                         json!({ "stage": "post", "status": resp.status().as_u16() }),
@@ -1065,7 +865,7 @@ async fn run_cycle(
     if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED
         || cfg_resp.status() == reqwest::StatusCode::FORBIDDEN
     {
-        invalidate_auth(app, state).await?;
+        auth::invalidate_auth(app, state).await?;
         let _ = app.emit(
             "collection:error",
             json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
@@ -2195,7 +1995,7 @@ pub fn run() {
             for a in args {
                 if a.starts_with("klaayguard://") {
                     log::info!("single_instance_deep_link_received");
-                    handle_deep_link_url(&app, &st, &a);
+                    crate::auth::handle_deep_link_url(&app, &st, &a);
                     break;
                 }
             }
@@ -2322,7 +2122,7 @@ pub fn run() {
             }
 
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
-            try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
+            crate::auth::try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
 
             window.on_window_event(move |event| {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -2437,11 +2237,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             execute_query,
             get_device_serial_number,
-            save_auth_token,
-            clear_auth_token,
+            crate::auth::save_auth_token,
+            crate::auth::clear_auth_token,
             set_api_base_url,
             get_next_run_in_seconds,
-            get_auth_status,
+            crate::auth::get_auth_status,
             get_app_version,
             install_launch_agent,
             uninstall_launch_agent,
@@ -2462,7 +2262,7 @@ pub fn run() {
                 for u in urls {
                     let s = u.to_string();
                     log::info!("run_event_opened url={}", s);
-                    handle_deep_link_url(&_app_handle, &st, &s);
+                    crate::auth::handle_deep_link_url(&_app_handle, &st, &s);
                 }
             }
         }
