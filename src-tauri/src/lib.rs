@@ -21,21 +21,13 @@ mod system;
 mod updates;
 mod upload;
 use crate::auth::AuthStatus;
-// rusqlite imports kept for legacy compat in this file
 use crate::system::launch_agent::install_launch_agent;
 use sentry::{self, Level};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tauri::{Emitter, Manager};
-// removed autostart plugin; using manual LaunchAgent management
-// use tauri_plugin_shell::ShellExt; // not used in this file
-// use tauri_plugin_log::LogTarget; // use defaults
 use tokio::sync::RwLock;
-// use uuid::Uuid; // only used in removed helpers
-// use system::launch_agent via full path where needed
-
-// Re-introduced minimal osquery commands used by the UI.
 
 /// Shared application state for background operations
 pub struct AppState {
@@ -70,8 +62,6 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
     });
 }
 
-// deep link handling moved to auth module
-
 #[tauri::command]
 async fn set_api_base_url(
     state: tauri::State<'_, Arc<AppState>>,
@@ -81,9 +71,7 @@ async fn set_api_base_url(
     Ok(())
 }
 
-// save_auth_token moved to auth module
-// clear_auth_token moved to auth module
-// get_auth_status moved to auth module
+// Auth-related commands are implemented in the `auth` module
 
 #[tauri::command]
 async fn get_app_version() -> Result<String, String> {
@@ -91,14 +79,6 @@ async fn get_app_version() -> Result<String, String> {
     log::info!("📱 Frontend requested app version: {}", version);
     Ok(version)
 }
-
-// moved to collection::execute_query
-
-/// Executes a batch of SQL statements against osquery and returns results keyed by logical id
-/// The vector contains pairs of (logical_id, sql_to_execute).
-// moved to collection::execute_sql_batch
-
-// invalidate_auth moved to auth module
 
 fn wake_gap_seconds() -> u64 {
     background::config::wake_gap_seconds()
@@ -110,8 +90,6 @@ fn focus_debounce_seconds() -> u64 {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(60)
 }
-
-// retention interval resolved where needed in background::retention
 
 fn collection_interval_seconds() -> u64 {
     background::config::collection_interval_seconds()
@@ -154,267 +132,6 @@ pub(crate) async fn emit_error_and_focus(
     );
 }
 
-// moved to upload::types::UploadRow
-
-// moved to upload::types::JsonApiResource
-
-// moved to upload::types::JsonApiPayload
-
-// Remove unused helper: get_db_path_cached
-/* async fn get_db_path_cached(
-    app: &tauri::AppHandle,
-    _state: &Arc<AppState>,
-) -> Result<PathBuf, String> {
-    Ok(database::resolve_path(app)?)
-} */
-
-// moved to upload::store::get_last_upload_at
-
-// moved to upload::store::select_pending_rows
-
-// moved to upload::store::build_in_clause_params
-
-// moved to upload::store::mark_rows_handled_and_advance_watermark
-
-/* async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
-    crate::collection::get_device_serial_number_internal(app).await
-} */
-
-// moved to upload::run_upload_cycle
-
-// moved to upload::spawn_upload_loop
-
-/* async fn run_cycle(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    client: &reqwest::Client,
-) -> Result<(), String> {
-    let token = match state.auth_token.read().await.clone() {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-
-    let base = state.api_base_url.read().await.clone();
-
-    // Mark an attempt start and notify UI listeners
-    *state.last_attempt_at.write().await = Some(std::time::Instant::now());
-    let _ = app.emit("collection:attempt", ());
-
-    // 1) GET /klaayguard/config
-    add_breadcrumb("collection", "config_fetch_start", Level::Info);
-    sentry::capture_message("collection_config_fetch_start", Level::Info);
-    let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
-    let retry_delays = [60u64, 120u64];
-    let mut attempt = 0usize;
-    let cfg_resp = loop {
-        match client
-            .get(format!("{}/klaayguard/config", base))
-            .bearer_auth(&token)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                add_breadcrumb(
-                    "collection",
-                    &format!("config_status:{}", resp.status().as_u16()),
-                    Level::Info,
-                );
-                if !resp.status().is_success()
-                    && is_transient_status(resp.status().as_u16())
-                    && attempt < retry_delays.len()
-                {
-                    let delay = retry_delays[attempt];
-                    add_breadcrumb(
-                        "collection",
-                        &format!("transient_retry_in_s:{}", delay),
-                        Level::Warning,
-                    );
-                    sentry::capture_message("collection_transient_retry", Level::Warning);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    attempt += 1;
-                    continue;
-                }
-                break resp;
-            }
-            Err(e) => {
-                add_breadcrumb(
-                    "collection",
-                    &format!("config_network_error:{}", e),
-                    Level::Warning,
-                );
-                sentry::capture_message("collection_config_network_error", Level::Warning);
-                if attempt < retry_delays.len() {
-                    let delay = retry_delays[attempt];
-                    add_breadcrumb(
-                        "collection",
-                        &format!("retry_in_s:{}", delay),
-                        Level::Warning,
-                    );
-                    sentry::capture_message("collection_retry", Level::Warning);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    attempt += 1;
-                    continue;
-                } else {
-                    return Err(e.to_string());
-                }
-            }
-        }
-    };
-
-    if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED
-        || cfg_resp.status() == reqwest::StatusCode::FORBIDDEN
-    {
-        auth::invalidate_auth(app, state).await?;
-        let _ = app.emit(
-            "collection:error",
-            json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
-        );
-        sentry::capture_message("collection_auth_invalidated_on_config", Level::Warning);
-        return Ok(());
-    }
-    if !cfg_resp.status().is_success() {
-        emit_error_and_focus(
-            app,
-            state,
-            "collection:error",
-            json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
-        )
-        .await;
-        sentry::capture_message("collection_error_config_non_transient", Level::Warning);
-        return Ok(());
-    }
-
-    let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
-    // Build query list. If item has an explicit `sql`, use it; otherwise default to SELECT * FROM <id>.
-    let queries: Vec<(String, String)> = cfg_json
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let id = item.get("id").and_then(|v| v.as_str())?;
-                    let sql = item
-                        .get("sql")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("SELECT * FROM {}", id));
-                    Some((id.to_string(), sql))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if queries.is_empty() {
-        emit_error_and_focus(
-            app,
-            state,
-            "collection:error",
-            json!({ "stage": "config", "reason": "no_tables" }),
-        )
-        .await;
-        return Ok(());
-    }
-
-    // 2) osquery
-    add_breadcrumb("collection", "osquery_start", Level::Info);
-    sentry::capture_message("collection_osquery_start", Level::Info);
-    let results = crate::collection::execute_sql_batch(app.clone(), queries).await?;
-
-    // 3) Persist results to SQLite (Loop A)
-    let run_id = Uuid::new_v4().to_string();
-    let inserted = persist_results_to_sqlite(app, state, &run_id, &results).await?;
-    *state.last_run_at.write().await = Some(std::time::Instant::now());
-    let _ = app.emit(
-        "collection:success",
-        json!({ "inserted_rows": inserted, "run_id": run_id }),
-    );
-    log::info!(
-        "collection_success inserted_rows={} run_id={}",
-        inserted,
-        run_id
-    );
-    add_breadcrumb(
-        "collection",
-        &format!("persisted_rows:{} run_id:{}", inserted, run_id),
-        Level::Info,
-    );
-    sentry::capture_message("collection_persisted", Level::Info);
-
-    // Trigger uploader immediately after successful collection to restart retry loop (B)
-    if let Err(e) = crate::upload::run_upload_cycle(app, state, client).await {
-        log::error!("upload cycle (post-collection) error: {}", e);
-        emit_error_and_focus(
-            app,
-            state,
-            "upload:error",
-            json!({ "stage": "internal", "error": e, "post_collection": true }),
-        )
-        .await;
-    }
-
-    Ok(())
-} */
-
-/* // deprecated by collection::spawn_collection_loop
-fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        let client = reqwest::Client::builder()
-            .user_agent("klaayguard/0.1")
-            .build()
-            .expect("reqwest client");
-
-        // wait for token once
-        loop {
-            if state.auth_token.read().await.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-
-        // run immediately
-        if let Err(e) = run_cycle(&app, &state, &client).await {
-            log::error!("initial cycle error: {}", e);
-            emit_error_and_focus(
-                &app,
-                &state,
-                "collection:error",
-                json!({ "stage": "internal", "error": e }),
-            )
-            .await;
-        }
-
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(collection_interval_seconds()));
-        loop {
-            interval.tick().await;
-            // detect potential wake by long elapsed since last attempt
-            let woke = {
-                let last = *state.last_attempt_at.read().await;
-                if let Some(prev) = last {
-                    prev.elapsed() >= std::time::Duration::from_secs(wake_gap_seconds())
-                } else {
-                    false
-                }
-            };
-            if woke {
-                let _ = app.emit("system:wake_detected", json!({ "loop": "collection" }));
-                add_breadcrumb("system", "wake_detected_collection", Level::Info);
-                sentry::capture_message("wake_detected_collection", Level::Info);
-            }
-            if let Err(e) = run_cycle(&app, &state, &client).await {
-                log::error!("cycle error: {}", e);
-                emit_error_and_focus(
-                    &app,
-                    &state,
-                    "collection:error",
-                    json!({ "stage": "internal", "error": e }),
-                )
-                .await;
-            }
-        }
-    });
-} */
-
 pub(crate) fn get_sqlite_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     database::resolve_path(app)
 }
@@ -422,30 +139,6 @@ pub(crate) fn get_sqlite_path(app: &tauri::AppHandle) -> Result<PathBuf, String>
 fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
     database::initialize(app).map(|_| ())
 }
-
-// helper moved to background::retention
-
-/* async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    database::prune_time_based(
-        app,
-        state,
-        database::config::retention_days(),
-        database::config::prune_batch_rows(),
-    )
-    .await
-} */
-
-/* async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    database::prune_size_based(
-        app,
-        state,
-        database::config::max_db_mb(),
-        database::config::prune_batch_rows(),
-    )
-    .await
-} */
-
-// retention loop moved to crate::background::retention
 
 async fn persist_results_to_sqlite(
     app: &tauri::AppHandle,
@@ -455,13 +148,6 @@ async fn persist_results_to_sqlite(
 ) -> Result<usize, String> {
     database::persist_results(app, state, run_id, results).await
 }
-
-/// Installs a launch agent for automatic startup on macOS.
-///
-/// This function creates a launchd plist file in the user's LaunchAgents directory
-/// and loads it to ensure the app starts automatically on login. This is a mandatory
-/// security feature that cannot be disabled by users.
-// moved into system::launch_agent
 
 #[derive(Serialize)]
 struct ArchStatus {
@@ -588,9 +274,6 @@ async fn get_runtime_status(
     })
 }
 
-// release DTOs and API helper moved to updates module
-
-// moved to updates::check
 /* async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, String> {
     let current_version = env!("CARGO_PKG_VERSION");
     log::info!(
@@ -722,8 +405,6 @@ async fn get_runtime_status(
     Ok(None)
 } */
 
-// re-exported from updates module
-
 /* async fn download_and_install_update_internal(
     api_base: &str,
     asset_id: &str,
@@ -789,9 +470,7 @@ async fn get_runtime_status(
     Ok(())
 } */
 
-// re-exported from updates module
-
-// moved to updates::install
+//
 /// Main entry point for the KlaayGuard security monitoring application.
 ///
 /// This function initializes the Tauri application with security-focused configuration:
@@ -1018,8 +697,6 @@ pub fn run() {
             // Spawn background monitoring loop
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
-
-            // (duplicate initial keychain load removed)
 
             // Initialize SQLite (file-backed) path and schema
             if let Err(e) = init_sqlite(&app.handle()) {

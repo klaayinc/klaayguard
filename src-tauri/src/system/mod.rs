@@ -29,10 +29,6 @@ impl Callbacks {
     }
 }
 
-// Removed unused SystemIntegration wrapper; callers should use `tray` and `window` directly.
-
 pub mod launch_agent;
 pub mod tray;
 pub mod window;
-
-// keep commands in submodule; reference from crate path

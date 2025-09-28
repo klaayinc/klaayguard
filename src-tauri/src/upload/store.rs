@@ -3,8 +3,6 @@ use std::sync::Arc;
 use super::types::UploadRow;
 use crate::AppState;
 
-// Removed redundant wrapper; use crate::database::get_last_upload_at directly
-
 pub async fn select_pending_rows(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
