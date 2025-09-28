@@ -10,7 +10,7 @@ pub async fn download_dmg(
 ) -> Result<PathBuf, UpdateError> {
     let url = format!("{}/klaayguard/download/{}", api_base, asset_id);
     log::info!("🌐 Download URL: {}", url);
-    let bytes = client.get_bytes_blocking(&url)?;
+    let bytes = client.get_bytes(&url).await?;
     log::info!("📊 Downloaded {} bytes", bytes.len());
 
     let dmg_path = paths.downloads_dir()?.join("KlaayGuard-update.dmg");
@@ -19,5 +19,3 @@ pub async fn download_dmg(
     log::info!("✅ Update downloaded successfully to: {:?}", dmg_path);
     Ok(dmg_path)
 }
-
-

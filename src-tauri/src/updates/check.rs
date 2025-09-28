@@ -29,7 +29,7 @@ pub async fn check(
     let url = format!("{}/klaayguard/updates/latest", api_base);
     log::info!("🌐 Checking for updates from API: {}", url);
 
-    let release: ReleaseInfo = client.get_json_blocking(&url)?;
+    let release: ReleaseInfo = client.get_json(&url).await?;
     log::info!(
         "📦 Found release: {} with {} assets",
         release.version,
@@ -83,12 +83,13 @@ mod tests {
     struct FakeClient {
         json: String,
     }
+    #[async_trait::async_trait]
     impl UpdateHttpClient for FakeClient {
-        fn get_json_blocking<T: DeserializeOwned>(&self, _url: &str) -> Result<T, UpdateError> {
+        async fn get_json<T: DeserializeOwned + Send>(&self, _url: &str) -> Result<T, UpdateError> {
             serde_json::from_str(&self.json)
                 .map_err(|e| UpdateError::InvalidResponse(e.to_string()))
         }
-        fn get_bytes_blocking(&self, _url: &str) -> Result<Vec<u8>, UpdateError> {
+        async fn get_bytes(&self, _url: &str) -> Result<Vec<u8>, UpdateError> {
             Ok(vec![])
         }
     }

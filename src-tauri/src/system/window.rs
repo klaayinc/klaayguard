@@ -28,17 +28,3 @@ pub fn focus_main(app: &tauri::AppHandle) -> Result<(), SystemError> {
         Err(SystemError::InvalidState("main window not found"))
     }
 }
-
-pub fn toggle_main(app: &tauri::AppHandle) -> Result<(), SystemError> {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            window.hide()?;
-        } else {
-            window.show()?;
-            let _ = window.set_focus();
-        }
-        Ok(())
-    } else {
-        Err(SystemError::InvalidState("main window not found"))
-    }
-}

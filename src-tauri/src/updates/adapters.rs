@@ -2,9 +2,10 @@ use crate::updates::types::UpdateError;
 use serde::de::DeserializeOwned;
 use std::path::PathBuf;
 
+#[async_trait::async_trait]
 pub trait UpdateHttpClient {
-    fn get_json_blocking<T: DeserializeOwned>(&self, url: &str) -> Result<T, UpdateError>;
-    fn get_bytes_blocking(&self, url: &str) -> Result<Vec<u8>, UpdateError>;
+    async fn get_json<T: DeserializeOwned + Send>(&self, url: &str) -> Result<T, UpdateError>;
+    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, UpdateError>;
 }
 
 pub struct ReqwestHttpClient {
@@ -21,86 +22,34 @@ impl ReqwestHttpClient {
     }
 }
 
+#[async_trait::async_trait]
 impl UpdateHttpClient for ReqwestHttpClient {
-    fn get_json_blocking<T: DeserializeOwned>(&self, url: &str) -> Result<T, UpdateError> {
-        let rt = tokio::runtime::Handle::try_current()
-            .ok()
-            .map(|h| h.clone());
-        if let Some(handle) = rt {
-            let fut = async {
-                let resp = self.client.get(url).send().await?;
-                if !resp.status().is_success() {
-                    return Err(UpdateError::Http(format!(
-                        "status {} from {}",
-                        resp.status(),
-                        url
-                    )));
-                }
-                match resp.json::<T>().await {
-                    Ok(v) => Ok::<T, UpdateError>(v),
-                    Err(e) => Err(UpdateError::InvalidResponse(e.to_string())),
-                }
-            };
-            handle.block_on(fut)
-        } else {
-            // Create a local runtime if we're not on Tokio
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| UpdateError::Http(e.to_string()))?;
-            rt.block_on(async {
-                let resp = self.client.get(url).send().await?;
-                if !resp.status().is_success() {
-                    return Err(UpdateError::Http(format!(
-                        "status {} from {}",
-                        resp.status(),
-                        url
-                    )));
-                }
-                match resp.json::<T>().await {
-                    Ok(v) => Ok::<T, UpdateError>(v),
-                    Err(e) => Err(UpdateError::InvalidResponse(e.to_string())),
-                }
-            })
+    async fn get_json<T: DeserializeOwned + Send>(&self, url: &str) -> Result<T, UpdateError> {
+        let resp = self.client.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(UpdateError::Http(format!(
+                "status {} from {}",
+                resp.status(),
+                url
+            )));
+        }
+        match resp.json::<T>().await {
+            Ok(v) => Ok(v),
+            Err(e) => Err(UpdateError::InvalidResponse(e.to_string())),
         }
     }
 
-    fn get_bytes_blocking(&self, url: &str) -> Result<Vec<u8>, UpdateError> {
-        let rt = tokio::runtime::Handle::try_current()
-            .ok()
-            .map(|h| h.clone());
-        if let Some(handle) = rt {
-            let fut = async {
-                let resp = self.client.get(url).send().await?;
-                if !resp.status().is_success() {
-                    return Err(UpdateError::Http(format!(
-                        "status {} from {}",
-                        resp.status(),
-                        url
-                    )));
-                }
-                let b = resp.bytes().await?;
-                Ok::<Vec<u8>, UpdateError>(b.to_vec())
-            };
-            handle.block_on(fut)
-        } else {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| UpdateError::Http(e.to_string()))?;
-            rt.block_on(async {
-                let resp = self.client.get(url).send().await?;
-                if !resp.status().is_success() {
-                    return Err(UpdateError::Http(format!(
-                        "status {} from {}",
-                        resp.status(),
-                        url
-                    )));
-                }
-                let b = resp.bytes().await?;
-                Ok::<Vec<u8>, UpdateError>(b.to_vec())
-            })
+    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, UpdateError> {
+        let resp = self.client.get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(UpdateError::Http(format!(
+                "status {} from {}",
+                resp.status(),
+                url
+            )));
         }
+        let b = resp.bytes().await?;
+        Ok(b.to_vec())
     }
 }
 

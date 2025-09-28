@@ -1000,18 +1000,14 @@ pub fn run() {
                                 st.auth_token.read().await.is_none()
                             })
                         };
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            if needs_login {
-                                let _ = window.set_focus();
-                            }
+                        let _ = crate::system::window::show_main(app);
+                        if needs_login {
+                            let _ = crate::system::window::focus_main(app);
                         }
                     },
                     |app| {
                         log::info!("Hide window requested from system tray");
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.hide();
-                        }
+                        let _ = crate::system::window::hide_main(app);
                     },
                 ),
             )
