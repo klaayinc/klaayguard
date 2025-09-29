@@ -720,6 +720,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             crate::collection::execute_query,
             crate::collection::get_device_serial_number,
+            crate::collection::get_device_info,
             crate::auth::save_auth_token,
             crate::auth::clear_auth_token,
             set_api_base_url,

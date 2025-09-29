@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
+import { invoke } from "@tauri-apps/api/core";
 import klaayLogo from "../../icons/KLAAY-LOGO-RGB_ICON.png";
 
 const EARTHENWARE_URL = import.meta.env.VITE_EARTHENWARE_URL as string;
@@ -18,6 +19,32 @@ export default function EarthenwareLogin() {
       navigate("/welcome");
     }
   }, [isAuthenticated, navigate]);
+
+  useEffect(() => {
+    // Handle device info requests from earthenware iframe
+    const handleMessage = async (event: MessageEvent) => {
+      if (event.data?.type === 'REQUEST_DEVICE_INFO') {
+        try {
+          const deviceInfo = await invoke('get_device_info');
+          // Send device info back to the iframe
+          event.source?.postMessage({
+            type: 'DEVICE_INFO_RESPONSE',
+            deviceInfo: deviceInfo
+          }, '*');
+        } catch (error) {
+          console.error('Failed to get device info:', error);
+          // Send empty response on error
+          event.source?.postMessage({
+            type: 'DEVICE_INFO_RESPONSE',
+            deviceInfo: null
+          }, '*');
+        }
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
 
   // If authenticated, don't render login
   if (isAuthenticated) {

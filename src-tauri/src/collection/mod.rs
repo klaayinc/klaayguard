@@ -8,7 +8,9 @@ use tauri::Emitter;
 use crate::{add_breadcrumb, auth, emit_error_and_focus, AppState};
 use tauri_plugin_shell::ShellExt;
 
-fn collection_interval_seconds() -> u64 { crate::background::config::collection_interval_seconds() }
+fn collection_interval_seconds() -> u64 {
+    crate::background::config::collection_interval_seconds()
+}
 
 #[tauri::command]
 pub async fn get_next_run_in_seconds(
@@ -155,6 +157,133 @@ pub async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result
         })
         .unwrap_or("UNKNOWN");
     Ok(serial.to_string())
+}
+
+#[tauri::command]
+pub async fn get_device_info(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let tables = vec![
+        "hardware_info".to_string(),
+        "system_info".to_string(),
+        "os_version".to_string(),
+    ];
+
+    let query_result = execute_query(app, tables).await?;
+
+    let mut device_info = serde_json::Map::new();
+
+    // Extract hardware information
+    if let Some(hardware_info) = query_result
+        .get("hardware_info")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+    {
+        if let Some(serial) = hardware_info
+            .get("serial_number")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            device_info.insert(
+                "serial_number".to_string(),
+                serde_json::Value::String(serial.to_string()),
+            );
+        } else if let Some(serial) = hardware_info
+            .get("hardware_serial")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            device_info.insert(
+                "serial_number".to_string(),
+                serde_json::Value::String(serial.to_string()),
+            );
+        } else if let Some(uuid) = hardware_info
+            .get("hardware_uuid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            device_info.insert(
+                "serial_number".to_string(),
+                serde_json::Value::String(uuid.to_string()),
+            );
+        }
+
+        if let Some(model) = hardware_info.get("model").and_then(|v| v.as_str()) {
+            device_info.insert(
+                "model".to_string(),
+                serde_json::Value::String(model.to_string()),
+            );
+        }
+        if let Some(vendor) = hardware_info.get("vendor").and_then(|v| v.as_str()) {
+            device_info.insert(
+                "vendor".to_string(),
+                serde_json::Value::String(vendor.to_string()),
+            );
+        }
+    }
+
+    // Extract system information
+    if let Some(system_info) = query_result
+        .get("system_info")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+    {
+        if let Some(hostname) = system_info.get("hostname").and_then(|v| v.as_str()) {
+            device_info.insert(
+                "hostname".to_string(),
+                serde_json::Value::String(hostname.to_string()),
+            );
+        }
+        if let Some(computer_name) = system_info.get("computer_name").and_then(|v| v.as_str()) {
+            device_info.insert(
+                "computer_name".to_string(),
+                serde_json::Value::String(computer_name.to_string()),
+            );
+        }
+    }
+
+    // Extract OS version information
+    if let Some(os_version) = query_result
+        .get("os_version")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+    {
+        if let Some(name) = os_version.get("name").and_then(|v| v.as_str()) {
+            device_info.insert(
+                "os_name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
+        }
+        if let Some(version) = os_version.get("version").and_then(|v| v.as_str()) {
+            device_info.insert(
+                "os_version".to_string(),
+                serde_json::Value::String(version.to_string()),
+            );
+        }
+        if let Some(build) = os_version.get("build").and_then(|v| v.as_str()) {
+            device_info.insert(
+                "os_build".to_string(),
+                serde_json::Value::String(build.to_string()),
+            );
+        }
+    }
+
+    // Add runtime information
+    device_info.insert(
+        "arch".to_string(),
+        serde_json::Value::String(std::env::consts::ARCH.to_string()),
+    );
+    device_info.insert(
+        "os".to_string(),
+        serde_json::Value::String(std::env::consts::OS.to_string()),
+    );
+
+    if let Ok(app_version) = std::env::var("TAURI_APP_VERSION") {
+        device_info.insert(
+            "app_version".to_string(),
+            serde_json::Value::String(app_version),
+        );
+    }
+
+    Ok(serde_json::Value::Object(device_info))
 }
 
 async fn fetch_config(
