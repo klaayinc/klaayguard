@@ -312,30 +312,47 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
             }
             
             if found_path.is_none() {
-                // Fallback to resource dir
+                // Fallback to resource dir (try both with and without icons/ subdirectory)
                 if let Ok(resource_dir) = app.path().resource_dir() {
-                    let full_path = resource_dir.join(icon_name);
-                    if full_path.exists() {
-                        log::info!("✅ Found resource icon at: {}", full_path.display());
-                        found_path = Some(full_path);
-        } else {
-                        log::warn!("❌ Resource icon not found: {}", full_path.display());
+                    // Try icons/ subdirectory first
+                    let icon_subdir_path = resource_dir.join("icons").join(icon_name);
+                    if icon_subdir_path.exists() {
+                        log::info!("✅ Found resource icon at: {}", icon_subdir_path.display());
+                        found_path = Some(icon_subdir_path);
+                    } else {
+                        // Try root resource dir
+                        let full_path = resource_dir.join(icon_name);
+                        if full_path.exists() {
+                            log::info!("✅ Found resource icon at: {}", full_path.display());
+                            found_path = Some(full_path);
+                        } else {
+                            log::warn!("❌ Resource icon not found: {}", full_path.display());
+                        }
                     }
                 }
             }
             
             found_path
         } else {
-            // Production: use resource dir
+            // Production: use resource dir (try both with and without icons/ subdirectory)
             app.path().resource_dir()
                 .ok()
                 .and_then(|p| {
-                    let full_path = p.join(icon_name);
-                    if full_path.exists() {
-                        Some(full_path)
+                    // Try icons/ subdirectory first
+                    let icon_subdir_path = p.join("icons").join(icon_name);
+                    if icon_subdir_path.exists() {
+                        log::info!("✅ Found resource icon at: {}", icon_subdir_path.display());
+                        Some(icon_subdir_path)
                     } else {
-                        log::warn!("Icon file not found: {}", full_path.display());
-                        None
+                        // Try root resource dir
+                        let full_path = p.join(icon_name);
+                        if full_path.exists() {
+                            log::info!("✅ Found resource icon at: {}", full_path.display());
+                            Some(full_path)
+                        } else {
+                            log::warn!("Icon file not found: {}", full_path.display());
+                            None
+                        }
                     }
                 })
         };
