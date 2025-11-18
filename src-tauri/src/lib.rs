@@ -1043,8 +1043,11 @@ pub fn run() {
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
                     log::info!("✅ Authenticated - token loaded from keychain");
                     
-                    // Update tray menu to show logout option
+                    // Update tray menu to show status
                     update_tray_menu(&app_handle_for_init, &state_for_init).await;
+                    
+                    // Update tray icon based on last collection status (or default if none)
+                    update_tray_status(&app_handle_for_init, &state_for_init, true).await;
                 } else {
                     *state_for_init.auth_token.write().await = None;
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
