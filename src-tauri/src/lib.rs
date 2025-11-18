@@ -235,11 +235,33 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     }
     log::warn!("Authentication invalidated");
     
-    // Show notification instead of focusing window
+    // Update tray menu to show login option
+    update_tray_menu(app, state).await;
+    
+    // Update tray icon to red (unauthenticated)
+    set_tray_icon_and_tooltip(
+        app,
+        "icon-error.png",
+        "🔴 Not authenticated - Click Login to start monitoring"
+    );
+    
+    // Open Earthenware for login
+    let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
+        .unwrap_or_else(|_| "https://app.klaay.com".to_string());
+    let callback_url = "klaayguard://auth-callback";
+    let full_url = format!("{}?redirect_to={}", earthenware_url, callback_url);
+    log::info!("🌐 Opening browser for re-authentication: {}", full_url);
+    if let Err(e) = open::that(&full_url) {
+        log::error!("❌ Failed to open browser: {}", e);
+    } else {
+        log::info!("✅ Browser opened successfully");
+    }
+    
+    // Show notification
     let _ = app.notification()
         .builder()
-        .title("KlaayGuard")
-        .body("Authentication required. Please sign in.")
+        .title("KlaayGuard - Authentication Required")
+        .body("Your session has expired. Please sign in again.")
         .show();
     
     let _ = app.emit("auth:invalidated", ());
