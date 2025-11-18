@@ -81,6 +81,9 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
         sentry::capture_message("deep_link_token_saved", Level::Info);
         
+        // Update tray menu to show logout option
+        update_tray_menu(app, state).await;
+        
         // Show success notification
         let _ = app.notification()
             .builder()
@@ -272,6 +275,57 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
         })
         .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
     Ok(serial.to_string())
+}
+
+/// Build tray menu dynamically based on authentication status
+fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    
+    let status_text = if is_authenticated {
+        "✅ Authenticated"
+    } else {
+        "🔴 Not Authenticated"
+    };
+    
+    // Status indicator (disabled, non-clickable)
+    let status_item = MenuItem::with_id(app, "status", status_text, false, None::<&str>)?;
+    
+    // Separator
+    let separator = PredefinedMenuItem::separator(app)?;
+    
+    // Build menu based on authentication status
+    if !is_authenticated {
+        let login_item = MenuItem::with_id(app, "login", "Login", true, None::<&str>)?;
+        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
+            &status_item,
+            &separator,
+            &login_item,
+        ];
+        Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    } else {
+        let logout_item = MenuItem::with_id(app, "logout", "Logout", true, None::<&str>)?;
+        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
+            &status_item,
+            &separator,
+            &logout_item,
+        ];
+        Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    }
+}
+
+/// Update tray menu based on current authentication status
+async fn update_tray_menu(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    let is_authenticated = state.auth_token.read().await.is_some();
+    
+    if let Ok(menu) = build_tray_menu(app, is_authenticated) {
+        if let Some(tray) = app.tray_by_id("main") {
+            if let Err(e) = tray.set_menu(Some(menu)) {
+                log::error!("Failed to update tray menu: {}", e);
+            } else {
+                log::info!("✓ Tray menu updated (authenticated: {})", is_authenticated);
+            }
+        }
+    }
 }
 
 /// Helper function to set tray icon and tooltip
@@ -889,20 +943,16 @@ pub fn run() {
 
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             
-            // Create tray menu FIRST (before spawning async tasks that need it)
-            let login_i = tauri::menu::MenuItem::with_id(app, "login", "Login", true, None::<&str>)
-                .map_err(|e| {
-                    log::error!("Failed to create 'Login' menu item: {}", e);
-                    e
-                })?;
-            let menu = tauri::menu::Menu::with_items(app, &[&login_i]).map_err(|e| {
+            // Create initial tray menu (unauthenticated state by default)
+            let menu = build_tray_menu(&app.handle(), false).map_err(|e| {
                 log::error!("Failed to create system tray menu: {}", e);
-                e
+                format!("{}", e)
             })?;
 
             // Create tray icon SECOND (before spawning async tasks that update it)
+            let state_for_menu = state_for_loop.clone();
             tauri::tray::TrayIconBuilder::with_id("main")
-                .on_menu_event(|_app, event| {
+                .on_menu_event(move |app, event| {
                     log::info!("🖱️  Menu event triggered: id={}", event.id.as_ref());
                     match event.id.as_ref() {
                         "login" => {
@@ -918,6 +968,44 @@ pub fn run() {
                                 log::info!("✅ Browser opened successfully");
                             }
                         }
+                        "logout" => {
+                            log::info!("🚪 Logout requested from system tray");
+                            let app_handle = app.clone();
+                            let state = state_for_menu.clone();
+                            tauri::async_runtime::spawn(async move {
+                                // Clear token from state
+                                *state.auth_token.write().await = None;
+                                
+                                // Clear token from keychain
+                                if let Err(e) = keychain::delete_token() {
+                                    log::error!("Failed to delete token from keychain: {}", e);
+                                } else {
+                                    log::info!("✅ Token deleted from keychain");
+                                }
+                                
+                                // Update tray menu to show login option
+                                update_tray_menu(&app_handle, &state).await;
+                                
+                                // Update tray icon to red (unauthenticated)
+                                set_tray_icon_and_tooltip(
+                                    &app_handle,
+                                    "icon-error.png",
+                                    "🔴 Not authenticated - Click Login to start monitoring"
+                                );
+                                
+                                // Show notification
+                                let _ = app_handle.notification()
+                                    .builder()
+                                    .title("KlaayGuard - Logged Out")
+                                    .body("You have been logged out. Click Login to authenticate.")
+                                    .show();
+                                
+                                log::info!("✅ Logout complete");
+                            });
+                        }
+                        "status" => {
+                            // Status item is non-clickable, ignore
+                        }
                         _ => {
                             log::warn!("⚠️  Unknown menu event: {}", event.id.as_ref());
                         }
@@ -926,7 +1014,7 @@ pub fn run() {
                 .icon(app.default_window_icon().unwrap().clone())
                 .icon_as_template(false) // Disable template mode to show colored status dots
                 .menu(&menu)
-                .show_menu_on_left_click(false)
+                .show_menu_on_left_click(true) // Show menu on left-click
                 .tooltip("KlaayGuard")
                 .build(app)
                 .map_err(|e| {
@@ -946,10 +1034,16 @@ pub fn run() {
                     *state_for_init.auth_token.write().await = Some(tok);
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
                     log::info!("✅ Authenticated - token loaded from keychain");
+                    
+                    // Update tray menu to show logout option
+                    update_tray_menu(&app_handle_for_init, &state_for_init).await;
                 } else {
                     *state_for_init.auth_token.write().await = None;
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
                     log::warn!("⚠️  Not authenticated - no token found in keychain");
+                    
+                    // Update tray menu to show login option
+                    update_tray_menu(&app_handle_for_init, &state_for_init).await;
                     
                     // Show notification prompting login
                     log::info!("📢 Showing login notification...");
