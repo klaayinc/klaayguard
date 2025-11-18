@@ -170,7 +170,7 @@ async fn get_api_base_url_cmd(state: tauri::State<'_, Arc<AppState>>) -> Result<
 }
 
 fn get_api_base_url() -> String {
-    std::env::var("APP_DEFAULT_API_BASE_URL").unwrap_or_else(|_| "https://api.klaay.com".to_string())
+    env!("APP_DEFAULT_API_BASE_URL").to_string()
 }
 
 #[tauri::command]
