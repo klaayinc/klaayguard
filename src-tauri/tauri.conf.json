@@ -15,7 +15,10 @@
     "targets": "all",
     "resources": [
       "vendor/licenses/*",
-      "resources/*"
+      "resources/*",
+      "icons/icon-success.png",
+      "icons/icon-error.png",
+      "icons/icon-default.png"
     ],
     "externalBin": [
       "vendor/osqueryi"

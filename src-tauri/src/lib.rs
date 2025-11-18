@@ -254,20 +254,61 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
 }
 
 async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
-    let (tooltip, notification_msg) = if success {
+    let (tooltip, notification_msg, icon_name) = if success {
         let timestamp = state.last_send_at.read().await.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
         let tooltip = if let Some(ts) = timestamp {
             format!("✓ Last send: {} (Success)", ts)
         } else {
             "✓ Last send: Success".to_string()
         };
-        (tooltip, None)
+        (tooltip, None, "icon-success.png")
     } else {
-        ("✗ Last send: Failed".to_string(), Some("Data send failed. Will retry in 1 hour."))
+        ("✗ Last send: Failed".to_string(), Some("Data send failed. Will retry in 1 hour."), "icon-error.png")
     };
     
     if let Some(tray) = app.tray_by_id("main") {
+        // Update tooltip
         let _ = tray.set_tooltip(Some(tooltip));
+        
+        // Update icon with status indicator
+        let icon_path = app.path().resource_dir()
+            .ok()
+            .and_then(|p| {
+                let full_path = p.join(icon_name);
+                if full_path.exists() {
+                    Some(full_path)
+                } else {
+                    log::warn!("Icon file not found: {}", full_path.display());
+                    None
+                }
+            });
+        
+        if let Some(path) = icon_path {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    // Load as PNG image - Tauri will handle the decoding
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let (width, height) = rgba.dimensions();
+                            let icon = tauri::image::Image::new_owned(rgba.into_raw(), width, height);
+                            
+                            if let Err(e) = tray.set_icon(Some(icon)) {
+                                log::error!("Failed to update tray icon: {}", e);
+                            } else {
+                                log::debug!("Tray icon updated to: {}", icon_name);
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to decode icon image {}: {}", icon_name, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to read icon file {}: {}", path.display(), e);
+                }
+            }
+        }
     }
     
     // Show notification on failure
@@ -758,8 +799,8 @@ pub fn run() {
                 e
             })?;
 
-            // Create tray icon
-            tauri::tray::TrayIconBuilder::new()
+            // Create tray icon with ID for status updates
+            tauri::tray::TrayIconBuilder::with_id("main")
                 .on_menu_event(|_app, event| match event.id.as_ref() {
                     "login" => {
                         log::info!("Login requested from system tray");
@@ -774,7 +815,7 @@ pub fn run() {
                     _ => {}
                 })
                 .icon(app.default_window_icon().unwrap().clone())
-                .icon_as_template(true)
+                .icon_as_template(false) // Disable template mode to show colored status dots
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .tooltip("KlaayGuard")
