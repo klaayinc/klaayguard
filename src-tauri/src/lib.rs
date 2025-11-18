@@ -42,7 +42,7 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
 }
 
 /// Handle deep link authentication callback (klaayguard://auth-callback?token=JWT)
-fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
+async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
     if !url.starts_with("klaayguard://") {
         log::info!("deep_link_ignored_non_scheme url={}", url);
         return;
@@ -74,10 +74,8 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
         }
         
         log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
-        tauri::async_runtime::block_on(async {
-            *state.auth_token.write().await = Some(tok.clone());
-            *state.keychain_cleared_this_session.write().await = false;
-        });
+        *state.auth_token.write().await = Some(tok.clone());
+        *state.keychain_cleared_this_session.write().await = false;
         let _ = keychain::save_token(&tok);
         log::info!("deep_link_token_saved_to_keychain");
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
@@ -89,13 +87,13 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
 }
 
 /// Scan process args for deep link
-fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>) {
+async fn try_handle_deep_link_from_args_async(app: &tauri::AppHandle, state: &Arc<AppState>) {
     let args: Vec<String> = std::env::args().collect();
     log::info!("process_args count={} sample_arg1={}", args.len(), args.get(1).cloned().unwrap_or_default());
     for a in args {
         if a.starts_with("klaayguard://") {
             log::info!("deep_link_found_in_process_args");
-            handle_deep_link_url(app, state, &a);
+            handle_deep_link_url_async(app, state, &a).await;
             break;
         }
     }
@@ -401,11 +399,9 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
     Ok(serial.to_string())
 }
 
-fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
+async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
     let (tooltip, notification_msg) = if success {
-        let timestamp = tauri::async_runtime::block_on(async {
-            state.last_send_at.read().await.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-        });
+        let timestamp = state.last_send_at.read().await.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
         let tooltip = if let Some(ts) = timestamp {
             format!("✓ Last send: {} (Success)", ts)
         } else {
@@ -429,10 +425,8 @@ fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bo
             .show();
     }
     
-    tauri::async_runtime::block_on(async {
-        *state.last_send_status.write().await = Some(success);
-        *state.last_send_at.write().await = Some(chrono::Utc::now());
-    });
+    *state.last_send_status.write().await = Some(success);
+    *state.last_send_at.write().await = Some(chrono::Utc::now());
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,7 +481,7 @@ async fn run_cycle(
     }
     if !cfg_resp.status().is_success() {
         sentry::capture_message("collection_error_config_non_success", Level::Warning);
-        update_tray_status(app, state, false);
+        update_tray_status(app, state, false).await;
         return Ok(());
     }
 
@@ -560,7 +554,7 @@ async fn run_cycle(
         Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED => {
             log::info!("Data send successful");
             add_breadcrumb("collection", "post_success", Level::Info);
-            update_tray_status(app, state, true);
+            update_tray_status(app, state, true).await;
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::FORBIDDEN => {
             add_breadcrumb("collection", "auth_invalidated_on_post", Level::Warning);
@@ -569,12 +563,12 @@ async fn run_cycle(
         Ok(resp) => {
             log::error!("Data send failed: status {}", resp.status().as_u16());
             add_breadcrumb("collection", &format!("post_failed:{}", resp.status().as_u16()), Level::Error);
-            update_tray_status(app, state, false);
+            update_tray_status(app, state, false).await;
         }
         Err(e) => {
             log::error!("Data send error: {}", e);
             add_breadcrumb("collection", &format!("post_error:{}", e), Level::Error);
-            update_tray_status(app, state, false);
+            update_tray_status(app, state, false).await;
         }
     }
 
@@ -938,11 +932,15 @@ pub fn run() {
         .plugin(tauri_plugin_log::Builder::new().level(log::LevelFilter::Info).build())
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let st = app.state::<Arc<AppState>>().inner().clone();
+            let app_handle = app.clone();
             log::info!("single_instance_args count={} sample_arg0={}", args.len(), args.get(0).cloned().unwrap_or_default());
             for a in args {
                 if a.starts_with("klaayguard://") {
                     log::info!("single_instance_deep_link_received");
-                    handle_deep_link_url(&app, &st, &a);
+                    let a_owned = a.clone();
+                    tauri::async_runtime::spawn(async move {
+                        handle_deep_link_url_async(&app_handle, &st, &a_owned).await;
+                    });
                     break;
                 }
             }
@@ -990,19 +988,21 @@ pub fn run() {
             });
 
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
+            let app_handle_for_init = app.handle().clone();
+            let state_for_init = state_for_loop.clone();
             
-            // Load token from keychain
-            if let Ok(Some(tok)) = keychain::load_token() {
-                tauri::async_runtime::block_on(async {
-                    *state_for_loop.auth_token.write().await = Some(tok);
-                });
-                let _ = app.emit("auth:status", json!({ "authenticated": true }));
-            } else {
-                let _ = app.emit("auth:status", json!({ "authenticated": false }));
-            }
+            // Load token from keychain and handle deep link in async task
+            tauri::async_runtime::spawn(async move {
+                if let Ok(Some(tok)) = keychain::load_token() {
+                    *state_for_init.auth_token.write().await = Some(tok);
+                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
+                } else {
+                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
+                }
 
-            // Handle deep link
-            try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
+                // Handle deep link
+                try_handle_deep_link_from_args_async(&app_handle_for_init, &state_for_init).await;
+            });
 
             // Create tray menu
             let login_i = tauri::menu::MenuItem::with_id(app, "login", "Login", true, None::<&str>)
@@ -1072,10 +1072,15 @@ pub fn run() {
         tauri::RunEvent::Opened { urls } => {
             if !urls.is_empty() {
                 let st = _app_handle.state::<Arc<AppState>>().inner().clone();
+                let app_handle = _app_handle.clone();
                 for u in urls {
                     let s = u.to_string();
                     log::info!("run_event_opened url={}", s);
-                    handle_deep_link_url(&_app_handle, &st, &s);
+                    let st_clone = st.clone();
+                    let app_handle_clone = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        handle_deep_link_url_async(&app_handle_clone, &st_clone, &s).await;
+                    });
                 }
             }
         }
