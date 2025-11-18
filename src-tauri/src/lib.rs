@@ -622,9 +622,16 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         log::info!("Collection interval: {} seconds", interval_secs);
 
         // Run immediately on startup
-        if let Err(e) = run_cycle(&app, &state).await {
-            log::error!("Initial collection cycle error: {}", e);
-            add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
+        match run_cycle(&app, &state).await {
+            Ok(_) => {
+                log::info!("Initial collection cycle completed successfully");
+                update_tray_status(&app, &state, true).await;
+            }
+            Err(e) => {
+                log::error!("Initial collection cycle error: {}", e);
+                add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
+                update_tray_status(&app, &state, false).await;
+            }
         }
 
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -633,9 +640,16 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         loop {
             interval.tick().await;
             log::info!("Timer tick - starting collection cycle");
-            if let Err(e) = run_cycle(&app, &state).await {
-                log::error!("Collection cycle error: {}", e);
-                add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
+            match run_cycle(&app, &state).await {
+                Ok(_) => {
+                    log::info!("Collection cycle completed successfully");
+                    update_tray_status(&app, &state, true).await;
+                }
+                Err(e) => {
+                    log::error!("Collection cycle error: {}", e);
+                    add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
+                    update_tray_status(&app, &state, false).await;
+                }
             }
         }
     });
