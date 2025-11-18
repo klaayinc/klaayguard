@@ -28,12 +28,16 @@ if not type -q cargo-tauri
 end
 
 # Development environment variables
-set -x VITE_API_BASE_URL http://localhost:3000
+# Explicitly unset first to override any existing values
+set -e APP_DEFAULT_API_BASE_URL 2>/dev/null
+set -e VITE_EARTHENWARE_URL 2>/dev/null
+# Then set new values
+set -x APP_DEFAULT_API_BASE_URL http://localhost:3000
 set -x VITE_EARTHENWARE_URL http://localhost:5173
 set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 300
 set -x RUST_LOG info
 
-echo "$green✓$normal API URL: $VITE_API_BASE_URL"
+echo "$green✓$normal API URL: $APP_DEFAULT_API_BASE_URL"
 echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
 echo "$green✓$normal Collection Interval: 300 seconds (5 minutes)"
 echo ""
@@ -41,7 +45,9 @@ echo "$blue📦 Starting Tauri dev server...$normal"
 echo "$yellow⚠  Note: App runs in system tray (no window)$normal"
 echo "$yellow⚠  Look for icon in top-right menu bar$normal"
 echo ""
+echo "$blue🔍 Debug: APP_DEFAULT_API_BASE_URL=$APP_DEFAULT_API_BASE_URL$normal"
+echo ""
 
 # Start Tauri dev server
-exec cargo tauri dev
+cargo tauri dev
 
