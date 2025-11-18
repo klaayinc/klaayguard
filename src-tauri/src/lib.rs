@@ -282,7 +282,7 @@ fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tau
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     
     let status_text = if is_authenticated {
-        "✅ Authenticated"
+        "🟢 KlaayGuard is running"
     } else {
         "🔴 Not Authenticated"
     };
