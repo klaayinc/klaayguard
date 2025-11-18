@@ -342,6 +342,29 @@ fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tau
     // Status indicator (disabled, non-clickable)
     let status_item = MenuItem::with_id(app, "status", status_text, false, None::<&str>)?;
     
+    // Get API URL and version for info display
+    let api_url = get_api_base_url()
+        .replace("https://", "")
+        .replace("http://", "");
+    let version = env!("CARGO_PKG_VERSION");
+    
+    // Create info items at the bottom
+    let separator_top = PredefinedMenuItem::separator(app)?;
+    let api_info = MenuItem::with_id(
+        app,
+        "api_info",
+        &format!("API: {}", api_url),
+        false,
+        None::<&str>
+    )?;
+    let version_info = MenuItem::with_id(
+        app,
+        "version_info",
+        &format!("v{}", version),
+        false,
+        None::<&str>
+    )?;
+    
     // Build menu based on authentication status
     if !is_authenticated {
         let separator = PredefinedMenuItem::separator(app)?;
@@ -350,12 +373,18 @@ fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tau
             &status_item,
             &separator,
             &login_item,
+            &separator_top,
+            &api_info,
+            &version_info,
         ];
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     } else {
-        // When authenticated, only show status (no logout option)
+        // When authenticated, only show status and info
         let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
             &status_item,
+            &separator_top,
+            &api_info,
+            &version_info,
         ];
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
