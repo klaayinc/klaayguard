@@ -8,13 +8,6 @@ const version = fs.readFileSync('VERSION', 'utf8').trim();
 
 console.log(`Syncing version ${version} across all files...`);
 
-// Update package.json
-const packageJsonPath = 'package.json';
-const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-packageJson.version = version;
-fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 2) + '\n');
-console.log(`✓ Updated ${packageJsonPath}`);
-
 // Update tauri.conf.json
 const tauriConfigPath = 'src-tauri/tauri.conf.json';
 const tauriConfig = JSON.parse(fs.readFileSync(tauriConfigPath, 'utf8'));
