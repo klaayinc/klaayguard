@@ -88,27 +88,48 @@ if test $needs_build -eq 1
     echo ""
 end
 
-echo "$blue🚀 Starting KlaayGuard-Dev...$normal"
+# Install Launch Agent for auto-restart and keep-alive
+set -l launch_agent_path "$HOME/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
+if test -f com.klaay.klaayguard-dev.plist
+    echo "$blue🔄 Installing Launch Agent for auto-restart...$normal"
+    
+    # Unload existing agent if present
+    launchctl unload "$launch_agent_path" 2>/dev/null; or true
+    
+    # Copy plist to LaunchAgents
+    cp com.klaay.klaayguard-dev.plist "$launch_agent_path"
+    
+    # Load the agent
+    if launchctl load "$launch_agent_path" 2>/dev/null
+        echo "$green✓$normal Launch Agent installed - KlaayGuard-Dev will:"
+        echo "   • Auto-start on login"
+        echo "   • Auto-restart if it crashes"
+    else
+        echo "$yellow⚠  Failed to load Launch Agent, but continuing...$normal"
+    end
+    echo ""
+end
+
+echo "$blue🚀 KlaayGuard-Dev is managed by Launch Agent$normal"
 echo "$yellow⚠  App runs in system tray (no window)$normal"
 echo "$yellow⚠  Look for 'KlaayGuard-Dev' icon in top-right menu bar$normal"
 echo ""
-
-# Kill any existing instance first
-pkill -f "KlaayGuard-Dev" 2>/dev/null; or true
-sleep 1
-
-# Launch the installed dev app (this ensures URL scheme works)
-open -a "$dev_app_path" --env APP_DEFAULT_API_BASE_URL="$APP_DEFAULT_API_BASE_URL" --env VITE_EARTHENWARE_URL="$VITE_EARTHENWARE_URL"
-
-echo "$green✓$normal KlaayGuard-Dev is running"
+echo "$green✓$normal KlaayGuard-Dev will:"
+echo "   • Start automatically (Launch Agent is running it)"
+echo "   • Restart if it crashes"
+echo "   • Start on every login"
 echo ""
 echo "$blue📝 To view logs:$normal"
 echo "   log stream --predicate 'process == \"KlaayGuard-Dev\"' --level info"
+echo "   tail -f /tmp/klaayguard-dev-launchd.log"
 echo ""
 echo "$blue🔗 Test deep link:$normal"
 echo "   open 'klaayguard://auth-callback?token=test123'"
 echo ""
-echo "$blue🛑 To stop:$normal"
-echo "   pkill -f KlaayGuard-Dev"
+echo "$blue🛑 To stop and disable auto-restart:$normal"
+echo "   launchctl unload ~/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
+echo ""
+echo "$blue🔄 To restart manually:$normal"
+echo "   launchctl start com.klaay.klaayguard-dev"
 echo ""
 

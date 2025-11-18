@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.klaay.klaayguard-dev</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/KlaayGuard-Dev.app/Contents/MacOS/KlaayGuard-Dev</string>
+    </array>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+    
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>APP_DEFAULT_API_BASE_URL</key>
+        <string>http://localhost:3000</string>
+        <key>VITE_EARTHENWARE_URL</key>
+        <string>http://localhost:5173</string>
+        <key>KLAAYGUARD_COLLECTION_INTERVAL_SECONDS</key>
+        <string>3600</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>/tmp/klaayguard-dev-launchd.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/tmp/klaayguard-dev-launchd-error.log</string>
+</dict>
+</plist>
+

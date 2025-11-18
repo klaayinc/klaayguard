@@ -81,6 +81,11 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
         sentry::capture_message("deep_link_token_saved", Level::Info);
         
+        // Enable autostart so KlaayGuard launches on login
+        if let Err(e) = enable_autostart(app).await {
+            log::warn!("Failed to enable autostart: {}", e);
+        }
+        
         // Update tray menu to show logout option
         update_tray_menu(app, state).await;
         
@@ -125,6 +130,31 @@ async fn try_handle_deep_link_from_args_async(app: &tauri::AppHandle, state: &Ar
             break;
         }
     }
+}
+
+/// Enable autostart so KlaayGuard launches on login
+async fn enable_autostart(app: &tauri::AppHandle) -> Result<(), String> {
+    log::info!("🚀 Enabling autostart...");
+    
+    use tauri_plugin_autostart::ManagerExt;
+    let autostart_manager = app.autolaunch();
+    
+    // Check if already enabled
+    let is_enabled = autostart_manager.is_enabled().map_err(|e| format!("Failed to check autostart status: {}", e))?;
+    
+    if is_enabled {
+        log::info!("✓ Autostart already enabled");
+        return Ok(());
+    }
+    
+    // Enable autostart
+    autostart_manager.enable().map_err(|e| {
+        log::error!("❌ Failed to enable autostart: {}", e);
+        format!("Failed to enable autostart: {}", e)
+    })?;
+    
+    log::info!("✓ Autostart enabled - KlaayGuard will launch on login");
+    Ok(())
 }
 
 #[tauri::command]
@@ -1042,6 +1072,11 @@ pub fn run() {
                     *state_for_init.auth_token.write().await = Some(tok);
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
                     log::info!("✅ Authenticated - token loaded from keychain");
+                    
+                    // Enable autostart if not already enabled
+                    if let Err(e) = enable_autostart(&app_handle_for_init).await {
+                        log::warn!("Failed to enable autostart: {}", e);
+                    }
                     
                     // Update tray menu to show status
                     update_tray_menu(&app_handle_for_init, &state_for_init).await;
