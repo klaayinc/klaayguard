@@ -1,0 +1,159 @@
+#!/usr/bin/env fish
+
+# bin/build - Build KlaayGuard for different environments
+# Usage: bin/build <environment>
+#   environment: development, staging, or production
+
+# Colors for output
+set -l green (set_color green)
+set -l blue (set_color blue)
+set -l yellow (set_color yellow)
+set -l red (set_color red)
+set -l normal (set_color normal)
+
+# Check if environment argument is provided
+if test (count $argv) -eq 0
+    echo "$red✗$normal Usage: bin/build <environment>"
+    echo ""
+    echo "  Environments:"
+    echo "    development  - Local development build with localhost API"
+    echo "    staging      - Staging build with staging API"
+    echo "    production   - Production build with production API"
+    echo ""
+    exit 1
+end
+
+set -l environment $argv[1]
+
+# Validate environment
+if not contains $environment development staging production
+    echo "$red✗$normal Invalid environment: $environment"
+    echo "  Valid environments: development, staging, production"
+    exit 1
+end
+
+echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
+echo "$blue  KlaayGuard Build Script - $environment$normal"
+echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
+echo ""
+
+# Check if Rust is installed
+if not type -q cargo
+    echo "$red✗$normal Rust not found."
+    echo "Please run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    exit 1
+end
+
+# Check if Tauri CLI is installed
+if not type -q cargo-tauri
+    echo "$yellow⚠$normal Tauri CLI not found. Installing..."
+    cargo install tauri-cli --version "^2.0.0"
+end
+
+# Set environment-specific configuration
+set -lx KLAAY_ENV $environment
+
+switch $environment
+    case development
+        set -lx VITE_API_BASE_URL http://localhost:3000
+        set -lx VITE_EARTHENWARE_URL http://localhost:5173
+        set -l build_mode debug
+        set -l config_file src-tauri/tauri.development.json
+        set -l api_url http://localhost:3000
+        set -l earthenware_url http://localhost:5173
+    case staging
+        set -lx VITE_API_BASE_URL https://api.klaay.dev
+        set -lx VITE_EARTHENWARE_URL https://app.klaay.dev
+        set -l build_mode release
+        set -l config_file src-tauri/tauri.staging.json
+        set -l api_url https://api.klaay.dev
+        set -l earthenware_url https://app.klaay.dev
+    case production
+        set -lx VITE_API_BASE_URL https://api.klaay.com
+        set -lx VITE_EARTHENWARE_URL https://app.klaay.com
+        set -l build_mode release
+        set -l config_file src-tauri/tauri.conf.json
+        set -l api_url https://api.klaay.com
+        set -l earthenware_url https://app.klaay.com
+end
+
+echo "$green✓$normal Environment: $environment"
+echo "$green✓$normal Build Mode: $build_mode"
+echo "$green✓$normal Config File: $config_file"
+echo "$green✓$normal API URL: $api_url"
+echo "$green✓$normal Earthenware URL: $earthenware_url"
+echo ""
+
+# Build the application
+echo "$blue📦 Building KlaayGuard for $environment...$normal"
+echo ""
+
+if test $build_mode = "debug"
+    # Debug build for development
+    cargo tauri build --debug --config $config_file
+else
+    # Release build for staging/production
+    cargo tauri build --config $config_file
+end
+
+if test $status -ne 0
+    echo ""
+    echo "$red✗$normal Build failed"
+    exit 1
+end
+
+echo ""
+echo "$green✓$normal Build completed successfully"
+echo ""
+
+# Determine output paths based on OS and build mode
+set -l os_type (uname -s)
+switch $os_type
+    case Darwin
+        # macOS
+        if test $build_mode = "debug"
+            set -l bundle_path src-tauri/target/debug/bundle
+            echo "$blue📦 Build artifacts:$normal"
+            echo "  • $bundle_path/macos/*.app"
+            echo "  • $bundle_path/dmg/*.dmg"
+        else
+            set -l bundle_path src-tauri/target/release/bundle
+            echo "$blue📦 Build artifacts:$normal"
+            echo "  • $bundle_path/macos/*.app"
+            echo "  • $bundle_path/dmg/*.dmg"
+        end
+    case Linux
+        if test $build_mode = "debug"
+            set -l bundle_path src-tauri/target/debug/bundle
+            echo "$blue📦 Build artifacts:$normal"
+            echo "  • $bundle_path/appimage/*.AppImage"
+            echo "  • $bundle_path/deb/*.deb"
+        else
+            set -l bundle_path src-tauri/target/release/bundle
+            echo "$blue📦 Build artifacts:$normal"
+            echo "  • $bundle_path/appimage/*.AppImage"
+            echo "  • $bundle_path/deb/*.deb"
+        end
+    case '*'
+        # Windows or other
+        if test $build_mode = "debug"
+            set -l bundle_path src-tauri/target/debug/bundle
+            echo "$blue📦 Build artifacts:$normal"
+            echo "  • $bundle_path/msi/*.msi"
+            echo "  • $bundle_path/nsis/*.exe"
+        else
+            set -l bundle_path src-tauri/target/release/bundle
+            echo "$blue📦 Build artifacts:$normal"
+            echo "  • $bundle_path/msi/*.msi"
+            echo "  • $bundle_path/nsis/*.exe"
+        end
+end
+
+echo ""
+echo "$blue📝 Build Info:$normal"
+echo "  • Environment: $environment"
+echo "  • Build Mode: $build_mode"
+echo "  • API URL: $api_url"
+echo "  • Earthenware URL: $earthenware_url"
+echo ""
+
