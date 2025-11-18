@@ -1,0 +1,47 @@
+#!/usr/bin/env fish
+
+# bin/dev - Start KlaayGuard in development mode
+# Usage: bin/dev
+
+# Colors for output
+set -l green (set_color green)
+set -l blue (set_color blue)
+set -l yellow (set_color yellow)
+set -l normal (set_color normal)
+
+echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
+echo "$blue  KlaayGuard Development Server$normal"
+echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
+echo ""
+
+# Check if Rust is installed
+if not type -q cargo
+    echo "$yellow⚠  Rust not found.$normal"
+    echo "Please run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    exit 1
+end
+
+# Check if Tauri CLI is installed
+if not type -q cargo-tauri
+    echo "$yellow⚠  Tauri CLI not found. Installing...$normal"
+    cargo install tauri-cli --version "^2.0.0"
+end
+
+# Development environment variables
+set -x VITE_API_BASE_URL http://localhost:3000
+set -x VITE_EARTHENWARE_URL http://localhost:5173
+set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 300
+set -x RUST_LOG info
+
+echo "$green✓$normal API URL: $VITE_API_BASE_URL"
+echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
+echo "$green✓$normal Collection Interval: 300 seconds (5 minutes)"
+echo ""
+echo "$blue📦 Starting Tauri dev server...$normal"
+echo "$yellow⚠  Note: App runs in system tray (no window)$normal"
+echo "$yellow⚠  Look for icon in top-right menu bar$normal"
+echo ""
+
+# Start Tauri dev server
+exec cargo tauri dev
+
