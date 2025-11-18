@@ -625,12 +625,18 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         match run_cycle(&app, &state).await {
             Ok(_) => {
                 log::info!("Initial collection cycle completed successfully");
-                update_tray_status(&app, &state, true).await;
+                // Only update tray status if we're authenticated (collection actually ran)
+                if state.auth_token.read().await.is_some() {
+                    update_tray_status(&app, &state, true).await;
+                }
             }
             Err(e) => {
                 log::error!("Initial collection cycle error: {}", e);
                 add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
-                update_tray_status(&app, &state, false).await;
+                // Only update tray status if we're authenticated
+                if state.auth_token.read().await.is_some() {
+                    update_tray_status(&app, &state, false).await;
+                }
             }
         }
 
@@ -643,12 +649,18 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             match run_cycle(&app, &state).await {
                 Ok(_) => {
                     log::info!("Collection cycle completed successfully");
-                    update_tray_status(&app, &state, true).await;
+                    // Only update tray status if we're authenticated (collection actually ran)
+                    if state.auth_token.read().await.is_some() {
+                        update_tray_status(&app, &state, true).await;
+                    }
                 }
                 Err(e) => {
                     log::error!("Collection cycle error: {}", e);
                     add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
-                    update_tray_status(&app, &state, false).await;
+                    // Only update tray status if we're authenticated
+                    if state.auth_token.read().await.is_some() {
+                        update_tray_status(&app, &state, false).await;
+                    }
                 }
             }
         }
