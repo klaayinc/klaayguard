@@ -73,8 +73,8 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         }
         
         log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
-        *state.auth_token.write().await = Some(tok.clone());
-        *state.keychain_cleared_this_session.write().await = false;
+            *state.auth_token.write().await = Some(tok.clone());
+            *state.keychain_cleared_this_session.write().await = false;
         let _ = keychain::save_token(&tok);
         log::info!("deep_link_token_saved_to_keychain");
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
@@ -269,49 +269,102 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
 
 /// Helper function to set tray icon and tooltip
 fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &str) {
+    log::info!("🔧 set_tray_icon_and_tooltip called: icon={}, tooltip={}", icon_name, tooltip);
+    
     if let Some(tray) = app.tray_by_id("main") {
         // Update tooltip
-        let _ = tray.set_tooltip(Some(tooltip.to_string()));
+        if let Err(e) = tray.set_tooltip(Some(tooltip.to_string())) {
+            log::error!("Failed to set tooltip: {}", e);
+        } else {
+            log::info!("✓ Tooltip set successfully");
+        }
         
-        // Update icon with status indicator
-        let icon_path = app.path().resource_dir()
-            .ok()
-            .and_then(|p| {
-                let full_path = p.join(icon_name);
-                if full_path.exists() {
-                    Some(full_path)
+        // In dev mode, icons are in src-tauri/icons/ or icons/
+        // In production, they're in the resource directory
+        let icon_path = if cfg!(debug_assertions) {
+            // Dev mode: try multiple paths
+            let current = std::env::current_dir().unwrap_or_default();
+            log::info!("📂 Current dir: {}", current.display());
+            
+            let paths_to_try = vec![
+                current.join("icons").join(icon_name),                    // If running from src-tauri/
+                current.join("src-tauri").join("icons").join(icon_name),  // If running from project root
+                current.parent().unwrap_or(&current).join("icons").join(icon_name), // One level up
+            ];
+            
+            let mut found_path = None;
+            for path in paths_to_try {
+                log::info!("🔍 Trying icon path: {}", path.display());
+                if path.exists() {
+                    log::info!("✅ Found dev icon at: {}", path.display());
+                    found_path = Some(path);
+                    break;
                 } else {
-                    log::warn!("Icon file not found: {}", full_path.display());
-                    None
+                    log::debug!("❌ Not found: {}", path.display());
                 }
-            });
+            }
+            
+            if found_path.is_none() {
+                // Fallback to resource dir
+                if let Ok(resource_dir) = app.path().resource_dir() {
+                    let full_path = resource_dir.join(icon_name);
+                    if full_path.exists() {
+                        log::info!("✅ Found resource icon at: {}", full_path.display());
+                        found_path = Some(full_path);
+                    } else {
+                        log::warn!("❌ Resource icon not found: {}", full_path.display());
+                    }
+                }
+            }
+            
+            found_path
+        } else {
+            // Production: use resource dir
+            app.path().resource_dir()
+                .ok()
+                .and_then(|p| {
+                    let full_path = p.join(icon_name);
+                    if full_path.exists() {
+                        Some(full_path)
+                    } else {
+                        log::warn!("Icon file not found: {}", full_path.display());
+                        None
+                    }
+                })
+        };
         
         if let Some(path) = icon_path {
+            log::info!("📂 Reading icon from: {}", path.display());
             match std::fs::read(&path) {
                 Ok(bytes) => {
-                    // Load as PNG image - Tauri will handle the decoding
+                    log::info!("✓ Icon file read: {} bytes", bytes.len());
                     match image::load_from_memory(&bytes) {
                         Ok(img) => {
                             let rgba = img.to_rgba8();
                             let (width, height) = rgba.dimensions();
+                            log::info!("✓ Icon decoded: {}x{}", width, height);
                             let icon = tauri::image::Image::new_owned(rgba.into_raw(), width, height);
                             
                             if let Err(e) = tray.set_icon(Some(icon)) {
-                                log::error!("Failed to update tray icon: {}", e);
+                                log::error!("❌ Failed to update tray icon: {}", e);
                             } else {
-                                log::debug!("Tray icon updated to: {}", icon_name);
+                                log::info!("✅ Tray icon updated to: {}", icon_name);
                             }
                         }
                         Err(e) => {
-                            log::error!("Failed to decode icon image {}: {}", icon_name, e);
+                            log::error!("❌ Failed to decode icon image {}: {}", icon_name, e);
                         }
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to read icon file {}: {}", path.display(), e);
+                    log::error!("❌ Failed to read icon file {}: {}", path.display(), e);
                 }
             }
+                } else {
+            log::error!("❌ Could not locate icon file: {}", icon_name);
         }
+    } else {
+        log::error!("❌ Tray icon with id 'main' not found!");
     }
 }
 
@@ -802,47 +855,8 @@ pub fn run() {
             });
 
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
-            let app_handle_for_init = app.handle().clone();
-            let state_for_init = state_for_loop.clone();
             
-            // Load token from keychain and handle deep link in async task
-            tauri::async_runtime::spawn(async move {
-                if let Ok(Some(tok)) = keychain::load_token() {
-                    *state_for_init.auth_token.write().await = Some(tok);
-                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
-                    log::info!("Authenticated - token loaded from keychain");
-                    
-                    // Set initial authenticated status
-                    set_tray_icon_and_tooltip(
-                        &app_handle_for_init,
-                        "icon-default.png",
-                        "✓ Authenticated - Monitoring will start shortly"
-                    );
-                } else {
-                    *state_for_init.auth_token.write().await = None;
-                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
-                    log::warn!("Not authenticated - no token found in keychain");
-                    
-                    // Show notification prompting login
-                    let _ = app_handle_for_init.notification()
-                        .builder()
-                        .title("KlaayGuard - Login Required")
-                        .body("Please login to start monitoring. Click the tray icon (top-right menu bar) and select Login.")
-                        .show();
-                    
-                    // Set unauthenticated icon
-                    set_tray_icon_and_tooltip(
-                        &app_handle_for_init,
-                        "icon-unauthenticated.png",
-                        "⚠️  Not authenticated - Click the tray icon and select Login to start monitoring"
-                    );
-                }
-
-                // Handle deep link
-                try_handle_deep_link_from_args_async(&app_handle_for_init, &state_for_init).await;
-            });
-
-            // Create tray menu
+            // Create tray menu FIRST (before spawning async tasks that need it)
             let login_i = tauri::menu::MenuItem::with_id(app, "login", "Login", true, None::<&str>)
                 .map_err(|e| {
                     log::error!("Failed to create 'Login' menu item: {}", e);
@@ -853,20 +867,28 @@ pub fn run() {
                 e
             })?;
 
-            // Create tray icon with ID for status updates
+            // Create tray icon SECOND (before spawning async tasks that update it)
             tauri::tray::TrayIconBuilder::with_id("main")
-                .on_menu_event(|_app, event| match event.id.as_ref() {
-                    "login" => {
-                        log::info!("Login requested from system tray");
-                        let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
-                            .unwrap_or_else(|_| "https://app.klaay.com".to_string());
-                        let callback_url = "klaayguard://auth-callback";
-                        let full_url = format!("{}?redirect_to={}", earthenware_url, callback_url);
-                        if let Err(e) = open::that(full_url) {
-                            log::error!("Failed to open browser: {}", e);
+                .on_menu_event(|_app, event| {
+                    log::info!("🖱️  Menu event triggered: id={}", event.id.as_ref());
+                    match event.id.as_ref() {
+                        "login" => {
+                            log::info!("🔐 Login requested from system tray");
+                            let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
+                                .unwrap_or_else(|_| "https://app.klaay.com".to_string());
+                            let callback_url = "klaayguard://auth-callback";
+                            let full_url = format!("{}?redirect_to={}", earthenware_url, callback_url);
+                            log::info!("🌐 Opening browser: {}", full_url);
+                            if let Err(e) = open::that(full_url) {
+                                log::error!("❌ Failed to open browser: {}", e);
+                            } else {
+                                log::info!("✅ Browser opened successfully");
+                            }
+                        }
+                        _ => {
+                            log::warn!("⚠️  Unknown menu event: {}", event.id.as_ref());
                         }
                     }
-                    _ => {}
                 })
                 .icon(app.default_window_icon().unwrap().clone())
                 .icon_as_template(false) // Disable template mode to show colored status dots
@@ -878,6 +900,55 @@ pub fn run() {
                     log::error!("Failed to create system tray: {}", e);
                     e
                 })?;
+
+            log::info!("✅ Tray icon created successfully");
+
+            // NOW load token and update tray (after tray exists!)
+            let app_handle_for_init = app.handle().clone();
+            let state_for_init = state_for_loop.clone();
+            
+            tauri::async_runtime::spawn(async move {
+                log::info!("🔑 Checking keychain for authentication token...");
+                if let Ok(Some(tok)) = keychain::load_token() {
+                    *state_for_init.auth_token.write().await = Some(tok);
+                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
+                    log::info!("✅ Authenticated - token loaded from keychain");
+                    
+                    // Set initial authenticated status
+                    log::info!("🎨 Setting authenticated tray icon...");
+                    set_tray_icon_and_tooltip(
+                        &app_handle_for_init,
+                        "icon-default.png",
+                        "✓ Authenticated - Monitoring will start shortly"
+                    );
+            } else {
+                    *state_for_init.auth_token.write().await = None;
+                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
+                    log::warn!("⚠️  Not authenticated - no token found in keychain");
+                    
+                    // Show notification prompting login
+                    log::info!("📢 Showing login notification...");
+                    match app_handle_for_init.notification()
+                        .builder()
+                        .title("KlaayGuard - Login Required")
+                        .body("Please login to start monitoring. Click the tray icon (top-right menu bar) and select Login.")
+                        .show() {
+                        Ok(_) => log::info!("✅ Notification shown successfully"),
+                        Err(e) => log::error!("❌ Failed to show notification: {}", e),
+                    }
+                    
+                    // Set unauthenticated icon
+                    log::info!("🎨 Setting unauthenticated tray icon...");
+                    set_tray_icon_and_tooltip(
+                        &app_handle_for_init,
+                        "icon-unauthenticated.png",
+                        "⚠️  Not authenticated - Click the tray icon and select Login to start monitoring"
+                    );
+                }
+
+                // Handle deep link
+                try_handle_deep_link_from_args_async(&app_handle_for_init, &state_for_init).await;
+            });
 
             log::info!("KlaayGuard started - running in background (no focus)");
 
