@@ -32,12 +32,12 @@ set -e APP_DEFAULT_API_BASE_URL 2>/dev/null
 set -e VITE_EARTHENWARE_URL 2>/dev/null
 set -x APP_DEFAULT_API_BASE_URL http://localhost:3000
 set -x VITE_EARTHENWARE_URL http://localhost:5173
-set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 300
+set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 3600
 set -x RUST_LOG info
 
 echo "$green✓$normal API URL: $APP_DEFAULT_API_BASE_URL"
 echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
-echo "$green✓$normal Collection Interval: 300 seconds (5 minutes)"
+echo "$green✓$normal Collection Interval: 3600 seconds (1 hour)"
 echo ""
 
 # Check if dev app bundle needs to be built/updated
