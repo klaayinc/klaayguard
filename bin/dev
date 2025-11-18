@@ -28,10 +28,8 @@ if not type -q cargo-tauri
 end
 
 # Development environment variables
-# Explicitly unset first to override any existing values
 set -e APP_DEFAULT_API_BASE_URL 2>/dev/null
 set -e VITE_EARTHENWARE_URL 2>/dev/null
-# Then set new values
 set -x APP_DEFAULT_API_BASE_URL http://localhost:3000
 set -x VITE_EARTHENWARE_URL http://localhost:5173
 set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 300
@@ -41,13 +39,76 @@ echo "$green✓$normal API URL: $APP_DEFAULT_API_BASE_URL"
 echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
 echo "$green✓$normal Collection Interval: 300 seconds (5 minutes)"
 echo ""
-echo "$blue📦 Starting Tauri dev server...$normal"
-echo "$yellow⚠  Note: App runs in system tray (no window)$normal"
-echo "$yellow⚠  Look for icon in top-right menu bar$normal"
-echo ""
-echo "$blue🔍 Debug: APP_DEFAULT_API_BASE_URL=$APP_DEFAULT_API_BASE_URL$normal"
+
+# Check if dev app bundle needs to be built/updated
+set -l dev_app_path "/Applications/KlaayGuard-Dev.app"
+set -l needs_build 0
+
+if not test -d "$dev_app_path"
+    echo "$yellow⚠  Dev app not found in Applications folder$normal"
+    set needs_build 1
+else
+    # Check if source is newer than installed app
+    set -l src_mtime (stat -f %m src-tauri/src/lib.rs 2>/dev/null; or echo 0)
+    set -l app_mtime (stat -f %m "$dev_app_path/Contents/MacOS/KlaayGuard-Dev" 2>/dev/null; or echo 0)
+    
+    if test $src_mtime -gt $app_mtime
+        echo "$yellow⚠  Source code is newer than installed app$normal"
+        set needs_build 1
+    end
+end
+
+if test $needs_build -eq 1
+    echo "$blue📦 Building and installing dev app bundle...$normal"
+    echo "$yellow   This will take a minute...$normal"
+    echo ""
+    
+    # Build the dev bundle with development environment variables
+    set -lx KLAAY_ENV development
+    cargo tauri build --debug --config src-tauri/tauri.development.json
+    
+    # Kill any running instance
+    pkill -f "KlaayGuard-Dev" 2>/dev/null; or true
+    
+    # Remove old dev app
+    rm -rf "$dev_app_path" 2>/dev/null; or true
+    
+    # Copy new dev app to Applications
+    if test -d "src-tauri/target/debug/bundle/macos/KlaayGuard-Dev.app"
+        cp -R "src-tauri/target/debug/bundle/macos/KlaayGuard-Dev.app" /Applications/
+        echo "$green✓$normal Dev app installed to $dev_app_path"
+        
+        # Force re-registration of URL scheme
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dev_app_path"
+        echo "$green✓$normal URL scheme registered for dev app"
+    else
+        echo "$yellow⚠  Build failed - app bundle not found$normal"
+        exit 1
+    end
+    echo ""
+end
+
+echo "$blue🚀 Starting KlaayGuard-Dev...$normal"
+echo "$yellow⚠  App runs in system tray (no window)$normal"
+echo "$yellow⚠  Look for 'KlaayGuard-Dev' icon in top-right menu bar$normal"
 echo ""
 
-# Start Tauri dev server
-cargo tauri dev
+# Kill any existing instance first
+pkill -f "KlaayGuard-Dev" 2>/dev/null; or true
+sleep 1
+
+# Launch the installed dev app (this ensures URL scheme works)
+open -a "$dev_app_path" --env APP_DEFAULT_API_BASE_URL="$APP_DEFAULT_API_BASE_URL" --env VITE_EARTHENWARE_URL="$VITE_EARTHENWARE_URL"
+
+echo "$green✓$normal KlaayGuard-Dev is running"
+echo ""
+echo "$blue📝 To view logs:$normal"
+echo "   log stream --predicate 'process == \"KlaayGuard-Dev\"' --level info"
+echo ""
+echo "$blue🔗 Test deep link:$normal"
+echo "   open 'klaayguard://auth-callback?token=test123'"
+echo ""
+echo "$blue🛑 To stop:$normal"
+echo "   pkill -f KlaayGuard-Dev"
+echo ""
 

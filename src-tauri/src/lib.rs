@@ -81,19 +81,31 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
         sentry::capture_message("deep_link_token_saved", Level::Info);
         
-        // Remove red dot - authenticated now (will show green/red after first collection)
-        set_tray_icon_and_tooltip(
-            app,
-            "icon-default.png",
-            "✓ Authenticated - First collection starting..."
-        );
-        
         // Show success notification
         let _ = app.notification()
             .builder()
             .title("KlaayGuard")
-            .body("Successfully authenticated! First data collection starting...")
+            .body("Successfully authenticated! Collecting data now...")
             .show();
+        
+        // Immediately trigger data collection to show green/red dot
+        set_tray_icon_and_tooltip(
+            app,
+            "icon-default.png",
+            "✓ Authenticated - Collecting data..."
+        );
+        
+        log::info!("deep_link_triggering_immediate_collection");
+        match run_cycle(app, state).await {
+            Ok(_) => {
+                log::info!("deep_link_immediate_collection_completed");
+                update_tray_status(app, state, true).await;
+            }
+            Err(e) => {
+                log::error!("deep_link_immediate_collection_failed error={}", e);
+                update_tray_status(app, state, false).await;
+            }
+        }
     } else {
         log::warn!("deep_link_missing_token_param");
     }
@@ -242,23 +254,18 @@ fn collection_interval_seconds() -> u64 {
 }
 
 async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["hardware_info".to_string()];
+    let tables = vec!["system_info".to_string()];
     let result = execute_query(app.clone(), tables).await?;
     let serial = result
-        .get("hardware_info")
+        .get("system_info")
         .and_then(|v| v.as_array())
         .and_then(|arr| arr.first())
         .and_then(|obj| {
-            obj.get("serial_number")
+            obj.get("hardware_serial")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .or_else(|| {
-                    obj.get("hardware_serial")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-                .or_else(|| {
-                    obj.get("hardware_uuid")
+                    obj.get("uuid")
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
                 })
@@ -427,9 +434,9 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
     let api_base = state.api_base_url.read().await.clone();
     let serial = get_device_serial_number_internal(app).await?;
 
-    // 1) Fetch config
+    // 1) Fetch config from Kiln
     let client = get_client_with_retries();
-    let cfg_url = format!("{}/v1/devices/{}/osquery_configs", api_base, serial);
+    let cfg_url = format!("{}/klaayguard/config", api_base);
     let cfg_resp = client
         .get(&cfg_url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
@@ -453,6 +460,7 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
     
+    // Parse queries from Kiln's config format: { data: [{ id, type, sql? }] }
     let queries: Vec<(String, String)> = cfg_json
         .get("data")
         .and_then(|d| d.as_array())
@@ -460,11 +468,12 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
             arr.iter()
                 .filter_map(|item| {
                     let logical_id = item.get("id")?.as_str()?.to_string();
+                    // If sql is provided, use it; otherwise use "SELECT * FROM {id}"
                     let sql = item
-                        .get("attributes")?
-                        .get("sql")?
-                        .as_str()?
-                        .to_string();
+                        .get("sql")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("SELECT * FROM {}", logical_id));
                     Some((logical_id, sql))
                 })
                 .collect::<Vec<_>>()
@@ -481,20 +490,29 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
     let results_map = execute_sql_batch(app.clone(), queries).await?;
     add_breadcrumb("collection", &format!("executed_queries:{}", results_map.len()), Level::Info);
 
-    // 3) POST to API
-    let resource = JsonApiResource {
-        id: None,
-        resource_type: "device_osquery_results".to_string(),
-        attributes: json!({
-            "device_serial_number": serial,
-            "results": results_map,
-        }),
-    };
+    // 3) POST to Kiln data endpoint
+    // Format: { meta: { device_uuid }, data: [{ type, attributes }] }
+    let data_array: Vec<Value> = results_map
+        .into_iter()
+        .map(|(table_name, rows)| {
+            json!({
+                "type": table_name,
+                "attributes": {
+                    "rows": rows
+                }
+            })
+        })
+        .collect();
 
-    let body_json = serde_json::to_string(&json!({ "data": resource }))
-        .map_err(|e| format!("serialize: {}", e))?;
+    let body_json = serde_json::to_string(&json!({
+        "meta": {
+            "device_uuid": serial
+        },
+        "data": data_array
+    }))
+    .map_err(|e| format!("serialize: {}", e))?;
 
-    let post_url = format!("{}/v1/device_osquery_results", api_base);
+    let post_url = format!("{}/klaayguard/data", api_base);
     let post_result = client
         .post(&post_url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))

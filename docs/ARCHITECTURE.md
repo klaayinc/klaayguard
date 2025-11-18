@@ -283,8 +283,14 @@ pub struct AppState {
 6. KlaayGuard parses token and saves to keychain
 
 **Registration**:
-- Declared in `tauri.conf.json` bundle configuration
+- Declared in `src-tauri/Info.plist` for macOS
 - OS registers on app installation
+- Dev builds use `KlaayGuard-Dev` with identifier `com.klaay.app.dev`
+
+**Development Mode**:
+- `bin/dev` builds and installs `KlaayGuard-Dev.app` to `/Applications/`
+- URL scheme registered to dev app for easy testing
+- Auto-rebuilds when source changes detected
 
 **Single Instance**:
 - Uses `tauri-plugin-single-instance`
