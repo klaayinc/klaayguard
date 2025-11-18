@@ -73,13 +73,27 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         }
         
         log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
-            *state.auth_token.write().await = Some(tok.clone());
-            *state.keychain_cleared_this_session.write().await = false;
+        *state.auth_token.write().await = Some(tok.clone());
+        *state.keychain_cleared_this_session.write().await = false;
         let _ = keychain::save_token(&tok);
         log::info!("deep_link_token_saved_to_keychain");
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
         add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
         sentry::capture_message("deep_link_token_saved", Level::Info);
+        
+        // Update tray icon to show authenticated state
+        set_tray_icon_and_tooltip(
+            app,
+            "icon-default.png",
+            "✓ Authenticated - Monitoring will start shortly"
+        );
+        
+        // Show success notification
+        let _ = app.notification()
+            .builder()
+            .title("KlaayGuard")
+            .body("Successfully authenticated! Monitoring will begin shortly.")
+            .show();
     } else {
         log::warn!("deep_link_missing_token_param");
     }
@@ -253,22 +267,11 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
     Ok(serial.to_string())
 }
 
-async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
-    let (tooltip, notification_msg, icon_name) = if success {
-        let timestamp = state.last_send_at.read().await.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
-        let tooltip = if let Some(ts) = timestamp {
-            format!("✓ Last send: {} (Success)", ts)
-        } else {
-            "✓ Last send: Success".to_string()
-        };
-        (tooltip, None, "icon-success.png")
-    } else {
-        ("✗ Last send: Failed".to_string(), Some("Data send failed. Will retry in 1 hour."), "icon-error.png")
-    };
-    
+/// Helper function to set tray icon and tooltip
+fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &str) {
     if let Some(tray) = app.tray_by_id("main") {
         // Update tooltip
-        let _ = tray.set_tooltip(Some(tooltip));
+        let _ = tray.set_tooltip(Some(tooltip.to_string()));
         
         // Update icon with status indicator
         let icon_path = app.path().resource_dir()
@@ -310,6 +313,33 @@ async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, succe
             }
         }
     }
+}
+
+async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
+    // Check if authenticated first
+    if state.auth_token.read().await.is_none() {
+        log::debug!("Skipping tray status update - not authenticated");
+        set_tray_icon_and_tooltip(
+            app,
+            "icon-unauthenticated.png",
+            "⚠️  Not authenticated - Click the tray icon and select Login to start monitoring"
+        );
+        return;
+    }
+    
+    let (tooltip, notification_msg, icon_name) = if success {
+        let timestamp = state.last_send_at.read().await.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
+        let tooltip = if let Some(ts) = timestamp {
+            format!("✓ Last send: {} (Success)", ts)
+        } else {
+            "✓ Last send: Success".to_string()
+        };
+        (tooltip, None, "icon-success.png")
+    } else {
+        ("✗ Last send: Failed".to_string(), Some("Data send failed. Will retry in 1 hour."), "icon-error.png")
+    };
+    
+    set_tray_icon_and_tooltip(app, icon_name, &tooltip);
     
     // Show notification on failure
     if let Some(msg) = notification_msg {
@@ -777,11 +807,35 @@ pub fn run() {
             
             // Load token from keychain and handle deep link in async task
             tauri::async_runtime::spawn(async move {
-            if let Ok(Some(tok)) = keychain::load_token() {
+                if let Ok(Some(tok)) = keychain::load_token() {
                     *state_for_init.auth_token.write().await = Some(tok);
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
-            } else {
+                    log::info!("Authenticated - token loaded from keychain");
+                    
+                    // Set initial authenticated status
+                    set_tray_icon_and_tooltip(
+                        &app_handle_for_init,
+                        "icon-default.png",
+                        "✓ Authenticated - Monitoring will start shortly"
+                    );
+                } else {
+                    *state_for_init.auth_token.write().await = None;
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
+                    log::warn!("Not authenticated - no token found in keychain");
+                    
+                    // Show notification prompting login
+                    let _ = app_handle_for_init.notification()
+                        .builder()
+                        .title("KlaayGuard - Login Required")
+                        .body("Please login to start monitoring. Click the tray icon (top-right menu bar) and select Login.")
+                        .show();
+                    
+                    // Set unauthenticated icon
+                    set_tray_icon_and_tooltip(
+                        &app_handle_for_init,
+                        "icon-unauthenticated.png",
+                        "⚠️  Not authenticated - Click the tray icon and select Login to start monitoring"
+                    );
                 }
 
                 // Handle deep link

@@ -18,7 +18,8 @@
       "resources/*",
       "icons/icon-success.png",
       "icons/icon-error.png",
-      "icons/icon-default.png"
+      "icons/icon-default.png",
+      "icons/icon-unauthenticated.png"
     ],
     "externalBin": [
       "vendor/osqueryi"
