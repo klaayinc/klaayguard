@@ -290,11 +290,9 @@ fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tau
     // Status indicator (disabled, non-clickable)
     let status_item = MenuItem::with_id(app, "status", status_text, false, None::<&str>)?;
     
-    // Separator
-    let separator = PredefinedMenuItem::separator(app)?;
-    
     // Build menu based on authentication status
     if !is_authenticated {
+        let separator = PredefinedMenuItem::separator(app)?;
         let login_item = MenuItem::with_id(app, "login", "Login", true, None::<&str>)?;
         let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
             &status_item,
@@ -303,11 +301,9 @@ fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tau
         ];
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     } else {
-        let logout_item = MenuItem::with_id(app, "logout", "Logout", true, None::<&str>)?;
+        // When authenticated, only show status (no logout option)
         let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
             &status_item,
-            &separator,
-            &logout_item,
         ];
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
@@ -949,10 +945,9 @@ pub fn run() {
                 format!("{}", e)
             })?;
 
-            // Create tray icon SECOND (before spawning async tasks that update it)
-            let state_for_menu = state_for_loop.clone();
-            tauri::tray::TrayIconBuilder::with_id("main")
-                .on_menu_event(move |app, event| {
+        // Create tray icon SECOND (before spawning async tasks that update it)
+        tauri::tray::TrayIconBuilder::with_id("main")
+                .on_menu_event(move |_app, event| {
                     log::info!("🖱️  Menu event triggered: id={}", event.id.as_ref());
                     match event.id.as_ref() {
                         "login" => {
@@ -967,41 +962,6 @@ pub fn run() {
                             } else {
                                 log::info!("✅ Browser opened successfully");
                             }
-                        }
-                        "logout" => {
-                            log::info!("🚪 Logout requested from system tray");
-                            let app_handle = app.clone();
-                            let state = state_for_menu.clone();
-                            tauri::async_runtime::spawn(async move {
-                                // Clear token from state
-                                *state.auth_token.write().await = None;
-                                
-                                // Clear token from keychain
-                                if let Err(e) = keychain::delete_token() {
-                                    log::error!("Failed to delete token from keychain: {}", e);
-                                } else {
-                                    log::info!("✅ Token deleted from keychain");
-                                }
-                                
-                                // Update tray menu to show login option
-                                update_tray_menu(&app_handle, &state).await;
-                                
-                                // Update tray icon to red (unauthenticated)
-                                set_tray_icon_and_tooltip(
-                                    &app_handle,
-                                    "icon-error.png",
-                                    "🔴 Not authenticated - Click Login to start monitoring"
-                                );
-                                
-                                // Show notification
-                                let _ = app_handle.notification()
-                                    .builder()
-                                    .title("KlaayGuard - Logged Out")
-                                    .body("You have been logged out. Click Login to authenticate.")
-                                    .show();
-                                
-                                log::info!("✅ Logout complete");
-                            });
                         }
                         "status" => {
                             // Status item is non-clickable, ignore
