@@ -7,7 +7,7 @@ const fs = require('node:fs')
 // Allowed values: production | staging | development
 const KLAAY_ENV = (process.env.KLAAY_ENV || process.env.NODE_ENV || 'production').toLowerCase()
 
-// Provide sensible defaults for required Vite vars if not already set
+// Provide sensible defaults for API/Earthenware URLs if not already set
 if (!process.env.VITE_API_BASE_URL || !process.env.VITE_EARTHENWARE_URL) {
   if (KLAAY_ENV === 'staging') {
     process.env.VITE_API_BASE_URL ||= 'https://api.klaay.dev'
@@ -25,7 +25,7 @@ const hasKey = !!process.env.TAURI_SIGNING_PRIVATE_KEY
 const args = ['build']
 const passThrough = process.argv.slice(2)
 
-// Select a per-env tauri config to ensure Vite runs with the correct mode
+// Select a per-env tauri config for environment-specific settings
 if (KLAAY_ENV === 'staging') {
   args.push('--config', 'src-tauri/tauri.staging.json')
 } else if (KLAAY_ENV === 'development') {
@@ -41,31 +41,8 @@ if (!hasKey) {
 args.push(...passThrough)
 
 function resolveTauriCommand() {
-  const binDir = path.resolve(__dirname, '../node_modules/.bin')
-  const win = process.platform === 'win32'
-  
-  if (win) {
-    // On Windows, try multiple candidates
-    const candidates = [
-      path.join(binDir, 'tauri.cmd'),
-      path.join(binDir, 'tauri'),
-      path.resolve(__dirname, '../node_modules/@tauri-apps/cli-win32-x64-msvc/tauri.exe'),
-      path.resolve(__dirname, '../node_modules/@tauri-apps/cli/tauri.js')
-    ]
-    
-    for (const candidate of candidates) {
-      if (fs.existsSync(candidate)) {
-        console.log(`[tauri-build] Using Tauri CLI: ${candidate}`)
-        return candidate
-      }
-    }
-  } else {
-    const candidate = path.join(binDir, 'tauri')
-    if (fs.existsSync(candidate)) return candidate
-  }
-  
-  // Fallback to PATH (works when invoked via yarn where .bin is injected)
-  return 'tauri'
+  // Try to use cargo-installed tauri-cli first (preferred for system tray-only app)
+  return 'cargo tauri'
 }
 
 const tauriCmd = resolveTauriCommand()

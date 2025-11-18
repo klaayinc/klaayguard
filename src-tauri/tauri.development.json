@@ -1,6 +1,3 @@
 {
-  "$schema": "https://schema.tauri.app/config/2",
-  "build": {
-    "beforeBuildCommand": "yarn build --mode development"
-  }
+  "$schema": "https://schema.tauri.app/config/2"
 }
