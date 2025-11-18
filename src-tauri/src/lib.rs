@@ -81,18 +81,18 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
         sentry::capture_message("deep_link_token_saved", Level::Info);
         
-        // Update tray icon to show authenticated state
+        // Remove red dot - authenticated now (will show green/red after first collection)
         set_tray_icon_and_tooltip(
             app,
             "icon-default.png",
-            "✓ Authenticated - Monitoring will start shortly"
+            "✓ Authenticated - First collection starting..."
         );
         
         // Show success notification
         let _ = app.notification()
             .builder()
             .title("KlaayGuard")
-            .body("Successfully authenticated! Monitoring will begin shortly.")
+            .body("Successfully authenticated! First data collection starting...")
             .show();
     } else {
         log::warn!("deep_link_missing_token_param");
@@ -369,9 +369,14 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
 }
 
 async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
-    // Check if authenticated first - if not, keep default icon
+    // Check if authenticated first - if not, show red (error state)
     if state.auth_token.read().await.is_none() {
-        log::debug!("Skipping tray status update - not authenticated");
+        log::debug!("Not authenticated - showing red dot");
+        set_tray_icon_and_tooltip(
+            app,
+            "icon-error.png",
+            "🔴 Not authenticated - Click Login to start monitoring"
+        );
         return;
     }
     
@@ -906,7 +911,7 @@ pub fn run() {
                     *state_for_init.auth_token.write().await = Some(tok);
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
                     log::info!("✅ Authenticated - token loaded from keychain");
-            } else {
+                } else {
                     *state_for_init.auth_token.write().await = None;
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
                     log::warn!("⚠️  Not authenticated - no token found in keychain");
@@ -921,6 +926,14 @@ pub fn run() {
                         Ok(_) => log::info!("✅ Notification shown successfully"),
                         Err(e) => log::error!("❌ Failed to show notification: {}", e),
                     }
+                    
+                    // Set red dot for unauthenticated state (error state)
+                    log::info!("🔴 Setting red dot for unauthenticated state...");
+                    set_tray_icon_and_tooltip(
+                        &app_handle_for_init,
+                        "icon-error.png",
+                        "🔴 Not authenticated - Click Login to start monitoring"
+                    );
                 }
 
                 // Handle deep link
