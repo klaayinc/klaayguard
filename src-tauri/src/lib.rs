@@ -311,7 +311,7 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
                     if full_path.exists() {
                         log::info!("✅ Found resource icon at: {}", full_path.display());
                         found_path = Some(full_path);
-                    } else {
+        } else {
                         log::warn!("❌ Resource icon not found: {}", full_path.display());
                     }
                 }
@@ -347,11 +347,11 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
                             
                             if let Err(e) = tray.set_icon(Some(icon)) {
                                 log::error!("❌ Failed to update tray icon: {}", e);
-                            } else {
+                } else {
                                 log::info!("✅ Tray icon updated to: {}", icon_name);
-                            }
-                        }
-                        Err(e) => {
+                }
+            }
+            Err(e) => {
                             log::error!("❌ Failed to decode icon image {}: {}", icon_name, e);
                         }
                     }
@@ -369,27 +369,20 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
 }
 
 async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
-    // Check if authenticated first
+    // Check if authenticated first - if not, keep default icon
     if state.auth_token.read().await.is_none() {
         log::debug!("Skipping tray status update - not authenticated");
-        set_tray_icon_and_tooltip(
-            app,
-            "icon-unauthenticated.png",
-            "⚠️  Not authenticated - Click the tray icon and select Login to start monitoring"
-        );
         return;
     }
     
+    // Update last send status
+    *state.last_send_status.write().await = Some(success);
+    *state.last_send_at.write().await = Some(chrono::Utc::now());
+    
     let (tooltip, notification_msg, icon_name) = if success {
-        let timestamp = state.last_send_at.read().await.map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string());
-        let tooltip = if let Some(ts) = timestamp {
-            format!("✓ Last send: {} (Success)", ts)
-        } else {
-            "✓ Last send: Success".to_string()
-        };
-        (tooltip, None, "icon-success.png")
+        ("🟢 Last data send successful".to_string(), None, "icon-success.png")
     } else {
-        ("✗ Last send: Failed".to_string(), Some("Data send failed. Will retry in 1 hour."), "icon-error.png")
+        ("🔴 Last data send failed".to_string(), Some("Data send failed. Will retry in 1 hour."), "icon-error.png")
     };
     
     set_tray_icon_and_tooltip(app, icon_name, &tooltip);
@@ -913,14 +906,6 @@ pub fn run() {
                     *state_for_init.auth_token.write().await = Some(tok);
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
                     log::info!("✅ Authenticated - token loaded from keychain");
-                    
-                    // Set initial authenticated status
-                    log::info!("🎨 Setting authenticated tray icon...");
-                    set_tray_icon_and_tooltip(
-                        &app_handle_for_init,
-                        "icon-default.png",
-                        "✓ Authenticated - Monitoring will start shortly"
-                    );
             } else {
                     *state_for_init.auth_token.write().await = None;
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
@@ -936,14 +921,6 @@ pub fn run() {
                         Ok(_) => log::info!("✅ Notification shown successfully"),
                         Err(e) => log::error!("❌ Failed to show notification: {}", e),
                     }
-                    
-                    // Set unauthenticated icon
-                    log::info!("🎨 Setting unauthenticated tray icon...");
-                    set_tray_icon_and_tooltip(
-                        &app_handle_for_init,
-                        "icon-unauthenticated.png",
-                        "⚠️  Not authenticated - Click the tray icon and select Login to start monitoring"
-                    );
                 }
 
                 // Handle deep link
