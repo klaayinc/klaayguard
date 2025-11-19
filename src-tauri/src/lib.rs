@@ -256,6 +256,40 @@ async fn execute_sql_batch(
     Ok(all_results)
 }
 
+/// Validate that a token is valid by making a test API call
+async fn validate_token(api_base: &str, token: &str) -> Result<bool, String> {
+    log::info!("Validating token against API: {}", api_base);
+    
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+    
+    let cfg_url = format!("{}/klaayguard/config", api_base);
+    let response = client
+        .get(&cfg_url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
+        .header(reqwest::header::ACCEPT, "application/vnd.api+json")
+        .send()
+        .await
+        .map_err(|e| format!("Token validation request failed: {}", e))?;
+    
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        || response.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        log::warn!("Token validation failed: {} status", response.status());
+        return Ok(false);
+    }
+    
+    if response.status().is_success() {
+        log::info!("Token validation successful");
+        return Ok(true);
+    }
+    
+    log::warn!("Token validation returned unexpected status: {}", response.status());
+    Ok(false)
+}
+
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     *state.auth_token.write().await = None;
     let already_cleared = *state.keychain_cleared_this_session.read().await;
@@ -275,11 +309,10 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
         "🔴 Not authenticated - Click Login to start monitoring"
     );
     
-    // Open Earthenware for login
-    let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
-        .unwrap_or_else(|_| "https://app.klaay.com".to_string());
+    // Open Earthenware for login (use compile-time constant)
+    let earthenware_url = env!("APP_DEFAULT_EARTHENWARE_URL");
     let callback_url = "klaayguard://auth-callback";
-    let full_url = format!("{}?redirect_to={}", earthenware_url, callback_url);
+    let full_url = format!("{}/login?app=klaayguard&redirect_to={}", earthenware_url, callback_url);
     log::info!("🌐 Opening browser for re-authentication: {}", full_url);
     if let Err(e) = open::that(&full_url) {
         log::error!("❌ Failed to open browser: {}", e);
@@ -1059,10 +1092,10 @@ pub fn run() {
                     match event.id.as_ref() {
                         "login" => {
                             log::info!("🔐 Login requested from system tray");
-                            let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
-                                .unwrap_or_else(|_| "https://app.klaay.com".to_string());
+                            // Use compile-time constant for Earthenware URL
+                            let earthenware_url = env!("APP_DEFAULT_EARTHENWARE_URL");
                             let callback_url = "klaayguard://auth-callback";
-                            let full_url = format!("{}?redirect_to={}", earthenware_url, callback_url);
+                            let full_url = format!("{}/login?app=klaayguard&redirect_to={}", earthenware_url, callback_url);
                             log::info!("🌐 Opening browser: {}", full_url);
                             if let Err(e) = open::that(full_url) {
                                 log::error!("❌ Failed to open browser: {}", e);
@@ -1098,20 +1131,54 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 log::info!("🔑 Checking keychain for authentication token...");
                 if let Ok(Some(tok)) = keychain::load_token() {
-                    *state_for_init.auth_token.write().await = Some(tok);
-                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
-                    log::info!("✅ Authenticated - token loaded from keychain");
+                    log::info!("📦 Token found in keychain, validating...");
                     
-                    // Enable autostart if not already enabled
-                    if let Err(e) = enable_autostart(&app_handle_for_init).await {
-                        log::warn!("Failed to enable autostart: {}", e);
+                    // Validate token before accepting it
+                    let api_base = state_for_init.api_base_url.read().await.clone();
+                    match validate_token(&api_base, &tok).await {
+                        Ok(true) => {
+                            log::info!("✅ Token validated successfully");
+                            *state_for_init.auth_token.write().await = Some(tok);
+                            let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
+                            
+                            // Enable autostart if not already enabled
+                            if let Err(e) = enable_autostart(&app_handle_for_init).await {
+                                log::warn!("Failed to enable autostart: {}", e);
+                            }
+                            
+                            // Update tray menu to show status
+                            update_tray_menu(&app_handle_for_init, &state_for_init).await;
+                            
+                            // Update tray icon to green (validated and working)
+                            update_tray_status(&app_handle_for_init, &state_for_init, true).await;
+                        }
+                        Ok(false) | Err(_) => {
+                            log::warn!("❌ Token validation failed - token is invalid for this environment");
+                            // Clear the invalid token
+                            let _ = keychain::delete_token();
+                            *state_for_init.auth_token.write().await = None;
+                            *state_for_init.keychain_cleared_this_session.write().await = true;
+                            let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
+                            
+                            // Update tray menu to show login option
+                            update_tray_menu(&app_handle_for_init, &state_for_init).await;
+                            
+                            // Show notification about invalid token
+                            log::info!("📢 Showing invalid token notification...");
+                            let _ = app_handle_for_init.notification()
+                                .builder()
+                                .title("KlaayGuard - Login Required")
+                                .body("Your authentication token is invalid. Please login again.")
+                                .show();
+                            
+                            // Set red dot for invalid token state
+                            set_tray_icon_and_tooltip(
+                                &app_handle_for_init,
+                                "icon-error.png",
+                                "🔴 Authentication invalid - Click Login to start monitoring"
+                            );
+                        }
                     }
-                    
-                    // Update tray menu to show status
-                    update_tray_menu(&app_handle_for_init, &state_for_init).await;
-                    
-                    // Update tray icon based on last collection status (or default if none)
-                    update_tray_status(&app_handle_for_init, &state_for_init, true).await;
                 } else {
                     *state_for_init.auth_token.write().await = None;
                     let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));

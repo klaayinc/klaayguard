@@ -21,15 +21,31 @@ fn main() {
     };
     let api_base = std::env::var("VITE_API_BASE_URL").unwrap_or_else(|_| default_api.to_string());
 
+    // Compute default Earthenware URL if not explicitly provided
+    let default_earthenware = match klaay_env.as_str() {
+        "staging" => "https://app.klaay.dev",
+        "development" => "http://localhost:5173",
+        _ => "https://app.klaay.com",
+    };
+    let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
+        .unwrap_or_else(|_| default_earthenware.to_string());
+
     // Debug output
     println!("cargo:warning=default_api: {}", default_api);
     println!("cargo:warning=final api_base: {}", api_base);
+    println!("cargo:warning=default_earthenware: {}", default_earthenware);
+    println!("cargo:warning=final earthenware_url: {}", earthenware_url);
 
-    // Expose compile-time default for Rust side
+    // Expose compile-time defaults for Rust side
     println!("cargo:rustc-env=APP_DEFAULT_API_BASE_URL={}", api_base);
+    println!("cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}", earthenware_url);
     println!(
         "cargo:warning=Setting APP_DEFAULT_API_BASE_URL to: {}",
         api_base
+    );
+    println!(
+        "cargo:warning=Setting APP_DEFAULT_EARTHENWARE_URL to: {}",
+        earthenware_url
     );
 
     let mut windows = tauri_build::WindowsAttributes::new();
