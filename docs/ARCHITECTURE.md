@@ -217,6 +217,8 @@ pub struct AppState {
     pub last_send_status: RwLock<Option<bool>>,
     pub last_send_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     pub keychain_cleared_this_session: RwLock<bool>,
+    pub status_sender: RwLock<Option<watch::Sender<StatusSnapshot>>>,
+    pub status_snapshot: RwLock<Option<StatusSnapshot>>,
 }
 ```
 
@@ -231,6 +233,64 @@ pub struct AppState {
 - `last_send_status`: Updated after each data send attempt
 - `last_send_at`: Updated with timestamp of last send
 - `keychain_cleared_this_session`: Prevents repeated keychain prompts
+- `status_sender`: Watch channel sender for reactive status updates
+- `status_snapshot`: Latest status snapshot for immediate reads
+
+### 6.1. Unified Status Management
+
+**Location**: `src-tauri/src/status.rs`
+
+**Purpose**: Single source of truth for application status, ensuring all UI components (tray icon, tooltip, context menu) stay synchronized.
+
+**Status Enum**:
+```rust
+pub enum AgentStatus {
+    Unauthenticated,
+    Authenticating,
+    Ready { last_success: Option<DateTime<Utc>> },
+    SendFailed { error: String, last_attempt: DateTime<Utc> },
+}
+```
+
+**StatusSnapshot**:
+- Contains current `AgentStatus`, API URL, and timestamp
+- Provides methods for UI rendering:
+  - `tray_icon()`: Returns icon filename based on status
+  - `tray_tooltip()`: Returns tooltip text
+  - `menu_status_text()`: Returns context menu status text
+  - `is_operational()`: Checks if agent is ready
+
+**Reactive Updates**:
+- Uses `tokio::sync::watch::channel` for broadcasting status changes
+- Single `StatusController::set_status()` method updates all state
+- Reactive observer task watches status channel and updates tray UI automatically
+- No manual UI update calls needed - all components react to status changes
+
+**Status Flow**:
+```mermaid
+flowchart TD
+    A[Status Change] --> B[StatusController::set_status]
+    B --> C[Update AppState.status_snapshot]
+    B --> D[Broadcast via watch channel]
+    B --> E[Persist to store]
+    B --> F[Emit Tauri event]
+    D --> G[Reactive Observer Task]
+    G --> H[Update Tray Menu]
+    G --> I[Update Tray Icon]
+    G --> J[Update Tooltip]
+    F --> K[Frontend Listeners]
+```
+
+**Persistence**:
+- Status persisted to `tauri-plugin-store` for restoration on restart
+- Stored in `app_data_dir/status.json`
+- Loaded on startup and broadcast to observers
+
+**Benefits**:
+- **Single Source of Truth**: All UI derives from one `StatusSnapshot`
+- **Reactive**: UI updates automatically when status changes
+- **Consistent**: Tray icon, tooltip, and menu always show matching status
+- **Testable**: Status logic separated from UI rendering
 
 ### 7. Notification System
 

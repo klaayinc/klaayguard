@@ -6,6 +6,8 @@
 //! - Shows status via tray icon tooltip
 
 mod keychain;
+mod status;
+
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -13,7 +15,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_shell::ShellExt;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 
 /// Shared application state
 pub struct AppState {
@@ -22,9 +24,13 @@ pub struct AppState {
     pub last_send_status: RwLock<Option<bool>>, // true = success, false = failure
     pub last_send_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     pub keychain_cleared_this_session: RwLock<bool>,
+    /// Watch channel sender for reactive status updates
+    pub status_sender: RwLock<Option<watch::Sender<status::StatusSnapshot>>>,
+    /// Latest status snapshot for immediate reads
+    pub status_snapshot: RwLock<Option<status::StatusSnapshot>>,
 }
 
-fn add_breadcrumb(category: &str, message: &str, level: Level) {
+pub(crate) fn add_breadcrumb(category: &str, message: &str, level: Level) {
     let mut data = std::collections::BTreeMap::new();
     data.insert(
         "ts".to_string(),
@@ -73,8 +79,8 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         }
         
         log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
-            *state.auth_token.write().await = Some(tok.clone());
-            *state.keychain_cleared_this_session.write().await = false;
+        *state.auth_token.write().await = Some(tok.clone());
+        *state.keychain_cleared_this_session.write().await = false;
         let _ = keychain::save_token(&tok);
         log::info!("deep_link_token_saved_to_keychain");
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
@@ -86,8 +92,12 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
             log::warn!("Failed to enable autostart: {}", e);
         }
         
-        // Update tray menu to show logout option
-        update_tray_menu(app, state).await;
+        // Set authenticating status first
+        let _ = status::StatusController::set_status(
+            app,
+            state,
+            status::AgentStatus::Authenticating,
+        ).await;
         
         // Show success notification
         let _ = app.notification()
@@ -97,21 +107,22 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
             .show();
         
         // Immediately trigger data collection to show green/red dot
-        set_tray_icon_and_tooltip(
-            app,
-            "icon-default.png",
-            "✓ Authenticated - Collecting data..."
-        );
-        
         log::info!("deep_link_triggering_immediate_collection");
         match run_cycle(app, state).await {
             Ok(_) => {
                 log::info!("deep_link_immediate_collection_completed");
-                update_tray_status(app, state, true).await;
+                // Status will be updated by run_cycle based on success/failure
             }
             Err(e) => {
                 log::error!("deep_link_immediate_collection_failed error={}", e);
-                update_tray_status(app, state, false).await;
+                status::StatusController::set_status(
+                    app,
+                    state,
+                    status::AgentStatus::SendFailed {
+                        error: e,
+                        last_attempt: chrono::Utc::now(),
+                    },
+                ).await.ok();
             }
         }
     } else {
@@ -170,7 +181,10 @@ async fn get_api_base_url_cmd(state: tauri::State<'_, Arc<AppState>>) -> Result<
 }
 
 fn get_api_base_url() -> String {
-    env!("APP_DEFAULT_API_BASE_URL").to_string()
+    // Check runtime env var first, fall back to compile-time default
+    std::env::var("VITE_API_BASE_URL")
+        .or_else(|_| std::env::var("APP_DEFAULT_API_BASE_URL"))
+        .unwrap_or_else(|_| env!("APP_DEFAULT_API_BASE_URL").to_string())
 }
 
 #[tauri::command]
@@ -291,47 +305,11 @@ async fn validate_token(api_base: &str, token: &str) -> Result<bool, String> {
 }
 
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
-    *state.auth_token.write().await = None;
-    let already_cleared = *state.keychain_cleared_this_session.read().await;
-    if !already_cleared {
-        let _ = keychain::delete_token();
-        *state.keychain_cleared_this_session.write().await = true;
-    }
-    log::warn!("Authentication invalidated");
-    
-    // Update tray menu to show login option
-    update_tray_menu(app, state).await;
-    
-    // Update tray icon to red (unauthenticated)
-    set_tray_icon_and_tooltip(
+    status::StatusController::set_status(
         app,
-        "icon-error.png",
-        "🔴 Not authenticated - Click Login to start monitoring"
-    );
-    
-    // Open Earthenware for login (use compile-time constant)
-    let earthenware_url = env!("APP_DEFAULT_EARTHENWARE_URL");
-    let callback_url = "klaayguard://auth-callback";
-    let full_url = format!("{}/login?app=klaayguard&redirect_to={}", earthenware_url, callback_url);
-    log::info!("🌐 Opening browser for re-authentication: {}", full_url);
-    if let Err(e) = open::that(&full_url) {
-        log::error!("❌ Failed to open browser: {}", e);
-    } else {
-        log::info!("✅ Browser opened successfully");
-    }
-    
-    // Show notification
-    let _ = app.notification()
-        .builder()
-        .title("KlaayGuard - Authentication Required")
-        .body("Your session has expired. Please sign in again.")
-        .show();
-    
-    let _ = app.emit("auth:invalidated", ());
-    let _ = app.emit("auth:status", json!({ "authenticated": false }));
-    add_breadcrumb("auth", "auth_invalidated", Level::Warning);
-    sentry::capture_message("auth_invalidated", Level::Warning);
-    Ok(())
+        state,
+        status::AgentStatus::Unauthenticated,
+    ).await
 }
 
 fn collection_interval_seconds() -> u64 {
@@ -362,7 +340,64 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
     Ok(serial.to_string())
 }
 
-/// Build tray menu dynamically based on authentication status
+/// Build tray menu dynamically based on status snapshot
+fn build_tray_menu_from_snapshot(app: &tauri::AppHandle, snapshot: &status::StatusSnapshot) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+    use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+    
+    let status_text = snapshot.menu_status_text();
+    
+    // Status indicator (disabled, non-clickable)
+    let status_item = MenuItem::with_id(app, "status", &status_text, false, None::<&str>)?;
+    
+    // Get API URL and version for info display
+    let api_url = snapshot.api_base_url
+        .replace("https://", "")
+        .replace("http://", "");
+    let version = env!("CARGO_PKG_VERSION");
+    
+    // Create info items at the bottom
+    let separator_top = PredefinedMenuItem::separator(app)?;
+    let api_info = MenuItem::with_id(
+        app,
+        "api_info",
+        &format!("API: {}", api_url),
+        false,
+        None::<&str>
+    )?;
+    let version_info = MenuItem::with_id(
+        app,
+        "version_info",
+        &format!("v{}", version),
+        false,
+        None::<&str>
+    )?;
+    
+    // Build menu based on authentication status
+    if !snapshot.is_operational() {
+        let separator = PredefinedMenuItem::separator(app)?;
+        let login_item = MenuItem::with_id(app, "login", "Login", true, None::<&str>)?;
+        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
+            &status_item,
+            &separator,
+            &login_item,
+            &separator_top,
+            &api_info,
+            &version_info,
+        ];
+        Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    } else {
+        // When authenticated, only show status and info
+        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
+            &status_item,
+            &separator_top,
+            &api_info,
+            &version_info,
+        ];
+        Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    }
+}
+
+/// Build tray menu dynamically based on authentication status (legacy, for initial setup)
 fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     
@@ -423,20 +458,51 @@ fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tau
     }
 }
 
-/// Update tray menu based on current authentication status
-async fn update_tray_menu(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    let is_authenticated = state.auth_token.read().await.is_some();
-    
-    if let Ok(menu) = build_tray_menu(app, is_authenticated) {
+/// Spawn a reactive observer task that watches status changes and updates tray UI
+fn spawn_status_observer(app: tauri::AppHandle, mut status_rx: watch::Receiver<status::StatusSnapshot>) {
+    tauri::async_runtime::spawn(async move {
+        log::info!("📡 Status observer started");
+        
+        // Process initial status immediately
+        let mut current_snapshot = status_rx.borrow().clone();
+        update_tray_from_snapshot(&app, &current_snapshot).await;
+        
+        // Watch for changes
+        loop {
+            match status_rx.changed().await {
+                Ok(()) => {
+                    current_snapshot = status_rx.borrow().clone();
+                    log::debug!("📡 Status changed: {:?}", current_snapshot.status);
+                    update_tray_from_snapshot(&app, &current_snapshot).await;
+                }
+                Err(_) => {
+                    log::error!("📡 Status channel closed, observer stopping");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Update tray menu and icon from a status snapshot
+async fn update_tray_from_snapshot(app: &tauri::AppHandle, snapshot: &status::StatusSnapshot) {
+    // Update menu
+    if let Ok(menu) = build_tray_menu_from_snapshot(app, snapshot) {
         if let Some(tray) = app.tray_by_id("main") {
             if let Err(e) = tray.set_menu(Some(menu)) {
                 log::error!("Failed to update tray menu: {}", e);
             } else {
-                log::info!("✓ Tray menu updated (authenticated: {})", is_authenticated);
+                log::debug!("✓ Tray menu updated");
             }
         }
     }
+    
+    // Update icon and tooltip
+    let icon_name = snapshot.tray_icon();
+    let tooltip = snapshot.tray_tooltip();
+    set_tray_icon_and_tooltip(app, icon_name, &tooltip);
 }
+
 
 /// Helper function to set tray icon and tooltip
 fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &str) {
@@ -556,42 +622,6 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
     }
 }
 
-async fn update_tray_status(app: &tauri::AppHandle, state: &Arc<AppState>, success: bool) {
-    // Check if authenticated first - if not, show red (error state)
-    if state.auth_token.read().await.is_none() {
-        log::debug!("Not authenticated - showing red dot");
-        set_tray_icon_and_tooltip(
-            app,
-            "icon-error.png",
-            "🔴 Not authenticated - Click Login to start monitoring"
-        );
-        return;
-    }
-    
-    // Update last send status
-    *state.last_send_status.write().await = Some(success);
-    *state.last_send_at.write().await = Some(chrono::Utc::now());
-    
-    let (tooltip, notification_msg, icon_name) = if success {
-        ("🟢 Last data send successful".to_string(), None, "icon-success.png")
-    } else {
-        ("🔴 Last data send failed".to_string(), Some("Data send failed. Will retry in 1 hour."), "icon-error.png")
-    };
-    
-    set_tray_icon_and_tooltip(app, icon_name, &tooltip);
-    
-    // Show notification on failure
-    if let Some(msg) = notification_msg {
-        let _ = app.notification()
-            .builder()
-            .title("KlaayGuard")
-            .body(msg)
-            .show();
-    }
-    
-    *state.last_send_status.write().await = Some(success);
-    *state.last_send_at.write().await = Some(chrono::Utc::now());
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonApiResource {
@@ -635,7 +665,14 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
     }
     if !cfg_resp.status().is_success() {
         sentry::capture_message("collection_error_config_non_success", Level::Warning);
-        update_tray_status(app, state, false).await;
+        status::StatusController::set_status(
+            app,
+            state,
+            status::AgentStatus::SendFailed {
+                error: format!("Config fetch failed: {}", cfg_resp.status()),
+                last_attempt: chrono::Utc::now(),
+            },
+        ).await?;
         return Ok(());
     }
 
@@ -704,11 +741,20 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
             .await;
     
     // 4) Update status
+    let now = chrono::Utc::now();
     match post_result {
         Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED => {
             log::info!("Data send successful");
             add_breadcrumb("collection", "post_success", Level::Info);
-            update_tray_status(app, state, true).await;
+            *state.last_send_status.write().await = Some(true);
+            *state.last_send_at.write().await = Some(now);
+            status::StatusController::set_status(
+                app,
+                state,
+                status::AgentStatus::Ready {
+                    last_success: Some(now),
+                },
+            ).await?;
         }
         Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::FORBIDDEN => {
             add_breadcrumb("collection", "auth_invalidated_on_post", Level::Warning);
@@ -717,12 +763,30 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
         Ok(resp) => {
             log::error!("Data send failed: status {}", resp.status().as_u16());
             add_breadcrumb("collection", &format!("post_failed:{}", resp.status().as_u16()), Level::Error);
-            update_tray_status(app, state, false).await;
+            *state.last_send_status.write().await = Some(false);
+            *state.last_send_at.write().await = Some(now);
+            status::StatusController::set_status(
+                app,
+                state,
+                status::AgentStatus::SendFailed {
+                    error: format!("HTTP {}", resp.status().as_u16()),
+                    last_attempt: now,
+                },
+            ).await?;
         }
         Err(e) => {
             log::error!("Data send error: {}", e);
             add_breadcrumb("collection", &format!("post_error:{}", e), Level::Error);
-            update_tray_status(app, state, false).await;
+            *state.last_send_status.write().await = Some(false);
+            *state.last_send_at.write().await = Some(now);
+            status::StatusController::set_status(
+                app,
+                state,
+                status::AgentStatus::SendFailed {
+                    error: e.to_string(),
+                    last_attempt: now,
+                },
+            ).await?;
         }
     }
 
@@ -739,17 +803,21 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         match run_cycle(&app, &state).await {
             Ok(_) => {
                 log::info!("Initial collection cycle completed successfully");
-                // Only update tray status if we're authenticated (collection actually ran)
-                if state.auth_token.read().await.is_some() {
-                    update_tray_status(&app, &state, true).await;
-                }
+                // Status is updated by run_cycle based on success/failure
             }
             Err(e) => {
                 log::error!("Initial collection cycle error: {}", e);
                 add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
-                // Only update tray status if we're authenticated
+                // Only update status if we're authenticated (collection actually attempted)
                 if state.auth_token.read().await.is_some() {
-                    update_tray_status(&app, &state, false).await;
+                    let _ = status::StatusController::set_status(
+                        &app,
+                        &state,
+                        status::AgentStatus::SendFailed {
+                            error: e,
+                            last_attempt: chrono::Utc::now(),
+                        },
+                    ).await;
                 }
             }
         }
@@ -763,17 +831,21 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             match run_cycle(&app, &state).await {
                 Ok(_) => {
                     log::info!("Collection cycle completed successfully");
-                    // Only update tray status if we're authenticated (collection actually ran)
-                    if state.auth_token.read().await.is_some() {
-                        update_tray_status(&app, &state, true).await;
-                    }
+                    // Status is updated by run_cycle based on success/failure
                 }
                 Err(e) => {
                     log::error!("Collection cycle error: {}", e);
                     add_breadcrumb("collection", &format!("cycle_error:{}", e), Level::Error);
-                    // Only update tray status if we're authenticated
+                    // Only update status if we're authenticated (collection actually attempted)
                     if state.auth_token.read().await.is_some() {
-                        update_tray_status(&app, &state, false).await;
+                        let _ = status::StatusController::set_status(
+                            &app,
+                            &state,
+                            status::AgentStatus::SendFailed {
+                                error: e,
+                                last_attempt: chrono::Utc::now(),
+                            },
+                        ).await;
                     }
                 }
             }
@@ -1007,12 +1079,21 @@ async fn download_and_install_update(
 pub fn run() {
     let default_api = get_api_base_url();
     
+    // Initialize status watch channel with unauthenticated state
+    let initial_snapshot = status::StatusSnapshot::new(
+        status::AgentStatus::Unauthenticated,
+        default_api.clone(),
+    );
+    let (status_tx, status_rx) = watch::channel(initial_snapshot.clone());
+    
     let state = Arc::new(AppState {
         auth_token: RwLock::new(None),
         api_base_url: RwLock::new(default_api.clone()),
         last_send_status: RwLock::new(None),
         last_send_at: RwLock::new(None),
         keychain_cleared_this_session: RwLock::new(false),
+        status_sender: RwLock::new(Some(status_tx)),
+        status_snapshot: RwLock::new(Some(initial_snapshot)),
     });
 
     let app = tauri::Builder::default()
@@ -1038,6 +1119,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None::<Vec<&str>>))
+        .plugin(tauri_plugin_store::Builder::default().build())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             {
@@ -1092,8 +1174,9 @@ pub fn run() {
                     match event.id.as_ref() {
                         "login" => {
                             log::info!("🔐 Login requested from system tray");
-                            // Use compile-time constant for Earthenware URL
-                            let earthenware_url = env!("APP_DEFAULT_EARTHENWARE_URL");
+                            // Check runtime env var first, fall back to compile-time default
+                            let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
+                                .unwrap_or_else(|_| env!("APP_DEFAULT_EARTHENWARE_URL").to_string());
                             let callback_url = "klaayguard://auth-callback";
                             let full_url = format!("{}/login?app=klaayguard&redirect_to={}", earthenware_url, callback_url);
                             log::info!("🌐 Opening browser: {}", full_url);
@@ -1124,6 +1207,24 @@ pub fn run() {
 
             log::info!("✅ Tray icon created successfully");
 
+            // Spawn reactive status observer
+            let app_handle_for_observer = app.handle().clone();
+            let state_for_persist = state_for_loop.clone();
+            spawn_status_observer(app_handle_for_observer, status_rx);
+            
+            // Load persisted status if available (after observer is spawned)
+            let app_handle_for_load = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(persisted_snapshot) = status::StatusController::load_persisted_status(&app_handle_for_load).await {
+                    log::info!("📦 Loaded persisted status: {:?}", persisted_snapshot.status);
+                    *state_for_persist.status_snapshot.write().await = Some(persisted_snapshot.clone());
+                    // Broadcast persisted status to observers
+                    if let Some(sender) = state_for_persist.status_sender.read().await.as_ref() {
+                        let _ = sender.send(persisted_snapshot);
+                    }
+                }
+            });
+
             // NOW load token and update tray (after tray exists!)
             let app_handle_for_init = app.handle().clone();
             let state_for_init = state_for_loop.clone();
@@ -1132,6 +1233,13 @@ pub fn run() {
                 log::info!("🔑 Checking keychain for authentication token...");
                 if let Ok(Some(tok)) = keychain::load_token() {
                     log::info!("📦 Token found in keychain, validating...");
+                    
+                    // Set authenticating status
+                    let _ = status::StatusController::set_status(
+                        &app_handle_for_init,
+                        &state_for_init,
+                        status::AgentStatus::Authenticating,
+                    ).await;
                     
                     // Validate token before accepting it
                     let api_base = state_for_init.api_base_url.read().await.clone();
@@ -1146,65 +1254,39 @@ pub fn run() {
                                 log::warn!("Failed to enable autostart: {}", e);
                             }
                             
-                            // Update tray menu to show status
-                            update_tray_menu(&app_handle_for_init, &state_for_init).await;
-                            
-                            // Update tray icon to green (validated and working)
-                            update_tray_status(&app_handle_for_init, &state_for_init, true).await;
+                            // Set ready status (will trigger immediate collection cycle)
+                            let _ = status::StatusController::set_status(
+                                &app_handle_for_init,
+                                &state_for_init,
+                                status::AgentStatus::Ready {
+                                    last_success: None,
+                                },
+                            ).await;
                         }
                         Ok(false) | Err(_) => {
                             log::warn!("❌ Token validation failed - token is invalid for this environment");
                             // Clear the invalid token
                             let _ = keychain::delete_token();
-                            *state_for_init.auth_token.write().await = None;
                             *state_for_init.keychain_cleared_this_session.write().await = true;
-                            let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
                             
-                            // Update tray menu to show login option
-                            update_tray_menu(&app_handle_for_init, &state_for_init).await;
-                            
-                            // Show notification about invalid token
-                            log::info!("📢 Showing invalid token notification...");
-                            let _ = app_handle_for_init.notification()
-                                .builder()
-                                .title("KlaayGuard - Login Required")
-                                .body("Your authentication token is invalid. Please login again.")
-                                .show();
-                            
-                            // Set red dot for invalid token state
-                            set_tray_icon_and_tooltip(
+                            // Set unauthenticated status
+                            let _ = status::StatusController::set_status(
                                 &app_handle_for_init,
-                                "icon-error.png",
-                                "🔴 Authentication invalid - Click Login to start monitoring"
-                            );
+                                &state_for_init,
+                                status::AgentStatus::Unauthenticated,
+                            ).await;
                         }
                     }
                 } else {
                     *state_for_init.auth_token.write().await = None;
-                    let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": false }));
                     log::warn!("⚠️  Not authenticated - no token found in keychain");
                     
-                    // Update tray menu to show login option
-                    update_tray_menu(&app_handle_for_init, &state_for_init).await;
-                    
-                    // Show notification prompting login
-                    log::info!("📢 Showing login notification...");
-                    match app_handle_for_init.notification()
-                        .builder()
-                        .title("KlaayGuard - Login Required")
-                        .body("Please login to start monitoring. Click the tray icon (top-right menu bar) and select Login.")
-                        .show() {
-                        Ok(_) => log::info!("✅ Notification shown successfully"),
-                        Err(e) => log::error!("❌ Failed to show notification: {}", e),
-                    }
-                    
-                    // Set red dot for unauthenticated state (error state)
-                    log::info!("🔴 Setting red dot for unauthenticated state...");
-                    set_tray_icon_and_tooltip(
+                    // Set unauthenticated status
+                    let _ = status::StatusController::set_status(
                         &app_handle_for_init,
-                        "icon-error.png",
-                        "🔴 Not authenticated - Click Login to start monitoring"
-                    );
+                        &state_for_init,
+                        status::AgentStatus::Unauthenticated,
+                    ).await;
                 }
 
                 // Handle deep link
@@ -1260,12 +1342,18 @@ mod tests {
     /// Test that AppState can be created with default values
     #[tokio::test]
     async fn test_app_state_creation() {
+        let (status_tx, _status_rx) = watch::channel(status::StatusSnapshot::new(
+            status::AgentStatus::Unauthenticated,
+            "https://api.test.com".to_string(),
+        ));
         let state = Arc::new(AppState {
             auth_token: RwLock::new(None),
             api_base_url: RwLock::new("https://api.test.com".to_string()),
             last_send_status: RwLock::new(None),
             last_send_at: RwLock::new(None),
             keychain_cleared_this_session: RwLock::new(false),
+            status_sender: RwLock::new(Some(status_tx)),
+            status_snapshot: RwLock::new(None),
         });
         
         assert!(state.auth_token.read().await.is_none());
@@ -1327,12 +1415,18 @@ mod tests {
     async fn test_update_tray_status_success() {
         // This test verifies that update_tray_status is truly async
         // and doesn't use block_on (which would panic in async context)
+        let (status_tx, _status_rx) = watch::channel(status::StatusSnapshot::new(
+            status::AgentStatus::Unauthenticated,
+            "https://api.test.com".to_string(),
+        ));
         let state = Arc::new(AppState {
             auth_token: RwLock::new(Some("test_token".to_string())),
             api_base_url: RwLock::new("https://api.test.com".to_string()),
             last_send_status: RwLock::new(None),
             last_send_at: RwLock::new(None),
             keychain_cleared_this_session: RwLock::new(false),
+            status_sender: RwLock::new(Some(status_tx)),
+            status_snapshot: RwLock::new(None),
         });
         
         // This would panic if update_tray_status used block_on internally
