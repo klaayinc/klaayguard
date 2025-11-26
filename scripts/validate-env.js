@@ -35,11 +35,16 @@ function parseEnvFile(filePath) {
       return
     }
 
-    // Parse key=value
+    // Parse key=value (handles quoted values)
     const match = line.match(/^([^=]+)=(.*)$/)
     if (match) {
       const key = match[1].trim()
-      const value = match[2].trim()
+      let value = match[2].trim()
+      // Remove surrounding quotes if present
+      if ((value.startsWith('"') && value.endsWith('"')) ||
+          (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1)
+      }
       vars[key] = value
     }
   })
