@@ -181,9 +181,9 @@ async fn get_api_base_url_cmd(state: tauri::State<'_, Arc<AppState>>) -> Result<
 }
 
 fn get_api_base_url() -> String {
-    // Check runtime env var first, fall back to compile-time default
+    // Use compile-time default from build.rs
+    // Runtime override via VITE_API_BASE_URL is checked first for development flexibility
     std::env::var("VITE_API_BASE_URL")
-        .or_else(|_| std::env::var("APP_DEFAULT_API_BASE_URL"))
         .unwrap_or_else(|_| env!("APP_DEFAULT_API_BASE_URL").to_string())
 }
 

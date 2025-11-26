@@ -99,10 +99,10 @@ impl StatusSnapshot {
             AgentStatus::Unauthenticated => "🔴 Not Authenticated".to_string(),
             AgentStatus::Authenticating => "🟡 Authenticating...".to_string(),
             AgentStatus::Ready { last_success } => {
-                if last_success.is_some() {
-                    "🟢 KlaayGuard is running".to_string()
+                if let Some(success_time) = last_success {
+                    format!("🟢 Last send: {}", success_time.format("%H:%M:%S"))
                 } else {
-                    "🟡 KlaayGuard is starting...".to_string()
+                    "🟢 KlaayGuard is running".to_string()
                 }
             }
             AgentStatus::SendFailed { .. } => "🔴 Data send failed".to_string(),
