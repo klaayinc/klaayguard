@@ -33,6 +33,14 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
+      - name: Setup environment files
+        run: |
+          chmod +x scripts/setup-env.sh
+          ./scripts/setup-env.sh
+
+      - name: Validate environment
+        run: node scripts/validate-env.js
+
       - name: Build for staging
         run: ./bin/build staging
 
@@ -73,6 +81,14 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
 
+      - name: Setup environment files
+        run: |
+          chmod +x scripts/setup-env.sh
+          ./scripts/setup-env.sh
+
+      - name: Validate environment
+        run: node scripts/validate-env.js
+
       - name: Build for staging
         run: ./bin/build staging
 
@@ -99,6 +115,15 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
+
+      - name: Setup environment files
+        shell: bash
+        run: |
+          chmod +x scripts/setup-env.sh
+          ./scripts/setup-env.sh
+
+      - name: Validate environment
+        run: node scripts/validate-env.js
 
       - name: Build for staging
         shell: bash
