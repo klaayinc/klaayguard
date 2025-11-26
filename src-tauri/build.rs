@@ -1,9 +1,6 @@
 fn main() {
     // Validate required environment variables
-    let required_vars = vec![
-        "VITE_API_BASE_URL",
-        "VITE_EARTHENWARE_URL",
-    ];
+    let required_vars = vec!["VITE_API_BASE_URL", "VITE_EARTHENWARE_URL"];
 
     let mut missing_vars = Vec::new();
     for var in &required_vars {
@@ -16,18 +13,18 @@ fn main() {
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         eprintln!("❌ Build Error: Required environment variables are missing");
         eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        eprintln!("");
+        eprintln!();
         eprintln!("Missing variables:");
         for var in &missing_vars {
             eprintln!("  - {}", var);
         }
-        eprintln!("");
+        eprintln!();
         eprintln!("Solution:");
         eprintln!("  1. Run: scripts/setup-env.sh");
         eprintln!("  2. Build using: bin/build <environment>");
-        eprintln!("");
+        eprintln!();
         eprintln!("See docs/ENVIRONMENT.md for details.");
-        eprintln!("");
+        eprintln!();
         panic!("Build failed: missing required environment variables");
     }
 
@@ -40,7 +37,7 @@ fn main() {
     let debug_enabled = std::env::var("KLAAY_DEBUG")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
-    
+
     if debug_enabled || cfg!(debug_assertions) {
         println!("cargo:warning=KLAAY_ENV: {}", klaay_env);
         println!("cargo:warning=VITE_API_BASE_URL: {}", api_base);
@@ -49,7 +46,10 @@ fn main() {
 
     // Expose compile-time defaults for Rust side
     println!("cargo:rustc-env=APP_DEFAULT_API_BASE_URL={}", api_base);
-    println!("cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}", earthenware_url);
+    println!(
+        "cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}",
+        earthenware_url
+    );
 
     let mut windows = tauri_build::WindowsAttributes::new();
     windows = windows.app_manifest(

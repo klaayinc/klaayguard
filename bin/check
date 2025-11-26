@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Check script for KlaayGuard
+# Runs formatting, linting, and tests
+# Usage: bin/check
+
+set -e
+
+echo "🔍 Running pre-commit checks..."
+echo ""
+
+# Get script directory and change to project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.."
+
+# Load environment variables for build.rs
+source scripts/load-env.sh development > /dev/null 2>&1
+
+# Change to src-tauri directory
+cd src-tauri
+
+# 1. Check formatting
+echo "📝 Checking code formatting..."
+if ! cargo fmt --check; then
+    echo "❌ Code formatting failed. Run: cargo fmt"
+    exit 1
+fi
+echo "✅ Code formatting passed"
+echo ""
+
+# 2. Run clippy (linting)
+echo "🔎 Running clippy..."
+if ! cargo clippy --all-targets --all-features -- -D warnings; then
+    echo "❌ Clippy failed. Fix warnings above."
+    exit 1
+fi
+echo "✅ Clippy passed"
+echo ""
+
+# 3. Run tests
+echo "🧪 Running tests..."
+if ! cargo test --quiet; then
+    echo "❌ Tests failed. Fix failing tests above."
+    exit 1
+fi
+echo "✅ Tests passed"
+echo ""
+
+echo "✨ All checks passed!"
+

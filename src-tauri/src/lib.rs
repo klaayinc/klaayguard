@@ -1,6 +1,6 @@
 // Copyright (C) 2024 KLAAY, Inc.
 //! KlaayGuard: System Tray-Only Security Agent
-//! 
+//!
 //! - Collects system data hourly via osquery
 //! - Immediately sends data to API (no local persistence)
 //! - Shows status via tray icon tooltip
@@ -53,9 +53,9 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         return;
     }
     log::info!("deep_link_received url={}", url);
-    
+
     let token_opt = {
-        let qs = url.splitn(2, '?').nth(1).unwrap_or("");
+        let qs = url.split_once('?').map(|x| x.1).unwrap_or("");
         let mut out: Option<String> = None;
         for pair in qs.split('&') {
             let mut it = pair.splitn(2, '=');
@@ -77,8 +77,11 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
             log::warn!("deep_link_invalid_token_shape dot_count={}", dot_count);
             return;
         }
-        
-        log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
+
+        log::info!(
+            "deep_link_token_parsed length={} saving_to_keychain",
+            tok.len()
+        );
         *state.auth_token.write().await = Some(tok.clone());
         *state.keychain_cleared_this_session.write().await = false;
         let _ = keychain::save_token(&tok);
@@ -86,26 +89,25 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
         add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
         sentry::capture_message("deep_link_token_saved", Level::Info);
-        
+
         // Enable autostart so KlaayGuard launches on login
         if let Err(e) = enable_autostart(app).await {
             log::warn!("Failed to enable autostart: {}", e);
         }
-        
+
         // Set authenticating status first
-        let _ = status::StatusController::set_status(
-            app,
-            state,
-            status::AgentStatus::Authenticating,
-        ).await;
-        
+        let _ =
+            status::StatusController::set_status(app, state, status::AgentStatus::Authenticating)
+                .await;
+
         // Show success notification
-        let _ = app.notification()
+        let _ = app
+            .notification()
             .builder()
             .title("KlaayGuard")
             .body("Successfully authenticated! Collecting data now...")
             .show();
-        
+
         // Immediately trigger data collection to show green/red dot
         log::info!("deep_link_triggering_immediate_collection");
         match run_cycle(app, state).await {
@@ -122,7 +124,9 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
                         error: e,
                         last_attempt: chrono::Utc::now(),
                     },
-                ).await.ok();
+                )
+                .await
+                .ok();
             }
         }
     } else {
@@ -133,7 +137,11 @@ async fn handle_deep_link_url_async(app: &tauri::AppHandle, state: &Arc<AppState
 /// Scan process args for deep link
 async fn try_handle_deep_link_from_args_async(app: &tauri::AppHandle, state: &Arc<AppState>) {
     let args: Vec<String> = std::env::args().collect();
-    log::info!("process_args count={} sample_arg1={}", args.len(), args.get(1).cloned().unwrap_or_default());
+    log::info!(
+        "process_args count={} sample_arg1={}",
+        args.len(),
+        args.get(1).cloned().unwrap_or_default()
+    );
     for a in args {
         if a.starts_with("klaayguard://") {
             log::info!("deep_link_found_in_process_args");
@@ -146,30 +154,35 @@ async fn try_handle_deep_link_from_args_async(app: &tauri::AppHandle, state: &Ar
 /// Enable autostart so KlaayGuard launches on login
 async fn enable_autostart(app: &tauri::AppHandle) -> Result<(), String> {
     log::info!("🚀 Enabling autostart...");
-    
+
     use tauri_plugin_autostart::ManagerExt;
     let autostart_manager = app.autolaunch();
-    
+
     // Check if already enabled
-    let is_enabled = autostart_manager.is_enabled().map_err(|e| format!("Failed to check autostart status: {}", e))?;
-    
+    let is_enabled = autostart_manager
+        .is_enabled()
+        .map_err(|e| format!("Failed to check autostart status: {}", e))?;
+
     if is_enabled {
         log::info!("✓ Autostart already enabled");
         return Ok(());
     }
-    
+
     // Enable autostart
     autostart_manager.enable().map_err(|e| {
         log::error!("❌ Failed to enable autostart: {}", e);
         format!("Failed to enable autostart: {}", e)
     })?;
-    
+
     log::info!("✓ Autostart enabled - KlaayGuard will launch on login");
     Ok(())
 }
 
 #[tauri::command]
-async fn set_api_base_url(state: tauri::State<'_, Arc<AppState>>, base: String) -> Result<(), String> {
+async fn set_api_base_url(
+    state: tauri::State<'_, Arc<AppState>>,
+    base: String,
+) -> Result<(), String> {
     *state.api_base_url.write().await = base;
     Ok(())
 }
@@ -196,7 +209,7 @@ async fn get_app_version() -> Result<String, String> {
 
 fn get_client_with_retries() -> reqwest_middleware::ClientWithMiddleware {
     use reqwest_middleware::ClientBuilder;
-    use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+    use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
 
     let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
     let base = reqwest::Client::builder()
@@ -261,7 +274,12 @@ async fn execute_sql_batch(
             .map_err(|e| format!("Invalid UTF-8 output for {}: {}", logical_id, e))?;
 
         let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
-            format!("Failed to parse JSON for {} (content: '{}'): {}", logical_id, stdout_str.trim(), e)
+            format!(
+                "Failed to parse JSON for {} (content: '{}'): {}",
+                logical_id,
+                stdout_str.trim(),
+                e
+            )
         })?;
 
         all_results.insert(logical_id, parsed_result);
@@ -273,12 +291,12 @@ async fn execute_sql_batch(
 /// Validate that a token is valid by making a test API call
 async fn validate_token(api_base: &str, token: &str) -> Result<bool, String> {
     log::info!("Validating token against API: {}", api_base);
-    
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| e.to_string())?;
-    
+
     let cfg_url = format!("{}/klaayguard/config", api_base);
     let response = client
         .get(&cfg_url)
@@ -287,29 +305,28 @@ async fn validate_token(api_base: &str, token: &str) -> Result<bool, String> {
         .send()
         .await
         .map_err(|e| format!("Token validation request failed: {}", e))?;
-    
+
     if response.status() == reqwest::StatusCode::UNAUTHORIZED
         || response.status() == reqwest::StatusCode::FORBIDDEN
     {
         log::warn!("Token validation failed: {} status", response.status());
         return Ok(false);
     }
-    
+
     if response.status().is_success() {
         log::info!("Token validation successful");
         return Ok(true);
     }
-    
-    log::warn!("Token validation returned unexpected status: {}", response.status());
+
+    log::warn!(
+        "Token validation returned unexpected status: {}",
+        response.status()
+    );
     Ok(false)
 }
 
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
-    status::StatusController::set_status(
-        app,
-        state,
-        status::AgentStatus::Unauthenticated,
-    ).await
+    status::StatusController::set_status(app, state, status::AgentStatus::Unauthenticated).await
 }
 
 fn collection_interval_seconds() -> u64 {
@@ -341,37 +358,41 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
 }
 
 /// Build tray menu dynamically based on status snapshot
-fn build_tray_menu_from_snapshot(app: &tauri::AppHandle, snapshot: &status::StatusSnapshot) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+fn build_tray_menu_from_snapshot(
+    app: &tauri::AppHandle,
+    snapshot: &status::StatusSnapshot,
+) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-    
+
     let status_text = snapshot.menu_status_text();
-    
+
     // Status indicator (disabled, non-clickable)
     let status_item = MenuItem::with_id(app, "status", &status_text, false, None::<&str>)?;
-    
+
     // Get API URL and version for info display
-    let api_url = snapshot.api_base_url
+    let api_url = snapshot
+        .api_base_url
         .replace("https://", "")
         .replace("http://", "");
     let version = env!("CARGO_PKG_VERSION");
-    
+
     // Create info items at the bottom
     let separator_top = PredefinedMenuItem::separator(app)?;
     let api_info = MenuItem::with_id(
         app,
         "api_info",
-        &format!("API: {}", api_url),
+        format!("API: {}", api_url),
         false,
-        None::<&str>
+        None::<&str>,
     )?;
     let version_info = MenuItem::with_id(
         app,
         "version_info",
-        &format!("v{}", version),
+        format!("v{}", version),
         false,
-        None::<&str>
+        None::<&str>,
     )?;
-    
+
     // Build menu based on authentication status
     if !snapshot.is_operational() {
         let separator = PredefinedMenuItem::separator(app)?;
@@ -387,52 +408,51 @@ fn build_tray_menu_from_snapshot(app: &tauri::AppHandle, snapshot: &status::Stat
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     } else {
         // When authenticated, only show status and info
-        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
-            &status_item,
-            &separator_top,
-            &api_info,
-            &version_info,
-        ];
+        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+            vec![&status_item, &separator_top, &api_info, &version_info];
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
 }
 
 /// Build tray menu dynamically based on authentication status (legacy, for initial setup)
-fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
+fn build_tray_menu(
+    app: &tauri::AppHandle,
+    is_authenticated: bool,
+) -> Result<tauri::menu::Menu<tauri::Wry>, Box<dyn std::error::Error>> {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-    
+
     let status_text = if is_authenticated {
         "🟢 KlaayGuard is running"
     } else {
         "🔴 Not Authenticated"
     };
-    
+
     // Status indicator (disabled, non-clickable)
     let status_item = MenuItem::with_id(app, "status", status_text, false, None::<&str>)?;
-    
+
     // Get API URL and version for info display
     let api_url = get_api_base_url()
         .replace("https://", "")
         .replace("http://", "");
     let version = env!("CARGO_PKG_VERSION");
-    
+
     // Create info items at the bottom
     let separator_top = PredefinedMenuItem::separator(app)?;
     let api_info = MenuItem::with_id(
         app,
         "api_info",
-        &format!("API: {}", api_url),
+        format!("API: {}", api_url),
         false,
-        None::<&str>
+        None::<&str>,
     )?;
     let version_info = MenuItem::with_id(
         app,
         "version_info",
-        &format!("v{}", version),
+        format!("v{}", version),
         false,
-        None::<&str>
+        None::<&str>,
     )?;
-    
+
     // Build menu based on authentication status
     if !is_authenticated {
         let separator = PredefinedMenuItem::separator(app)?;
@@ -448,25 +468,24 @@ fn build_tray_menu(app: &tauri::AppHandle, is_authenticated: bool) -> Result<tau
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     } else {
         // When authenticated, only show status and info
-        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![
-            &status_item,
-            &separator_top,
-            &api_info,
-            &version_info,
-        ];
+        let items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+            vec![&status_item, &separator_top, &api_info, &version_info];
         Menu::with_items(app, &items).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
 }
 
 /// Spawn a reactive observer task that watches status changes and updates tray UI
-fn spawn_status_observer(app: tauri::AppHandle, mut status_rx: watch::Receiver<status::StatusSnapshot>) {
+fn spawn_status_observer(
+    app: tauri::AppHandle,
+    mut status_rx: watch::Receiver<status::StatusSnapshot>,
+) {
     tauri::async_runtime::spawn(async move {
         log::info!("📡 Status observer started");
-        
+
         // Process initial status immediately
         let mut current_snapshot = status_rx.borrow().clone();
         update_tray_from_snapshot(&app, &current_snapshot).await;
-        
+
         // Watch for changes
         loop {
             match status_rx.changed().await {
@@ -496,18 +515,21 @@ async fn update_tray_from_snapshot(app: &tauri::AppHandle, snapshot: &status::St
             }
         }
     }
-    
+
     // Update icon and tooltip
     let icon_name = snapshot.tray_icon();
     let tooltip = snapshot.tray_tooltip();
     set_tray_icon_and_tooltip(app, icon_name, &tooltip);
 }
 
-
 /// Helper function to set tray icon and tooltip
 fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &str) {
-    log::info!("🔧 set_tray_icon_and_tooltip called: icon={}, tooltip={}", icon_name, tooltip);
-    
+    log::info!(
+        "🔧 set_tray_icon_and_tooltip called: icon={}, tooltip={}",
+        icon_name,
+        tooltip
+    );
+
     if let Some(tray) = app.tray_by_id("main") {
         // Update tooltip
         if let Err(e) = tray.set_tooltip(Some(tooltip.to_string())) {
@@ -515,20 +537,24 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
         } else {
             log::info!("✓ Tooltip set successfully");
         }
-        
+
         // In dev mode, icons are in src-tauri/icons/ or icons/
         // In production, they're in the resource directory
         let icon_path = if cfg!(debug_assertions) {
             // Dev mode: try multiple paths
             let current = std::env::current_dir().unwrap_or_default();
             log::info!("📂 Current dir: {}", current.display());
-            
+
             let paths_to_try = vec![
-                current.join("icons").join(icon_name),                    // If running from src-tauri/
-                current.join("src-tauri").join("icons").join(icon_name),  // If running from project root
-                current.parent().unwrap_or(&current).join("icons").join(icon_name), // One level up
+                current.join("icons").join(icon_name), // If running from src-tauri/
+                current.join("src-tauri").join("icons").join(icon_name), // If running from project root
+                current
+                    .parent()
+                    .unwrap_or(&current)
+                    .join("icons")
+                    .join(icon_name), // One level up
             ];
-            
+
             let mut found_path = None;
             for path in paths_to_try {
                 log::info!("🔍 Trying icon path: {}", path.display());
@@ -540,7 +566,7 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
                     log::debug!("❌ Not found: {}", path.display());
                 }
             }
-            
+
             if found_path.is_none() {
                 // Fallback to resource dir (try both with and without icons/ subdirectory)
                 if let Ok(resource_dir) = app.path().resource_dir() {
@@ -561,32 +587,30 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
                     }
                 }
             }
-            
+
             found_path
         } else {
             // Production: use resource dir (try both with and without icons/ subdirectory)
-            app.path().resource_dir()
-                .ok()
-                .and_then(|p| {
-                    // Try icons/ subdirectory first
-                    let icon_subdir_path = p.join("icons").join(icon_name);
-                    if icon_subdir_path.exists() {
-                        log::info!("✅ Found resource icon at: {}", icon_subdir_path.display());
-                        Some(icon_subdir_path)
+            app.path().resource_dir().ok().and_then(|p| {
+                // Try icons/ subdirectory first
+                let icon_subdir_path = p.join("icons").join(icon_name);
+                if icon_subdir_path.exists() {
+                    log::info!("✅ Found resource icon at: {}", icon_subdir_path.display());
+                    Some(icon_subdir_path)
+                } else {
+                    // Try root resource dir
+                    let full_path = p.join(icon_name);
+                    if full_path.exists() {
+                        log::info!("✅ Found resource icon at: {}", full_path.display());
+                        Some(full_path)
                     } else {
-                        // Try root resource dir
-                        let full_path = p.join(icon_name);
-                        if full_path.exists() {
-                            log::info!("✅ Found resource icon at: {}", full_path.display());
-                            Some(full_path)
-                        } else {
-                            log::warn!("Icon file not found: {}", full_path.display());
-                            None
-                        }
+                        log::warn!("Icon file not found: {}", full_path.display());
+                        None
                     }
-                })
+                }
+            })
         };
-        
+
         if let Some(path) = icon_path {
             log::info!("📂 Reading icon from: {}", path.display());
             match std::fs::read(&path) {
@@ -597,15 +621,16 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
                             let rgba = img.to_rgba8();
                             let (width, height) = rgba.dimensions();
                             log::info!("✓ Icon decoded: {}x{}", width, height);
-                            let icon = tauri::image::Image::new_owned(rgba.into_raw(), width, height);
-                            
+                            let icon =
+                                tauri::image::Image::new_owned(rgba.into_raw(), width, height);
+
                             if let Err(e) = tray.set_icon(Some(icon)) {
                                 log::error!("❌ Failed to update tray icon: {}", e);
-                } else {
+                            } else {
                                 log::info!("✅ Tray icon updated to: {}", icon_name);
-                }
-            }
-            Err(e) => {
+                            }
+                        }
+                        Err(e) => {
                             log::error!("❌ Failed to decode icon image {}: {}", icon_name, e);
                         }
                     }
@@ -614,14 +639,13 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
                     log::error!("❌ Failed to read icon file {}: {}", path.display(), e);
                 }
             }
-                } else {
+        } else {
             log::error!("❌ Could not locate icon file: {}", icon_name);
         }
     } else {
         log::error!("❌ Tray icon with id 'main' not found!");
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonApiResource {
@@ -652,8 +676,8 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
         .get(&cfg_url)
         .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token))
         .header(reqwest::header::ACCEPT, "application/vnd.api+json")
-            .send()
-            .await
+        .send()
+        .await
         .map_err(|e| e.to_string())?;
 
     if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED
@@ -672,12 +696,13 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
                 error: format!("Config fetch failed: {}", cfg_resp.status()),
                 last_attempt: chrono::Utc::now(),
             },
-        ).await?;
+        )
+        .await?;
         return Ok(());
     }
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
-    
+
     // Parse queries from Kiln's config format: { data: [{ id, type, sql? }] }
     let queries: Vec<(String, String)> = cfg_json
         .get("data")
@@ -706,7 +731,11 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
 
     // 2) Execute queries
     let results_map = execute_sql_batch(app.clone(), queries).await?;
-    add_breadcrumb("collection", &format!("executed_queries:{}", results_map.len()), Level::Info);
+    add_breadcrumb(
+        "collection",
+        &format!("executed_queries:{}", results_map.len()),
+        Level::Info,
+    );
 
     // 3) POST to Kiln data endpoint
     // Format: { meta: { device_uuid }, data: [{ type, attributes }] }
@@ -738,12 +767,14 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
         .header(reqwest::header::ACCEPT, "application/vnd.api+json")
         .body(body_json)
         .send()
-            .await;
-    
+        .await;
+
     // 4) Update status
     let now = chrono::Utc::now();
     match post_result {
-        Ok(resp) if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED => {
+        Ok(resp)
+            if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED =>
+        {
             log::info!("Data send successful");
             add_breadcrumb("collection", "post_success", Level::Info);
             *state.last_send_status.write().await = Some(true);
@@ -754,15 +785,23 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
                 status::AgentStatus::Ready {
                     last_success: Some(now),
                 },
-            ).await?;
+            )
+            .await?;
         }
-        Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::FORBIDDEN => {
+        Ok(resp)
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN =>
+        {
             add_breadcrumb("collection", "auth_invalidated_on_post", Level::Warning);
             invalidate_auth(app, state).await?;
         }
         Ok(resp) => {
             log::error!("Data send failed: status {}", resp.status().as_u16());
-            add_breadcrumb("collection", &format!("post_failed:{}", resp.status().as_u16()), Level::Error);
+            add_breadcrumb(
+                "collection",
+                &format!("post_failed:{}", resp.status().as_u16()),
+                Level::Error,
+            );
             *state.last_send_status.write().await = Some(false);
             *state.last_send_at.write().await = Some(now);
             status::StatusController::set_status(
@@ -772,7 +811,8 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
                     error: format!("HTTP {}", resp.status().as_u16()),
                     last_attempt: now,
                 },
-            ).await?;
+            )
+            .await?;
         }
         Err(e) => {
             log::error!("Data send error: {}", e);
@@ -786,7 +826,8 @@ async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), 
                     error: e.to_string(),
                     last_attempt: now,
                 },
-            ).await?;
+            )
+            .await?;
         }
     }
 
@@ -817,7 +858,8 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                             error: e,
                             last_attempt: chrono::Utc::now(),
                         },
-                    ).await;
+                    )
+                    .await;
                 }
             }
         }
@@ -845,7 +887,8 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                                 error: e,
                                 last_attempt: chrono::Utc::now(),
                             },
-                        ).await;
+                        )
+                        .await;
                     }
                 }
             }
@@ -856,7 +899,10 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
 #[tauri::command]
 async fn check_for_updates_internal(api_base_url: &str) -> Result<Option<String>, String> {
     let current_version = env!("CARGO_PKG_VERSION");
-    log::info!("🔍 Starting update check - current version: {}", current_version);
+    log::info!(
+        "🔍 Starting update check - current version: {}",
+        current_version
+    );
 
     let url = format!("{}/klaayguard/updates/latest", api_base_url);
     log::info!("🌐 Checking for updates from API: {}", url);
@@ -875,7 +921,10 @@ async fn check_for_updates_internal(api_base_url: &str) -> Result<Option<String>
     log::info!("📡 API response status: {}", response.status());
 
     if !response.status().is_success() {
-        return Err(format!("API returned non-success status: {}", response.status()));
+        return Err(format!(
+            "API returned non-success status: {}",
+            response.status()
+        ));
     }
 
     let release_info: Value = response
@@ -888,9 +937,14 @@ async fn check_for_updates_internal(api_base_url: &str) -> Result<Option<String>
         .and_then(|v| v.as_str())
         .ok_or_else(|| "Missing 'version' in response".to_string())?;
 
-    log::info!("📦 Found release: {} with {} assets", 
+    log::info!(
+        "📦 Found release: {} with {} assets",
         release_version,
-        release_info.get("assets").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0)
+        release_info
+            .get("assets")
+            .and_then(|a| a.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
     );
 
     if let Some(assets) = release_info.get("assets").and_then(|a| a.as_array()) {
@@ -909,18 +963,30 @@ async fn check_for_updates_internal(api_base_url: &str) -> Result<Option<String>
     let normalized_current = current_version.trim_start_matches('v');
     let normalized_release = release_version.trim_start_matches('v');
 
-    let current_semver = semver::Version::parse(normalized_current)
-        .map_err(|e| format!("Failed to parse current version '{}': {}", normalized_current, e))?;
+    let current_semver = semver::Version::parse(normalized_current).map_err(|e| {
+        format!(
+            "Failed to parse current version '{}': {}",
+            normalized_current, e
+        )
+    })?;
 
-    let release_semver = semver::Version::parse(normalized_release)
-        .map_err(|e| format!("Failed to parse release version '{}': {}", normalized_release, e))?;
+    let release_semver = semver::Version::parse(normalized_release).map_err(|e| {
+        format!(
+            "Failed to parse release version '{}': {}",
+            normalized_release, e
+        )
+    })?;
 
     if release_semver > current_semver {
-        log::info!("🔄 Update available: {} -> {}", current_version, release_version);
-        
+        log::info!(
+            "🔄 Update available: {} -> {}",
+            current_version,
+            release_version
+        );
+
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
-        
+
         let assets = release_info
             .get("assets")
             .and_then(|a| a.as_array())
@@ -938,12 +1004,14 @@ async fn check_for_updates_internal(api_base_url: &str) -> Result<Option<String>
                         _ => false,
                     };
                     let arch_match = match arch {
-                        "aarch64" | "arm" => name_lower.contains("arm64") || name_lower.contains("aarch64"),
+                        "aarch64" | "arm" => {
+                            name_lower.contains("arm64") || name_lower.contains("aarch64")
+                        }
                         "x86_64" => name_lower.contains("x64") || name_lower.contains("x86_64"),
                         _ => false,
                     };
                     os_match && arch_match
-    } else {
+                } else {
                     false
                 }
             })
@@ -953,7 +1021,10 @@ async fn check_for_updates_internal(api_base_url: &str) -> Result<Option<String>
 
         Ok(Some(asset_id))
     } else {
-        log::info!("✅ No update needed - already at latest version: {}", current_version);
+        log::info!(
+            "✅ No update needed - already at latest version: {}",
+            current_version
+        );
         Ok(None)
     }
 }
@@ -986,7 +1057,10 @@ async fn download_and_install_update_internal(
         .map_err(|e| format!("Failed to download update: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Download failed with status: {}", response.status()));
+        return Err(format!(
+            "Download failed with status: {}",
+            response.status()
+        ));
     }
 
     let content_type = response
@@ -994,7 +1068,7 @@ async fn download_and_install_update_internal(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|ct| ct.to_str().ok())
         .unwrap_or("unknown");
-    
+
     log::info!("📦 Response Content-Type: {}", content_type);
 
     let file_extension = if content_type.contains("gzip") || content_type.contains("x-gzip") {
@@ -1018,10 +1092,12 @@ async fn download_and_install_update_internal(
         .await
         .map_err(|e| format!("Failed to read response bytes: {}", e))?;
 
-    std::fs::write(&file_path, bytes)
-        .map_err(|e| format!("Failed to write update file: {}", e))?;
+    std::fs::write(&file_path, bytes).map_err(|e| format!("Failed to write update file: {}", e))?;
 
-    log::info!("✅ Download complete: {} bytes", std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0));
+    log::info!(
+        "✅ Download complete: {} bytes",
+        std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0)
+    );
 
     #[cfg(target_os = "macos")]
     {
@@ -1078,14 +1154,12 @@ async fn download_and_install_update(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let default_api = get_api_base_url();
-    
+
     // Initialize status watch channel with unauthenticated state
-    let initial_snapshot = status::StatusSnapshot::new(
-        status::AgentStatus::Unauthenticated,
-        default_api.clone(),
-    );
+    let initial_snapshot =
+        status::StatusSnapshot::new(status::AgentStatus::Unauthenticated, default_api.clone());
     let (status_tx, status_rx) = watch::channel(initial_snapshot.clone());
-    
+
     let state = Arc::new(AppState {
         auth_token: RwLock::new(None),
         api_base_url: RwLock::new(default_api.clone()),
@@ -1104,7 +1178,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             let st = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.clone();
-            log::info!("single_instance_args count={} sample_arg0={}", args.len(), args.get(0).cloned().unwrap_or_default());
+            log::info!("single_instance_args count={} sample_arg0={}", args.len(), args.first().cloned().unwrap_or_default());
             for a in args {
                 if a.starts_with("klaayguard://") {
                     log::info!("single_instance_deep_link_received");
@@ -1160,9 +1234,9 @@ pub fn run() {
             });
 
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
-            
+
             // Create initial tray menu (unauthenticated state by default)
-            let menu = build_tray_menu(&app.handle(), false).map_err(|e| {
+            let menu = build_tray_menu(app.handle(), false).map_err(|e| {
                 log::error!("Failed to create system tray menu: {}", e);
                 format!("{}", e)
             })?;
@@ -1211,7 +1285,7 @@ pub fn run() {
             let app_handle_for_observer = app.handle().clone();
             let state_for_persist = state_for_loop.clone();
             spawn_status_observer(app_handle_for_observer, status_rx);
-            
+
             // Load persisted status if available (after observer is spawned)
             let app_handle_for_load = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -1228,19 +1302,19 @@ pub fn run() {
             // NOW load token and update tray (after tray exists!)
             let app_handle_for_init = app.handle().clone();
             let state_for_init = state_for_loop.clone();
-            
+
             tauri::async_runtime::spawn(async move {
                 log::info!("🔑 Checking keychain for authentication token...");
                 if let Ok(Some(tok)) = keychain::load_token() {
                     log::info!("📦 Token found in keychain, validating...");
-                    
+
                     // Set authenticating status
                     let _ = status::StatusController::set_status(
                         &app_handle_for_init,
                         &state_for_init,
                         status::AgentStatus::Authenticating,
                     ).await;
-                    
+
                     // Validate token before accepting it
                     let api_base = state_for_init.api_base_url.read().await.clone();
                     match validate_token(&api_base, &tok).await {
@@ -1248,12 +1322,12 @@ pub fn run() {
                             log::info!("✅ Token validated successfully");
                             *state_for_init.auth_token.write().await = Some(tok);
                             let _ = app_handle_for_init.emit("auth:status", json!({ "authenticated": true }));
-                            
+
                             // Enable autostart if not already enabled
                             if let Err(e) = enable_autostart(&app_handle_for_init).await {
                                 log::warn!("Failed to enable autostart: {}", e);
                             }
-                            
+
                             // Set ready status (will trigger immediate collection cycle)
                             let _ = status::StatusController::set_status(
                                 &app_handle_for_init,
@@ -1268,7 +1342,7 @@ pub fn run() {
                             // Clear the invalid token
                             let _ = keychain::delete_token();
                             *state_for_init.keychain_cleared_this_session.write().await = true;
-                            
+
                             // Set unauthenticated status
                             let _ = status::StatusController::set_status(
                                 &app_handle_for_init,
@@ -1280,7 +1354,7 @@ pub fn run() {
                 } else {
                     *state_for_init.auth_token.write().await = None;
                     log::warn!("⚠️  Not authenticated - no token found in keychain");
-                    
+
                     // Set unauthenticated status
                     let _ = status::StatusController::set_status(
                         &app_handle_for_init,
@@ -1338,7 +1412,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     /// Test that AppState can be created with default values
     #[tokio::test]
     async fn test_app_state_creation() {
@@ -1355,14 +1429,14 @@ mod tests {
             status_sender: RwLock::new(Some(status_tx)),
             status_snapshot: RwLock::new(None),
         });
-        
+
         assert!(state.auth_token.read().await.is_none());
         assert_eq!(*state.api_base_url.read().await, "https://api.test.com");
         assert!(state.last_send_status.read().await.is_none());
         assert!(state.last_send_at.read().await.is_none());
         assert!(!*state.keychain_cleared_this_session.read().await);
     }
-    
+
     /// Test that collection interval can be parsed from environment
     #[test]
     fn test_collection_interval_default() {
@@ -1373,7 +1447,7 @@ mod tests {
             .unwrap_or(3600);
         assert!(interval >= 300); // At least 5 minutes
     }
-    
+
     #[test]
     fn test_collection_interval_parsing_logic() {
         // Test the parsing logic without modifying global env
@@ -1381,17 +1455,15 @@ mod tests {
             (Some("1800"), 1800),
             (Some("300"), 300),
             (Some("invalid"), 3600), // Invalid falls back to default
-            (None, 3600), // Missing falls back to default
+            (None, 3600),            // Missing falls back to default
         ];
-        
+
         for (input, expected) in test_cases {
-            let result = input
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(3600);
+            let result = input.and_then(|s| s.parse::<u64>().ok()).unwrap_or(3600);
             assert_eq!(result, expected);
         }
     }
-    
+
     /// Test API base URL parsing logic
     #[test]
     fn test_get_api_base_url_parsing() {
@@ -1401,7 +1473,7 @@ mod tests {
             (Some("https://api.staging.com"), "https://api.staging.com"),
             (None, "https://api.klaay.com"), // Default
         ];
-        
+
         for (input, expected) in test_cases {
             let result = input
                 .map(|s| s.to_string())
@@ -1409,7 +1481,7 @@ mod tests {
             assert_eq!(result, expected);
         }
     }
-    
+
     /// Test that update_tray_status is async and doesn't block
     #[tokio::test]
     async fn test_update_tray_status_success() {
@@ -1428,26 +1500,26 @@ mod tests {
             status_sender: RwLock::new(Some(status_tx)),
             status_snapshot: RwLock::new(None),
         });
-        
+
         // This would panic if update_tray_status used block_on internally
         // Note: We can't actually call update_tray_status without a real AppHandle,
         // but we can verify the state updates work correctly
         *state.last_send_status.write().await = Some(true);
         *state.last_send_at.write().await = Some(chrono::Utc::now());
-        
+
         assert_eq!(*state.last_send_status.read().await, Some(true));
         assert!(state.last_send_at.read().await.is_some());
     }
-    
+
     /// Test deep link URL parsing
     #[test]
     fn test_deep_link_url_parsing() {
         // Valid JWT token structure (3 parts separated by dots)
         let valid_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-        
+
         // Parse URL
         let url = format!("klaayguard://auth-callback?token={}", valid_token);
-        let qs = url.splitn(2, '?').nth(1).unwrap_or("");
+        let qs = url.split_once('?').map(|x| x.1).unwrap_or("");
         let mut token_opt: Option<String> = None;
         for pair in qs.split('&') {
             let mut it = pair.splitn(2, '=');
@@ -1458,17 +1530,17 @@ mod tests {
                 break;
             }
         }
-        
+
         assert!(token_opt.is_some());
         let token = token_opt.unwrap();
         assert_eq!(token.matches('.').count(), 2);
     }
-    
+
     #[test]
     fn test_deep_link_invalid_token() {
         // Invalid token (not JWT format)
         let url = "klaayguard://auth-callback?token=invalid_token";
-        let qs = url.splitn(2, '?').nth(1).unwrap_or("");
+        let qs = url.split_once('?').map(|x| x.1).unwrap_or("");
         let mut token_opt: Option<String> = None;
         for pair in qs.split('&') {
             let mut it = pair.splitn(2, '=');
@@ -1479,16 +1551,16 @@ mod tests {
                 break;
             }
         }
-        
+
         assert!(token_opt.is_some());
         let token = token_opt.unwrap();
         assert_ne!(token.matches('.').count(), 2); // Invalid JWT format
     }
-    
+
     #[test]
     fn test_deep_link_missing_token() {
         let url = "klaayguard://auth-callback";
-        let qs = url.splitn(2, '?').nth(1).unwrap_or("");
+        let qs = url.split_once('?').map(|x| x.1).unwrap_or("");
         let mut token_opt: Option<String> = None;
         for pair in qs.split('&') {
             let mut it = pair.splitn(2, '=');
@@ -1499,10 +1571,10 @@ mod tests {
                 break;
             }
         }
-        
+
         assert!(token_opt.is_none());
     }
-    
+
     /// Test JSON API resource serialization
     #[test]
     fn test_json_api_resource_serialization() {
@@ -1514,13 +1586,13 @@ mod tests {
                 "results": {}
             }),
         };
-        
+
         let serialized = serde_json::to_string(&resource).unwrap();
         assert!(serialized.contains("\"type\":\"device_osquery_results\""));
         assert!(serialized.contains("\"id\":\"123\""));
         assert!(serialized.contains("device_serial_number"));
     }
-    
+
     #[test]
     fn test_json_api_resource_without_id() {
         let resource = JsonApiResource {
@@ -1530,17 +1602,16 @@ mod tests {
                 "device_serial_number": "ABC123",
             }),
         };
-        
+
         let serialized = serde_json::to_string(&resource).unwrap();
         assert!(serialized.contains("\"type\":\"device_osquery_results\""));
         assert!(!serialized.contains("\"id\":")); // ID should be omitted when None
     }
-    
+
     /// Test HTTP client configuration
     #[test]
     fn test_client_with_retries() {
         let _client = get_client_with_retries();
         // Just verify it can be created without panicking
-        assert!(true);
     }
 }

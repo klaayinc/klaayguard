@@ -55,6 +55,9 @@ nix = "0.26"  # For Unix-specific system calls if needed
 #[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Updater disabled
 
+[dev-dependencies]
+cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+
 # Enable all Tauri features needed for each platform
 [features]
 default = []

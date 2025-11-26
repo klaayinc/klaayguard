@@ -9,7 +9,7 @@ fn get_keychain_service() -> String {
     let api_url = std::env::var("VITE_API_BASE_URL")
         .or_else(|_| std::env::var("APP_DEFAULT_API_BASE_URL"))
         .unwrap_or_else(|_| env!("APP_DEFAULT_API_BASE_URL").to_string());
-    
+
     // Match on API URL to determine environment
     if api_url.contains("localhost") {
         "com.klaay.klaayguard.dev".to_string()
@@ -22,8 +22,7 @@ fn get_keychain_service() -> String {
 
 fn entry() -> Result<Entry, String> {
     let service = get_keychain_service();
-    Entry::new(&service, KEYCHAIN_ACCOUNT)
-        .map_err(|e| format!("keychain new entry error: {}", e))
+    Entry::new(&service, KEYCHAIN_ACCOUNT).map_err(|e| format!("keychain new entry error: {}", e))
 }
 
 pub fn save_token(token: &str) -> Result<(), String> {

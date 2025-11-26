@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Pre-commit hook for Rust project
+# Delegates to bin/check
+
+bin/check
+exit $?

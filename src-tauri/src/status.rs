@@ -1,6 +1,6 @@
 // Copyright (C) 2024 KLAAY, Inc.
 //! Unified status management for KlaayGuard
-//! 
+//!
 //! This module provides a single source of truth for application status,
 //! using reactive watch channels to ensure all UI components stay in sync.
 
@@ -75,20 +75,26 @@ impl StatusSnapshot {
             AgentStatus::Unauthenticated => {
                 "🔴 Not authenticated - Click Login to start monitoring".to_string()
             }
-            AgentStatus::Authenticating => {
-                "🟡 Authenticating...".to_string()
-            }
+            AgentStatus::Authenticating => "🟡 Authenticating...".to_string(),
             AgentStatus::Ready { last_success } => {
                 if let Some(success_time) = last_success {
-                    format!("🟢 Last data send successful ({})", 
-                        success_time.format("%H:%M:%S"))
+                    format!(
+                        "🟢 Last data send successful ({})",
+                        success_time.format("%H:%M:%S")
+                    )
                 } else {
                     "🟢 KlaayGuard is running".to_string()
                 }
             }
-            AgentStatus::SendFailed { error, last_attempt } => {
-                format!("🔴 Last data send failed at {}: {}", 
-                    last_attempt.format("%H:%M:%S"), error)
+            AgentStatus::SendFailed {
+                error,
+                last_attempt,
+            } => {
+                format!(
+                    "🔴 Last data send failed at {}: {}",
+                    last_attempt.format("%H:%M:%S"),
+                    error
+                )
             }
         }
     }
@@ -122,25 +128,25 @@ impl StatusController {
     ) -> Result<(), String> {
         let api_base = state.api_base_url.read().await.clone();
         let snapshot = StatusSnapshot::new(new_status, api_base);
-        
+
         // Update the latest snapshot
         *state.status_snapshot.write().await = Some(snapshot.clone());
-        
+
         // Persist to store
         if let Err(e) = Self::persist_status(app, &snapshot).await {
             log::warn!("Failed to persist status to store: {}", e);
         }
-        
+
         // Update the watch channel
         if let Some(sender) = state.status_sender.read().await.as_ref() {
-            sender.send(snapshot.clone()).map_err(|e| {
-                format!("Failed to broadcast status update: {}", e)
-            })?;
+            sender
+                .send(snapshot.clone())
+                .map_err(|e| format!("Failed to broadcast status update: {}", e))?;
         }
-        
+
         // Emit Tauri event for frontend
         let _ = app.emit("app:status", &snapshot);
-        
+
         // Handle side effects based on status
         match &snapshot.status {
             AgentStatus::Unauthenticated => {
@@ -156,7 +162,7 @@ impl StatusController {
                 Self::handle_send_failed(app, error).await;
             }
         }
-        
+
         Ok(())
     }
 
@@ -167,50 +173,58 @@ impl StatusController {
     ) -> Result<(), String> {
         // Clear token from memory
         *state.auth_token.write().await = None;
-        
+
         // Clear keychain if not already cleared this session
         let already_cleared = *state.keychain_cleared_this_session.read().await;
         if !already_cleared {
             let _ = super::keychain::delete_token();
             *state.keychain_cleared_this_session.write().await = true;
         }
-        
+
         log::warn!("Authentication invalidated");
-        
+
         // Emit auth events
         let _ = app.emit("auth:invalidated", ());
         let _ = app.emit("auth:status", serde_json::json!({ "authenticated": false }));
-        
+
         // Open browser for login
         // Check runtime env var first, fall back to compile-time default
         let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
             .unwrap_or_else(|_| env!("APP_DEFAULT_EARTHENWARE_URL").to_string());
         let callback_url = "klaayguard://auth-callback";
-        let full_url = format!("{}/login?app=klaayguard&redirect_to={}", earthenware_url, callback_url);
+        let full_url = format!(
+            "{}/login?app=klaayguard&redirect_to={}",
+            earthenware_url, callback_url
+        );
         log::info!("🌐 Opening browser for re-authentication: {}", full_url);
         if let Err(e) = open::that(&full_url) {
             log::error!("❌ Failed to open browser: {}", e);
         }
-        
+
         // Show notification
-        let _ = app.notification()
+        let _ = app
+            .notification()
             .builder()
             .title("KlaayGuard - Authentication Required")
             .body("Your session has expired. Please sign in again.")
             .show();
-        
+
         super::add_breadcrumb("auth", "auth_invalidated", sentry::Level::Warning);
         sentry::capture_message("auth_invalidated", sentry::Level::Warning);
-        
+
         Ok(())
     }
 
     /// Handle send failure
     async fn handle_send_failed(app: &AppHandle, error: &str) {
-        let _ = app.notification()
+        let _ = app
+            .notification()
             .builder()
             .title("KlaayGuard")
-            .body(&format!("Data send failed: {}. Will retry in 1 hour.", error))
+            .body(format!(
+                "Data send failed: {}. Will retry in 1 hour.",
+                error
+            ))
             .show();
     }
 
@@ -225,7 +239,8 @@ impl StatusController {
                         let value = serde_json::to_value(snapshot)
                             .map_err(|e| format!("Failed to serialize status: {}", e))?;
                         store.set("status".to_string(), value);
-                        store.save()
+                        store
+                            .save()
                             .map_err(|e| format!("Failed to save store: {}", e))?;
                         Ok(())
                     }
@@ -248,8 +263,9 @@ impl StatusController {
         let app_data_dir = app.path().app_data_dir().ok()?;
         let path = app_data_dir.join("status.json");
         let store = app.store(path).ok()?;
-        
-        store.get("status")
+
+        store
+            .get("status")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 }
@@ -264,7 +280,7 @@ mod tests {
             AgentStatus::Unauthenticated,
             "https://api.test.com".to_string(),
         );
-        
+
         assert_eq!(snapshot.api_base_url, "https://api.test.com");
         assert!(!snapshot.is_operational());
         assert_eq!(snapshot.tray_icon(), "icon-error.png");
@@ -281,26 +297,28 @@ mod tests {
             },
             "https://api.test.com".to_string(),
         );
-        
+
         assert!(snapshot.is_operational());
         assert_eq!(snapshot.tray_icon(), "icon-success.png");
-        assert!(snapshot.tray_tooltip().contains("Last data send successful"));
+        assert!(snapshot
+            .tray_tooltip()
+            .contains("Last data send successful"));
         assert!(snapshot.menu_status_text().contains("Last send:"));
     }
 
     #[test]
     fn test_status_snapshot_ready_without_success() {
         let snapshot = StatusSnapshot::new(
-            AgentStatus::Ready {
-                last_success: None,
-            },
+            AgentStatus::Ready { last_success: None },
             "https://api.test.com".to_string(),
         );
-        
+
         assert!(snapshot.is_operational());
         assert_eq!(snapshot.tray_icon(), "icon-success.png");
         assert_eq!(snapshot.tray_tooltip(), "🟢 KlaayGuard is running");
-        assert!(snapshot.menu_status_text().contains("KlaayGuard is running"));
+        assert!(snapshot
+            .menu_status_text()
+            .contains("KlaayGuard is running"));
     }
 
     #[test]
@@ -313,7 +331,7 @@ mod tests {
             },
             "https://api.test.com".to_string(),
         );
-        
+
         assert!(!snapshot.is_operational());
         assert_eq!(snapshot.tray_icon(), "icon-error.png");
         assert!(snapshot.tray_tooltip().contains("Last data send failed"));
@@ -327,7 +345,7 @@ mod tests {
             AgentStatus::Authenticating,
             "https://api.test.com".to_string(),
         );
-        
+
         assert!(!snapshot.is_operational());
         assert_eq!(snapshot.tray_icon(), "icon-default.png");
         assert!(snapshot.tray_tooltip().contains("Authenticating"));
@@ -341,7 +359,7 @@ mod tests {
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("Ready"));
-        
+
         let deserialized: AgentStatus = serde_json::from_str(&json).unwrap();
         assert!(matches!(deserialized, AgentStatus::Ready { .. }));
     }
@@ -355,7 +373,7 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(json.contains("Unauthenticated"));
         assert!(json.contains("api.test.com"));
-        
+
         let deserialized: StatusSnapshot = serde_json::from_str(&json).unwrap();
         assert!(matches!(deserialized.status, AgentStatus::Unauthenticated));
         assert_eq!(deserialized.api_base_url, "https://api.test.com");

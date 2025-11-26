@@ -7,6 +7,7 @@ name = "KlaayGuard"
 version = "0.1.12"
 dependencies = [
  "anyhow",
+ "cargo-husky",
  "chrono",
  "dirs 5.0.1",
  "image",
@@ -901,6 +902,12 @@ checksum = "e1de8bc0aa9e9385ceb3bf0c152e3a9b9544f6c4a912c8ae504e80c1f0368603"
 dependencies = [
  "serde_core",
 ]
+
+[[package]]
+name = "cargo-husky"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b02b629252fe8ef6460461409564e2c21d0c8e77e0944f3d189ff06c4e932ad"
 
 [[package]]
 name = "cargo-platform"
