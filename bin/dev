@@ -27,17 +27,69 @@ if not type -q cargo-tauri
     cargo install tauri-cli --version "^2.0.0"
 end
 
-# Development environment variables
-set -e APP_DEFAULT_API_BASE_URL 2>/dev/null
-set -e VITE_EARTHENWARE_URL 2>/dev/null
-set -x APP_DEFAULT_API_BASE_URL http://localhost:3000
-set -x VITE_EARTHENWARE_URL http://localhost:5173
-set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 3600
+# Load environment variables from .env files
+set -l script_dir (dirname (status --current-filename))
+source $script_dir/../scripts/load-env.fish development
+
+if test $status -ne 0
+    echo "$yellow⚠  Failed to load environment configuration, using defaults$normal"
+    set -x VITE_API_BASE_URL http://localhost:3000
+    set -x VITE_EARTHENWARE_URL http://localhost:5173
+    set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 3600
+end
+
+# Set development-specific variables
+set -x APP_DEFAULT_API_BASE_URL $VITE_API_BASE_URL
 set -x RUST_LOG info
 
-echo "$green✓$normal API URL: $APP_DEFAULT_API_BASE_URL"
+echo "$green✓$normal API URL: $VITE_API_BASE_URL"
 echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
-echo "$green✓$normal Collection Interval: 3600 seconds (1 hour)"
+echo "$green✓$normal Collection Interval: $KLAAYGUARD_COLLECTION_INTERVAL_SECONDS seconds"
+echo ""
+
+# Generate Launch Agent plist with current environment variables
+echo "$blue📝 Generating Launch Agent configuration...$normal"
+printf '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.klaay.klaayguard-dev</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/KlaayGuard-Dev.app/Contents/MacOS/KlaayGuard</string>
+    </array>
+    
+    <key>RunAtLoad</key>
+    <true/>
+    
+    <key>KeepAlive</key>
+    <true/>
+    
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>VITE_API_BASE_URL</key>
+        <string>%s</string>
+        <key>VITE_EARTHENWARE_URL</key>
+        <string>%s</string>
+        <key>KLAAYGUARD_COLLECTION_INTERVAL_SECONDS</key>
+        <string>%s</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+    
+    <key>StandardOutPath</key>
+    <string>/tmp/klaayguard-dev-launchd.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/tmp/klaayguard-dev-launchd-error.log</string>
+</dict>
+</plist>' "$VITE_API_BASE_URL" "$VITE_EARTHENWARE_URL" "$KLAAYGUARD_COLLECTION_INTERVAL_SECONDS" > com.klaay.klaayguard-dev.plist
+echo "$green✓$normal Plist generated with current environment variables"
 echo ""
 
 # Check if dev app bundle needs to be built/updated
@@ -90,25 +142,26 @@ end
 
 # Install Launch Agent for auto-restart and keep-alive
 set -l launch_agent_path "$HOME/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
-if test -f com.klaay.klaayguard-dev.plist
-    echo "$blue🔄 Installing Launch Agent for auto-restart...$normal"
-    
-    # Unload existing agent if present
-    launchctl unload "$launch_agent_path" 2>/dev/null; or true
-    
-    # Copy plist to LaunchAgents
-    cp com.klaay.klaayguard-dev.plist "$launch_agent_path"
-    
-    # Load the agent
-    if launchctl load "$launch_agent_path" 2>/dev/null
-        echo "$green✓$normal Launch Agent installed - KlaayGuard-Dev will:"
-        echo "   • Auto-start on login"
-        echo "   • Auto-restart if it crashes"
-    else
-        echo "$yellow⚠  Failed to load Launch Agent, but continuing...$normal"
-    end
-    echo ""
+echo "$blue🔄 Installing Launch Agent for auto-restart...$normal"
+
+# Unload existing agent if present (kill running instance first)
+pkill -f "KlaayGuard" 2>/dev/null; or true
+launchctl unload "$launch_agent_path" 2>/dev/null; or true
+
+# Copy the generated plist to LaunchAgents
+cp com.klaay.klaayguard-dev.plist "$launch_agent_path"
+echo "$green✓$normal Launch Agent plist copied to ~/Library/LaunchAgents/"
+
+# Load the agent
+if launchctl load "$launch_agent_path" 2>/dev/null
+    echo "$green✓$normal Launch Agent loaded - KlaayGuard-Dev will:"
+    echo "   • Auto-start on login"
+    echo "   • Auto-restart if it crashes"
+    echo "   • Use API: $VITE_API_BASE_URL"
+else
+    echo "$yellow⚠  Failed to load Launch Agent, but continuing...$normal"
 end
+echo ""
 
 echo "$blue🚀 KlaayGuard-Dev is managed by Launch Agent$normal"
 echo "$yellow⚠  App runs in system tray (no window)$normal"

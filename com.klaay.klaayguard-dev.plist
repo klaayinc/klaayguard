@@ -7,7 +7,7 @@
     
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/KlaayGuard-Dev.app/Contents/MacOS/KlaayGuard-Dev</string>
+        <string>/Applications/KlaayGuard-Dev.app/Contents/MacOS/KlaayGuard</string>
     </array>
     
     <key>RunAtLoad</key>
@@ -21,7 +21,7 @@
     
     <key>EnvironmentVariables</key>
     <dict>
-        <key>APP_DEFAULT_API_BASE_URL</key>
+        <key>VITE_API_BASE_URL</key>
         <string>http://localhost:3000</string>
         <key>VITE_EARTHENWARE_URL</key>
         <string>http://localhost:5173</string>
@@ -38,4 +38,3 @@
     <string>/tmp/klaayguard-dev-launchd-error.log</string>
 </dict>
 </plist>
-
