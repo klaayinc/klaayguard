@@ -28,18 +28,29 @@ const loadEnvScript = path.join(projectRoot, "scripts", "load-env.sh");
 if (fs.existsSync(loadEnvScript)) {
   try {
     // Source the script and export variables
-    // Use array arguments to prevent command injection
-    const envOutput = execSync(
+    // Use spawnSync with array arguments to prevent command injection
+    const result = spawnSync(
       "bash",
       ["-c", 'source "$1" "$2" && env', "--", loadEnvScript, KLAAY_ENV],
       {
         cwd: projectRoot,
         encoding: "utf8",
+        stdio: "pipe",
       }
     );
 
+    if (result.error) {
+      throw result.error;
+    }
+
+    if (result.status !== 0) {
+      throw new Error(
+        `bash command failed with exit code ${result.status}: ${result.stderr}`
+      );
+    }
+
     // Parse the output and set environment variables
-    envOutput.split("\n").forEach((line) => {
+    result.stdout.split("\n").forEach((line) => {
       const match = line.match(/^([^=]+)=(.*)$/);
       if (match && !process.env[match[1]]) {
         process.env[match[1]] = match[2];
