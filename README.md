@@ -18,11 +18,13 @@ KlaayGuard automatically:
 ## 🏗️ Architecture
 
 ### System Tray Only
+
 - No visible windows or UI
 - All interactions via system tray menu
 - Status displayed in tooltip
 
 ### Authentication Flow
+
 1. App starts → Check keychain for token
 2. If no token: User clicks "Login" in tray menu
 3. Opens browser to Earthenware login page
@@ -30,6 +32,7 @@ KlaayGuard automatically:
 5. Token saved to system keychain
 
 ### Data Collection Flow
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -42,7 +45,7 @@ sequenceDiagram
     Agent->>Keychain: Load token on startup
     Keychain-->>Agent: Token (if exists)
     Agent->>API: GET /me (validate token)
-    
+
     alt Token valid
         API-->>Agent: 200 OK
         loop Every 1 hour
@@ -81,17 +84,37 @@ cargo install tauri-cli
 git clone https://github.com/klaayinc/klaayguard.git
 cd klaayguard
 
+# Setup environment (first time only)
+scripts/setup-env.sh
+
 # Run in development
-cargo tauri dev
+bin/dev
 ```
 
 ### Build
 
-```bash
-# Production build
-cargo tauri build
+Build scripts automatically load environment variables and select the correct Tauri config:
 
-# Platform-specific builds
+```bash
+# Development build (debug mode, localhost API)
+bin/build development
+
+# Staging build (release mode, staging API)
+bin/build staging
+
+# Production build (release mode, production API)
+bin/build production
+```
+
+**Build outputs**:
+
+- **macOS**: `src-tauri/target/{debug|release}/bundle/macos/*.app` and `bundle/dmg/*.dmg`
+- **Linux**: `src-tauri/target/{debug|release}/bundle/appimage/*.AppImage` and `bundle/deb/*.deb`
+- **Windows**: `src-tauri/target/{debug|release}/bundle/msi/*.msi` and `bundle/nsis/*.exe`
+
+**Platform-specific targets**:
+
+```bash
 cargo tauri build --target aarch64-apple-darwin      # macOS Apple Silicon
 cargo tauri build --target x86_64-apple-darwin       # macOS Intel
 cargo tauri build --target x86_64-pc-windows-msvc    # Windows
@@ -114,22 +137,31 @@ node scripts/validate-env.js
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VITE_API_BASE_URL` | (required) | Kiln API base URL |
-| `VITE_EARTHENWARE_URL` | (required) | Earthenware login URL |
-| `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `3600` | Collection interval (1 hour) |
-| `VITE_SENTRY_DSN` | (empty) | Sentry error tracking DSN |
+| Variable                                 | Default    | Description                  |
+| ---------------------------------------- | ---------- | ---------------------------- |
+| `VITE_API_BASE_URL`                      | (required) | Kiln API base URL            |
+| `VITE_EARTHENWARE_URL`                   | (required) | Earthenware login URL        |
+| `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `3600`     | Collection interval (1 hour) |
+| `VITE_SENTRY_DSN`                        | (empty)    | Sentry error tracking DSN    |
 
 ### Environment Files
 
+Environment files are located in the project root:
+
 - `.env.defaults` - Safe defaults (committed)
-- `.env.development` - Development configuration
+- `.env.development` - Development configuration (localhost)
 - `.env.staging` - Staging configuration
 - `.env.production` - Production configuration
-- `.env.*.local` - Local overrides (not committed)
+- `.env.*.local` - Local overrides (not committed, optional)
 
-For detailed configuration instructions, see [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)
+**Priority**: Later files override earlier files (defaults → environment → local)
+
+**Template files** are provided in `config/` directory:
+
+- `config/env.defaults` → `.env.defaults`
+- `config/env.development` → `.env.development`
+- `config/env.staging` → `.env.staging`
+- `config/env.production` → `.env.production`
 
 ### API Endpoints
 
@@ -164,15 +196,27 @@ klaayguard/
 - **Retry Logic**: Automatic retry with exponential backoff (3 attempts)
 - **No Local Storage**: Data sent immediately (no local persistence)
 
-## 🔄 Auto-Start
+## 🔄 Auto-Start & Keep-Alive
 
 KlaayGuard uses `tauri-plugin-autostart` for cross-platform auto-start:
 
-- **macOS**: LaunchAgent (runs on login)
-- **Windows**: Registry startup entry
-- **Linux**: XDG autostart desktop entry
+- **macOS**: LaunchAgent at `~/Library/LaunchAgents/com.klaay.app.plist`
+- **Windows**: Registry entry at `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`
+- **Linux**: XDG autostart desktop entry at `~/.config/autostart/`
 
 The app automatically configures itself to start on login. This ensures continuous security monitoring.
+
+**Development Mode**:
+
+- Uses separate app bundle (`KlaayGuard-Dev`)
+- Separate LaunchAgent (`com.klaay.klaayguard-dev.plist`)
+- Dynamically generated plist with current environment variables
+- Run `bin/dev` to start development mode with auto-start configured
+
+**Production Mode**:
+
+- Environment variables embedded at build time
+- Standard auto-start behavior via `tauri-plugin-autostart`
 
 ## 📊 Status Indicators
 
@@ -211,6 +255,7 @@ cargo test --manifest-path=src-tauri/Cargo.toml
 ## 📦 Dependencies
 
 ### Core
+
 - **Tauri 2.0**: Desktop app framework
 - **reqwest**: HTTP client
 - **reqwest-middleware**: Retry logic with exponential backoff
@@ -219,6 +264,7 @@ cargo test --manifest-path=src-tauri/Cargo.toml
 - **chrono**: Timestamps
 
 ### Plugins
+
 - **tauri-plugin-shell**: Execute osquery binary
 - **tauri-plugin-notification**: System notifications
 - **tauri-plugin-autostart**: Auto-start on login
@@ -226,23 +272,27 @@ cargo test --manifest-path=src-tauri/Cargo.toml
 - **tauri-plugin-single-instance**: Prevent duplicate instances
 
 ### Platform-Specific
+
 - **keyring**: Secure token storage (system keychain)
 - **sentry**: Error tracking and monitoring
 
 ## 🏗️ Multi-Platform Support
 
 ### Windows
+
 - System tray icon with menu
 - Registry-based auto-start
 - osquery bundled as sidecar
 
 ### macOS
+
 - System tray icon (template mode for dark/light)
 - LaunchAgent for auto-start
 - Keychain for secure token storage
 - osquery bundled as sidecar
 
 ### Linux
+
 - System tray icon (requires GTK)
 - XDG autostart
 - osquery bundled as sidecar
