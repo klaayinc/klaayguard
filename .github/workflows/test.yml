@@ -2,6 +2,7 @@ name: Rust unit tests
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
