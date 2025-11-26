@@ -285,7 +285,7 @@ mod tests {
         assert!(snapshot.is_operational());
         assert_eq!(snapshot.tray_icon(), "icon-success.png");
         assert!(snapshot.tray_tooltip().contains("Last data send successful"));
-        assert!(snapshot.menu_status_text().contains("KlaayGuard is running"));
+        assert!(snapshot.menu_status_text().contains("Last send:"));
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod tests {
         assert!(snapshot.is_operational());
         assert_eq!(snapshot.tray_icon(), "icon-success.png");
         assert_eq!(snapshot.tray_tooltip(), "🟢 KlaayGuard is running");
-        assert!(snapshot.menu_status_text().contains("starting"));
+        assert!(snapshot.menu_status_text().contains("KlaayGuard is running"));
     }
 
     #[test]

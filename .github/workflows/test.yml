@@ -1,0 +1,30 @@
+name: Rust unit tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: Rust unit tests (ubuntu-latest, stable)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Setup environment files
+        run: scripts/setup-env.sh
+
+      - name: Run tests
+        working-directory: src-tauri
+        run: |
+          source ../scripts/load-env.sh development
+          cargo test --verbose
