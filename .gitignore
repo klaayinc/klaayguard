@@ -24,7 +24,15 @@ dist-ssr
 *.sln
 *.sw?
 
+# Allow specific env files but ignore local overrides
 .env
+.env.local
+.env.*.local
+!.env.defaults
+!.env.development
+!.env.staging
+!.env.production
+
 tmp
 src-tauri/vendor/*
 !src-tauri/vendor/.keep
