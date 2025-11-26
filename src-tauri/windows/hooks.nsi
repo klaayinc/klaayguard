@@ -11,5 +11,3 @@
 !macro customRemove
   DeleteRegKey HKCR "klaayguard"
 !macroend
-
-

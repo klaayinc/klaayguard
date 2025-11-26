@@ -61,6 +61,3 @@ cargo-husky = { version = "1", default-features = false, features = ["user-hooks
 # Enable all Tauri features needed for each platform
 [features]
 default = []
-
-
-

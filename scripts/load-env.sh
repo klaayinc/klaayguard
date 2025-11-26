@@ -76,6 +76,3 @@ if [ ${#MISSING_VARS[@]} -gt 0 ]; then
     echo "Run: scripts/setup-env.sh to create template files." >&2
     return 1 2>/dev/null || exit 1
 fi
-
-
-

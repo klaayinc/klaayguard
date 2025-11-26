@@ -210,6 +210,3 @@ if (require.main === module) {
 }
 
 module.exports = { parseEnvFile, validateEnvironment }
-
-
-

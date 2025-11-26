@@ -131,4 +131,4 @@ if (!response.ok) {
 - Verify osquery integration works
 - Ensure proper signing for releases
 - Test system tray functionality
-- Verify background monitoring works correctly 
+- Verify background monitoring works correctly

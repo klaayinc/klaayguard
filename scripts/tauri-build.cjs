@@ -19,7 +19,7 @@ if (fs.existsSync(loadEnvScript)) {
       cwd: projectRoot,
       encoding: 'utf8'
     })
-    
+
     // Parse the output and set environment variables
     envOutput.split('\n').forEach(line => {
       const match = line.match(/^([^=]+)=(.*)$/)
@@ -81,9 +81,9 @@ console.log(`[tauri-build] Command exists: ${fs.existsSync(tauriCmd)}`)
 console.log(`[tauri-build] Platform: ${process.platform}`)
 console.log(`[tauri-build] Args: ${args.join(' ')}`)
 
-const result = spawnSync(tauriCmd, args, { 
-  stdio: 'inherit', 
-  env: process.env, 
+const result = spawnSync(tauriCmd, args, {
+  stdio: 'inherit',
+  env: process.env,
   shell: process.platform === 'win32' // Use shell on Windows
 })
 

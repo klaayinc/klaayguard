@@ -69,6 +69,3 @@ if test (count $missing_vars) -gt 0
     echo "Run: scripts/setup-env.sh to create template files." >&2
     return 1
 end
-
-
-

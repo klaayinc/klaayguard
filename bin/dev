@@ -58,21 +58,21 @@ printf '<?xml version="1.0" encoding="UTF-8"?>
 <dict>
     <key>Label</key>
     <string>com.klaay.klaayguard-dev</string>
-    
+
     <key>ProgramArguments</key>
     <array>
         <string>/Applications/KlaayGuard-Dev.app/Contents/MacOS/KlaayGuard-Dev</string>
     </array>
-    
+
     <key>RunAtLoad</key>
     <true/>
-    
+
     <key>KeepAlive</key>
     <true/>
-    
+
     <key>ProcessType</key>
     <string>Interactive</string>
-    
+
     <key>EnvironmentVariables</key>
     <dict>
         <key>VITE_API_BASE_URL</key>
@@ -84,10 +84,10 @@ printf '<?xml version="1.0" encoding="UTF-8"?>
         <key>RUST_LOG</key>
         <string>info</string>
     </dict>
-    
+
     <key>StandardOutPath</key>
     <string>/tmp/klaayguard-dev-launchd.log</string>
-    
+
     <key>StandardErrorPath</key>
     <string>/tmp/klaayguard-dev-launchd-error.log</string>
 </dict>
@@ -109,13 +109,13 @@ else
     else
         SRC_MTIME=0
     fi
-    
+
     if [ -f "$DEV_APP_PATH/Contents/MacOS/KlaayGuard" ]; then
         APP_MTIME=$(stat -f %m "$DEV_APP_PATH/Contents/MacOS/KlaayGuard" 2>/dev/null || echo 0)
     else
         APP_MTIME=0
     fi
-    
+
     if [ "$SRC_MTIME" -gt "$APP_MTIME" ]; then
         echo -e "${YELLOW}⚠  Source code is newer than installed app${NORMAL}"
         NEEDS_BUILD=1
@@ -126,22 +126,22 @@ if [ "$NEEDS_BUILD" -eq 1 ]; then
     echo -e "${BLUE}📦 Building and installing dev app bundle...${NORMAL}"
     echo -e "${YELLOW}   This will take a minute...${NORMAL}"
     echo ""
-    
+
     # Build the dev bundle with development environment variables
     export KLAAY_ENV=development
     cargo tauri build --debug --config src-tauri/tauri.development.json
-    
+
     # Kill any running instance
     pkill -f "KlaayGuard-Dev" 2>/dev/null || true
-    
+
     # Remove old dev app
     rm -rf "$DEV_APP_PATH" 2>/dev/null || true
-    
+
     # Copy new dev app to Applications
     if [ -d "src-tauri/target/debug/bundle/macos/KlaayGuard-Dev.app" ]; then
         cp -R "src-tauri/target/debug/bundle/macos/KlaayGuard-Dev.app" /Applications/
         echo -e "${GREEN}✓${NORMAL} Dev app installed to $DEV_APP_PATH"
-        
+
         # Force re-registration of URL scheme
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEV_APP_PATH"
         echo -e "${GREEN}✓${NORMAL} URL scheme registered for dev app"
@@ -197,4 +197,3 @@ echo ""
 echo -e "${BLUE}🔄 To restart manually:${NORMAL}"
 echo "   launchctl start com.klaay.klaayguard-dev"
 echo ""
-

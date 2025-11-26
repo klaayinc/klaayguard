@@ -25,7 +25,7 @@ copy_env_file() {
     local src="$1"
     local dest="$2"
     local env_name="$3"
-    
+
     if [ -f "$dest" ]; then
         echo -e "${YELLOW}⚠${NC}  $env_name already exists, skipping"
     else
@@ -57,6 +57,3 @@ echo ""
 echo -e "${BLUE}Documentation:${NC}"
 echo "  See docs/ENVIRONMENT.md for detailed usage instructions"
 echo ""
-
-
-

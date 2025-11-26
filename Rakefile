@@ -121,7 +121,7 @@ file TARBALL_PATH => [DIR_TMP] do
         File.write(TARBALL_PATH, response.read)
     end
     verify_checksum(TARBALL_PATH)
-end 
+end
 
 file LINUX_TARBALL_PATH => [DIR_TMP] do
     log "Downloading linux tarball.."
@@ -326,5 +326,3 @@ task :check_urls do
         log "All URLs are valid."
     end
 end
-
-
