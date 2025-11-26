@@ -37,8 +37,5 @@ jobs:
       - name: Setup environment files
         run: scripts/setup-env.sh
 
-      - name: Run tests
-        working-directory: src-tauri
-        run: |
-          source ../scripts/load-env.sh development
-          cargo test --verbose
+      - name: Run checks (formatting, linting, tests)
+        run: bin/check
