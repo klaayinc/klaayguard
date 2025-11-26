@@ -55,13 +55,33 @@ jobs:
 
       - name: sccache
         uses: mozilla-actions/sccache-action@v0.0.4
+        continue-on-error: true
+        id: sccache_setup
 
       - name: Enable sccache
+        if: steps.sccache_setup.outcome == 'success'
         run: |
           echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
           echo "SCCACHE_GHA_ENABLED=true" >> $GITHUB_ENV
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> $GITHUB_ENV
           echo "SCCACHE_GHA_STORAGE_MODE=minio" >> $GITHUB_ENV
+
+      - name: Verify sccache startup
+        if: steps.sccache_setup.outcome == 'success'
+        run: |
+          echo "Testing sccache with rustc..."
+          if ! sccache rustc --version > /dev/null 2>&1; then
+            echo "⚠️ sccache failed to start (cache service unavailable), disabling caching"
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+            echo "SCCACHE_GHA_ENABLED=" >> $GITHUB_ENV
+          else
+            echo "✓ sccache started successfully"
+          fi
+
+      - name: Fallback message if sccache unavailable
+        if: steps.sccache_setup.outcome != 'success'
+        run: |
+          echo "⚠️ sccache unavailable (GitHub Actions cache service may be down), continuing without Rust compilation cache"
 
       - name: (Ubuntu) install dependencies
         run: |
