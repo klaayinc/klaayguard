@@ -29,13 +29,18 @@ fn main() {
     }
 
     // Get environment variables (already validated)
-    let api_base = std::env::var("VITE_API_BASE_URL").unwrap();
-    let earthenware_url = std::env::var("VITE_EARTHENWARE_URL").unwrap();
+    let api_base = std::env::var("VITE_API_BASE_URL")
+        .expect("VITE_API_BASE_URL should be set (checked during validation)");
+    let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
+        .expect("VITE_EARTHENWARE_URL should be set (checked during validation)");
     let klaay_env = std::env::var("KLAAY_ENV").unwrap_or_else(|_| "production".to_string());
 
     // Debug output (only in debug builds or when KLAAY_DEBUG is set)
     let debug_enabled = std::env::var("KLAAY_DEBUG")
-        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .map(|v| {
+            let v_lower = v.to_lowercase();
+            v == "1" || v_lower == "true" || v_lower == "yes" || v_lower == "on"
+        })
         .unwrap_or(false);
 
     if debug_enabled || cfg!(debug_assertions) {

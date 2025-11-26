@@ -188,7 +188,9 @@ impl StatusController {
         let _ = app.emit("auth:status", serde_json::json!({ "authenticated": false }));
 
         // Open browser for login
-        // Check runtime env var first, fall back to compile-time default
+        // Determine Earthenware URL for authentication.
+        // Precedence: First, check the runtime environment variable VITE_EARTHENWARE_URL.
+        // If not set, fall back to the compile-time default APP_DEFAULT_EARTHENWARE_URL.
         let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
             .unwrap_or_else(|_| env!("APP_DEFAULT_EARTHENWARE_URL").to_string());
         let callback_url = "klaayguard://auth-callback";

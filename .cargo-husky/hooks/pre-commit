@@ -6,5 +6,10 @@
 GIT_ROOT="$(git rev-parse --show-toplevel)"
 cd "$GIT_ROOT"
 
-bin/check
-exit $?
+if [[ -x bin/check ]]; then
+    bin/check
+    exit $?
+else
+    echo "Error: bin/check not found or not executable. Please ensure it exists and has execute permissions." >&2
+    exit 1
+fi

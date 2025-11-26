@@ -26,7 +26,19 @@ load_env_file() {
             [[ -z "$line" ]] && continue
             # Export the variable
             if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-                export "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+                local raw_value="${BASH_REMATCH[2]}"
+                # Trim leading whitespace
+                local value="${raw_value#"${raw_value%%[![:space:]]*}"}"
+                # Trim trailing whitespace
+                local trimmed="${value%"${value##*[![:space:]]}"}"
+                value="$trimmed"
+                # Remove surrounding quotes if present (simple check)
+                if [[ ${#value} -ge 2 && ("${value:0:1}" == "\"" && "${value: -1}" == "\"") ]]; then
+                    value="${value:1:$(( ${#value} - 2 ))}"
+                elif [[ ${#value} -ge 2 && ("${value:0:1}" == "'" && "${value: -1}" == "'") ]]; then
+                    value="${value:1:$(( ${#value} - 2 ))}"
+                fi
+                export "${BASH_REMATCH[1]}=$value"
             fi
         done < "$env_file"
         return 0
@@ -74,5 +86,6 @@ if [ ${#MISSING_VARS[@]} -gt 0 ]; then
     echo "" >&2
     echo "Please ensure your .env.$ENV_NAME file defines these variables." >&2
     echo "Run: scripts/setup-env.sh to create template files." >&2
+    # Use 'return' if sourced, 'exit' if executed. 'return' fails when not sourced, so redirect its error to /dev/null.
     return 1 2>/dev/null || exit 1
 fi

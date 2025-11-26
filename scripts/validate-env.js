@@ -206,7 +206,10 @@ function main() {
 }
 
 if (require.main === module) {
-  main()
+  main().catch((error) => {
+    console.error('Unhandled error:', error)
+    process.exit(1)
+  })
 }
 
 module.exports = { parseEnvFile, validateEnvironment }
