@@ -61,7 +61,7 @@ printf '<?xml version="1.0" encoding="UTF-8"?>
     
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/KlaayGuard-Dev.app/Contents/MacOS/KlaayGuard</string>
+        <string>/Applications/KlaayGuard-Dev.app/Contents/MacOS/KlaayGuard-Dev</string>
     </array>
     
     <key>RunAtLoad</key>
