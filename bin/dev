@@ -1,54 +1,57 @@
-#!/usr/bin/env fish
+#!/usr/bin/env bash
 
 # bin/dev - Start KlaayGuard in development mode
 # Usage: bin/dev
 
 # Colors for output
-set -l green (set_color green)
-set -l blue (set_color blue)
-set -l yellow (set_color yellow)
-set -l normal (set_color normal)
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+NORMAL='\033[0m'
 
-echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
-echo "$blue  KlaayGuard Development Server$normal"
-echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NORMAL}"
+echo -e "${BLUE}  KlaayGuard Development Server${NORMAL}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NORMAL}"
 echo ""
 
 # Check if Rust is installed
-if not type -q cargo
-    echo "$yellow⚠  Rust not found.$normal"
+if ! command -v cargo &> /dev/null; then
+    echo -e "${YELLOW}⚠  Rust not found.${NORMAL}"
     echo "Please run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
     exit 1
-end
+fi
 
 # Check if Tauri CLI is installed
-if not type -q cargo-tauri
-    echo "$yellow⚠  Tauri CLI not found. Installing...$normal"
+if ! command -v cargo-tauri &> /dev/null; then
+    echo -e "${YELLOW}⚠  Tauri CLI not found. Installing...${NORMAL}"
     cargo install tauri-cli --version "^2.0.0"
-end
+fi
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Load environment variables from .env files
-set -l script_dir (dirname (status --current-filename))
-source $script_dir/../scripts/load-env.fish development
+# shellcheck source=../scripts/load-env.sh
+source "$SCRIPT_DIR/../scripts/load-env.sh" development
 
-if test $status -ne 0
-    echo "$yellow⚠  Failed to load environment configuration, using defaults$normal"
-    set -x VITE_API_BASE_URL http://localhost:3000
-    set -x VITE_EARTHENWARE_URL http://localhost:5173
-    set -x KLAAYGUARD_COLLECTION_INTERVAL_SECONDS 3600
-end
+if [ $? -ne 0 ]; then
+    echo -e "${YELLOW}⚠  Failed to load environment configuration, using defaults${NORMAL}"
+    export VITE_API_BASE_URL="http://localhost:3000"
+    export VITE_EARTHENWARE_URL="http://localhost:5173"
+    export KLAAYGUARD_COLLECTION_INTERVAL_SECONDS="3600"
+fi
 
 # Set development-specific variables
-set -x APP_DEFAULT_API_BASE_URL $VITE_API_BASE_URL
-set -x RUST_LOG info
+export APP_DEFAULT_API_BASE_URL="$VITE_API_BASE_URL"
+export RUST_LOG="info"
 
-echo "$green✓$normal API URL: $VITE_API_BASE_URL"
-echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
-echo "$green✓$normal Collection Interval: $KLAAYGUARD_COLLECTION_INTERVAL_SECONDS seconds"
+echo -e "${GREEN}✓${NORMAL} API URL: $VITE_API_BASE_URL"
+echo -e "${GREEN}✓${NORMAL} Earthenware URL: $VITE_EARTHENWARE_URL"
+echo -e "${GREEN}✓${NORMAL} Collection Interval: $KLAAYGUARD_COLLECTION_INTERVAL_SECONDS seconds"
 echo ""
 
 # Generate Launch Agent plist with current environment variables
-echo "$blue📝 Generating Launch Agent configuration...$normal"
+echo -e "${BLUE}📝 Generating Launch Agent configuration...${NORMAL}"
 printf '<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -89,100 +92,109 @@ printf '<?xml version="1.0" encoding="UTF-8"?>
     <string>/tmp/klaayguard-dev-launchd-error.log</string>
 </dict>
 </plist>' "$VITE_API_BASE_URL" "$VITE_EARTHENWARE_URL" "$KLAAYGUARD_COLLECTION_INTERVAL_SECONDS" > com.klaay.klaayguard-dev.plist
-echo "$green✓$normal Plist generated with current environment variables"
+echo -e "${GREEN}✓${NORMAL} Plist generated with current environment variables"
 echo ""
 
 # Check if dev app bundle needs to be built/updated
-set -l dev_app_path "/Applications/KlaayGuard-Dev.app"
-set -l needs_build 0
+DEV_APP_PATH="/Applications/KlaayGuard-Dev.app"
+NEEDS_BUILD=0
 
-if not test -d "$dev_app_path"
-    echo "$yellow⚠  Dev app not found in Applications folder$normal"
-    set needs_build 1
+if [ ! -d "$DEV_APP_PATH" ]; then
+    echo -e "${YELLOW}⚠  Dev app not found in Applications folder${NORMAL}"
+    NEEDS_BUILD=1
 else
     # Check if source is newer than installed app
-    set -l src_mtime (stat -f %m src-tauri/src/lib.rs 2>/dev/null; or echo 0)
-    set -l app_mtime (stat -f %m "$dev_app_path/Contents/MacOS/KlaayGuard-Dev" 2>/dev/null; or echo 0)
+    if [ -f "src-tauri/src/lib.rs" ]; then
+        SRC_MTIME=$(stat -f %m src-tauri/src/lib.rs 2>/dev/null || echo 0)
+    else
+        SRC_MTIME=0
+    fi
     
-    if test $src_mtime -gt $app_mtime
-        echo "$yellow⚠  Source code is newer than installed app$normal"
-        set needs_build 1
-    end
-end
+    if [ -f "$DEV_APP_PATH/Contents/MacOS/KlaayGuard" ]; then
+        APP_MTIME=$(stat -f %m "$DEV_APP_PATH/Contents/MacOS/KlaayGuard" 2>/dev/null || echo 0)
+    else
+        APP_MTIME=0
+    fi
+    
+    if [ "$SRC_MTIME" -gt "$APP_MTIME" ]; then
+        echo -e "${YELLOW}⚠  Source code is newer than installed app${NORMAL}"
+        NEEDS_BUILD=1
+    fi
+fi
 
-if test $needs_build -eq 1
-    echo "$blue📦 Building and installing dev app bundle...$normal"
-    echo "$yellow   This will take a minute...$normal"
+if [ "$NEEDS_BUILD" -eq 1 ]; then
+    echo -e "${BLUE}📦 Building and installing dev app bundle...${NORMAL}"
+    echo -e "${YELLOW}   This will take a minute...${NORMAL}"
     echo ""
     
     # Build the dev bundle with development environment variables
-    set -lx KLAAY_ENV development
+    export KLAAY_ENV=development
     cargo tauri build --debug --config src-tauri/tauri.development.json
     
     # Kill any running instance
-    pkill -f "KlaayGuard-Dev" 2>/dev/null; or true
+    pkill -f "KlaayGuard-Dev" 2>/dev/null || true
     
     # Remove old dev app
-    rm -rf "$dev_app_path" 2>/dev/null; or true
+    rm -rf "$DEV_APP_PATH" 2>/dev/null || true
     
     # Copy new dev app to Applications
-    if test -d "src-tauri/target/debug/bundle/macos/KlaayGuard-Dev.app"
+    if [ -d "src-tauri/target/debug/bundle/macos/KlaayGuard-Dev.app" ]; then
         cp -R "src-tauri/target/debug/bundle/macos/KlaayGuard-Dev.app" /Applications/
-        echo "$green✓$normal Dev app installed to $dev_app_path"
+        echo -e "${GREEN}✓${NORMAL} Dev app installed to $DEV_APP_PATH"
         
         # Force re-registration of URL scheme
-        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$dev_app_path"
-        echo "$green✓$normal URL scheme registered for dev app"
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DEV_APP_PATH"
+        echo -e "${GREEN}✓${NORMAL} URL scheme registered for dev app"
     else
-        echo "$yellow⚠  Build failed - app bundle not found$normal"
+        echo -e "${YELLOW}⚠  Build failed - app bundle not found${NORMAL}"
         exit 1
-    end
+    fi
     echo ""
-end
+fi
 
 # Install Launch Agent for auto-restart and keep-alive
-set -l launch_agent_path "$HOME/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
-echo "$blue🔄 Installing Launch Agent for auto-restart...$normal"
+LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
+echo -e "${BLUE}🔄 Installing Launch Agent for auto-restart...${NORMAL}"
 
 # Unload existing agent if present (kill running instance first)
-pkill -f "KlaayGuard" 2>/dev/null; or true
-launchctl unload "$launch_agent_path" 2>/dev/null; or true
+pkill -f "KlaayGuard" 2>/dev/null || true
+launchctl unload "$LAUNCH_AGENT_PATH" 2>/dev/null || true
 
 # Copy the generated plist to LaunchAgents
-cp com.klaay.klaayguard-dev.plist "$launch_agent_path"
-echo "$green✓$normal Launch Agent plist copied to ~/Library/LaunchAgents/"
+cp com.klaay.klaayguard-dev.plist "$LAUNCH_AGENT_PATH"
+echo -e "${GREEN}✓${NORMAL} Launch Agent plist copied to ~/Library/LaunchAgents/"
 
 # Load the agent
-if launchctl load "$launch_agent_path" 2>/dev/null
-    echo "$green✓$normal Launch Agent loaded - KlaayGuard-Dev will:"
+if launchctl load "$LAUNCH_AGENT_PATH" 2>/dev/null; then
+    echo -e "${GREEN}✓${NORMAL} Launch Agent loaded - KlaayGuard-Dev will:"
     echo "   • Auto-start on login"
     echo "   • Auto-restart if it crashes"
     echo "   • Use API: $VITE_API_BASE_URL"
 else
-    echo "$yellow⚠  Failed to load Launch Agent, but continuing...$normal"
-end
+    echo -e "${YELLOW}⚠  Failed to load Launch Agent, but continuing...${NORMAL}"
+fi
 echo ""
 
-echo "$blue🚀 KlaayGuard-Dev is managed by Launch Agent$normal"
-echo "$yellow⚠  App runs in system tray (no window)$normal"
-echo "$yellow⚠  Look for 'KlaayGuard-Dev' icon in top-right menu bar$normal"
+echo -e "${BLUE}🚀 KlaayGuard-Dev is managed by Launch Agent${NORMAL}"
+echo -e "${YELLOW}⚠  App runs in system tray (no window)${NORMAL}"
+echo -e "${YELLOW}⚠  Look for 'KlaayGuard-Dev' icon in top-right menu bar${NORMAL}"
 echo ""
-echo "$green✓$normal KlaayGuard-Dev will:"
+echo -e "${GREEN}✓${NORMAL} KlaayGuard-Dev will:"
 echo "   • Start automatically (Launch Agent is running it)"
 echo "   • Restart if it crashes"
 echo "   • Start on every login"
 echo ""
-echo "$blue📝 To view logs:$normal"
+echo -e "${BLUE}📝 To view logs:${NORMAL}"
 echo "   log stream --predicate 'process == \"KlaayGuard-Dev\"' --level info"
 echo "   tail -f /tmp/klaayguard-dev-launchd.log"
 echo ""
-echo "$blue🔗 Test deep link:$normal"
+echo -e "${BLUE}🔗 Test deep link:${NORMAL}"
 echo "   open 'klaayguard://auth-callback?token=test123'"
 echo ""
-echo "$blue🛑 To stop and disable auto-restart:$normal"
+echo -e "${BLUE}🛑 To stop and disable auto-restart:${NORMAL}"
 echo "   launchctl unload ~/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
 echo ""
-echo "$blue🔄 To restart manually:$normal"
+echo -e "${BLUE}🔄 To restart manually:${NORMAL}"
 echo "   launchctl start com.klaay.klaayguard-dev"
 echo ""
 

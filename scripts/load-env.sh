@@ -19,11 +19,16 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 load_env_file() {
     local env_file="$1"
     if [ -f "$env_file" ]; then
-        # Export variables from file, ignoring comments and empty lines
-        set -a
-        # shellcheck disable=SC1090
-        source <(grep -v '^#' "$env_file" | grep -v '^$' | sed 's/^/export /')
-        set +a
+        # Read and export variables, ignoring comments and empty lines
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Skip comments and empty lines
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$line" ]] && continue
+            # Export the variable
+            if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                export "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
+            fi
+        done < "$env_file"
         return 0
     fi
     return 1
