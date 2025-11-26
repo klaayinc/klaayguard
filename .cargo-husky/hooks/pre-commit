@@ -2,5 +2,9 @@
 # Pre-commit hook for Rust project
 # Delegates to bin/check
 
+# Get the git root directory
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+cd "$GIT_ROOT"
+
 bin/check
 exit $?
