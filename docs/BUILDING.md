@@ -52,16 +52,28 @@ Used for production releases. Fully optimized build connecting to production inf
 
 ## Build Process
 
+### Setup (First Time Only)
+
+Before building, set up your environment files:
+
+```bash
+scripts/setup-env.sh
+```
+
+This creates `.env.development`, `.env.staging`, and `.env.production` from templates.
+
+### Building
+
 The `bin/build` script:
 
 1. Validates the environment argument
-2. Sets environment variables:
-   - `KLAAY_ENV`: Controls API URL selection in `build.rs`
-   - `VITE_API_BASE_URL`: Explicit API URL (optional)
-   - `VITE_EARTHENWARE_URL`: Earthenware frontend URL
-3. Selects the appropriate Tauri config file
-4. Runs `cargo tauri build` with the correct flags
-5. Reports the location of build artifacts
+2. Loads environment variables from `.env.<environment>` files
+3. Validates required variables are set
+4. Selects the appropriate Tauri config file
+5. Runs `cargo tauri build` with the correct flags
+6. Reports the location of build artifacts
+
+All environment configuration is now managed through `.env.*` files. See [ENVIRONMENT.md](ENVIRONMENT.md) for details.
 
 ## Build Output
 
@@ -121,27 +133,36 @@ See `.github/workflows/` for complete examples:
 
 ## Environment Variable Reference
 
-### Build-time Variables
+### Configuration Files
 
-These are set by `bin/build` and consumed by `build.rs`:
+Environment variables are now managed through `.env.*` files:
+
+- `.env.defaults` - Safe defaults (committed)
+- `.env.development` - Development settings
+- `.env.staging` - Staging settings
+- `.env.production` - Production settings
+- `.env.*.local` - Local overrides (not committed)
+
+### Variable Values by Environment
 
 | Variable | Development | Staging | Production |
 |----------|-------------|---------|------------|
 | `KLAAY_ENV` | `development` | `staging` | `production` |
 | `VITE_API_BASE_URL` | `http://localhost:3000` | `https://api.klaay.dev` | `https://api.klaay.com` |
 | `VITE_EARTHENWARE_URL` | `http://localhost:5173` | `https://app.klaay.dev` | `https://app.klaay.com` |
+| `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `3600` | `3600` | `3600` |
 
 ### Runtime Variables
 
-These can be set when running the built app (development only):
-
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `APP_DEFAULT_API_BASE_URL` | From `KLAAY_ENV` | Override API base URL |
+| `VITE_API_BASE_URL` | From `.env.*` | Can override at runtime (development only) |
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `3600` | Data collection interval in seconds |
 | `RUST_LOG` | `info` | Logging level |
 
-**Note**: Runtime environment variables only work for development builds launched via Launch Agent. Production and staging builds have the API URL compiled in.
+**Note**: Runtime environment variable overrides only work for development builds. Production and staging builds have values compiled in from the `.env.*` files.
+
+For complete documentation, see [ENVIRONMENT.md](ENVIRONMENT.md)
 
 ## Local Development vs Production Builds
 

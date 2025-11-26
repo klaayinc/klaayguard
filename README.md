@@ -100,23 +100,36 @@ cargo tauri build --target x86_64-unknown-linux-gnu  # Linux
 
 ## 🔧 Configuration
 
+### Environment Setup
+
+KlaayGuard uses environment files for configuration management. Before building, set up your environment files:
+
+```bash
+# Copy template files
+scripts/setup-env.sh
+
+# Validate configuration
+node scripts/validate-env.js
+```
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VITE_API_BASE_URL` | `https://api.klaay.com` | Kiln API base URL |
-| `VITE_EARTHENWARE_URL` | `https://app.klaay.com` | Earthenware login URL |
+| `VITE_API_BASE_URL` | (required) | Kiln API base URL |
+| `VITE_EARTHENWARE_URL` | (required) | Earthenware login URL |
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `3600` | Collection interval (1 hour) |
 | `VITE_SENTRY_DSN` | (empty) | Sentry error tracking DSN |
 
-### Local .env files
+### Environment Files
 
-Create `.env.development.local` for local development:
+- `.env.defaults` - Safe defaults (committed)
+- `.env.development` - Development configuration
+- `.env.staging` - Staging configuration
+- `.env.production` - Production configuration
+- `.env.*.local` - Local overrides (not committed)
 
-```bash
-VITE_API_BASE_URL=http://localhost:3000
-VITE_EARTHENWARE_URL=http://localhost:5173
-```
+For detailed configuration instructions, see [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)
 
 ### API Endpoints
 
@@ -174,11 +187,19 @@ On failure, a system notification appears with details.
 ## 🛠️ Development Commands
 
 ```bash
-# Development (with local API)
-VITE_API_BASE_URL=http://localhost:3000 cargo tauri dev
+# Setup environment files (first time only)
+scripts/setup-env.sh
 
-# Build release
-cargo tauri build
+# Development (with local API)
+bin/dev
+
+# Build for specific environment
+bin/build development
+bin/build staging
+bin/build production
+
+# Validate environment configuration
+node scripts/validate-env.js
 
 # Check code
 cargo check --manifest-path=src-tauri/Cargo.toml

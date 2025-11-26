@@ -400,50 +400,70 @@ flowchart TD
 
 ## Environment Variables
 
-### Required
-None (all have defaults)
+### Configuration Management
 
-### Optional
+KlaayGuard uses centralized environment files to prevent configuration drift:
+
+- `.env.defaults` - Safe defaults
+- `.env.development` - Development configuration
+- `.env.staging` - Staging configuration
+- `.env.production` - Production configuration
+- `.env.*.local` - Local overrides (not committed)
+
+See [ENVIRONMENT.md](ENVIRONMENT.md) for complete documentation.
+
+### Required Variables
+
+| Variable | Description |
+|----------|-------------|
+| `VITE_API_BASE_URL` | Kiln API endpoint |
+| `VITE_EARTHENWARE_URL` | Login page URL |
+| `KLAAY_ENV` | Environment name (development/staging/production) |
+
+### Optional Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VITE_API_BASE_URL` | `https://api.klaay.com` | Kiln API endpoint |
-| `VITE_EARTHENWARE_URL` | `https://app.klaay.com` | Login page URL |
-| `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `3600` | Collection frequency |
-| `VITE_SENTRY_DSN` | (none) | Error tracking |
+| `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `3600` | Collection frequency (seconds) |
+| `VITE_SENTRY_DSN` | (empty) | Error tracking DSN |
 
 ### Build-time Variables
 
 | Variable | Description |
 |----------|-------------|
-| `APP_DEFAULT_API_BASE_URL` | Compiled-in API URL fallback |
-| `KLAAY_ENV` | Build environment (development/staging/production) |
 | `TAURI_SIGNING_PRIVATE_KEY` | Code signing key for updater |
 
 ## Build Process
 
+### Setup (First Time)
+
+```bash
+# Create environment files from templates
+scripts/setup-env.sh
+
+# Validate configuration
+node scripts/validate-env.js
+```
+
 ### Development
 
 ```bash
-# Run with local API
-VITE_API_BASE_URL=http://localhost:3000 cargo tauri dev
+# Run with local API (loads .env.development)
+bin/dev
 ```
 
 ### Production
 
 ```bash
-# Build for production
-cargo tauri build
-
-# Platform-specific
-cargo tauri build --target aarch64-apple-darwin
-cargo tauri build --target x86_64-pc-windows-msvc
-cargo tauri build --target x86_64-unknown-linux-gnu
+# Build for specific environment
+bin/build development  # Loads .env.development
+bin/build staging      # Loads .env.staging
+bin/build production   # Loads .env.production
 ```
 
 ### Environment Selection
 
-Controlled via `scripts/tauri-build.cjs`:
+Environment configuration is loaded from `.env.<environment>` files:
 
 ```javascript
 // KLAAY_ENV determines environment
