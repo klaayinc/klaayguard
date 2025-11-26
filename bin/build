@@ -1,19 +1,21 @@
-#!/usr/bin/env fish
+#!/usr/bin/env bash
 
 # bin/build - Build KlaayGuard for different environments
 # Usage: bin/build <environment>
 #   environment: development, staging, or production
 
+set -e  # Exit on error
+
 # Colors for output
-set -l green (set_color green)
-set -l blue (set_color blue)
-set -l yellow (set_color yellow)
-set -l red (set_color red)
-set -l normal (set_color normal)
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NORMAL='\033[0m'
 
 # Check if environment argument is provided
-if test (count $argv) -eq 0
-    echo "$red✗$normal Usage: bin/build <environment>"
+if [ $# -eq 0 ]; then
+    echo -e "${RED}✗${NORMAL} Usage: bin/build <environment>"
     echo ""
     echo "  Environments:"
     echo "    development  - Local development build with localhost API"
@@ -21,133 +23,133 @@ if test (count $argv) -eq 0
     echo "    production   - Production build with production API"
     echo ""
     exit 1
-end
+fi
 
-set -l environment $argv[1]
+ENVIRONMENT="$1"
 
 # Validate environment
-if not contains $environment development staging production
-    echo "$red✗$normal Invalid environment: $environment"
+if [[ ! "$ENVIRONMENT" =~ ^(development|staging|production)$ ]]; then
+    echo -e "${RED}✗${NORMAL} Invalid environment: $ENVIRONMENT"
     echo "  Valid environments: development, staging, production"
     exit 1
-end
+fi
 
-echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
-echo "$blue  KlaayGuard Build Script - $environment$normal"
-echo "$blue━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━$normal"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NORMAL}"
+echo -e "${BLUE}  KlaayGuard Build Script - $ENVIRONMENT${NORMAL}"
+echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NORMAL}"
 echo ""
 
 # Check if Rust is installed
-if not type -q cargo
-    echo "$red✗$normal Rust not found."
+if ! command -v cargo &> /dev/null; then
+    echo -e "${RED}✗${NORMAL} Rust not found."
     echo "Please run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
     exit 1
-end
+fi
 
 # Check if Tauri CLI is installed
-if not type -q cargo-tauri
-    echo "$yellow⚠$normal Tauri CLI not found. Installing..."
+if ! command -v cargo-tauri &> /dev/null; then
+    echo -e "${YELLOW}⚠${NORMAL} Tauri CLI not found. Installing..."
     cargo install tauri-cli --version "^2.0.0"
-end
+fi
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Load environment variables from .env files
-set -l script_dir (dirname (status --current-filename))
-source $script_dir/../scripts/load-env.fish $environment
+# shellcheck source=../scripts/load-env.sh
+source "$SCRIPT_DIR/../scripts/load-env.sh" "$ENVIRONMENT"
 
-if test $status -ne 0
-    echo "$red✗$normal Failed to load environment configuration"
+if [ $? -ne 0 ]; then
+    echo -e "${RED}✗${NORMAL} Failed to load environment configuration"
     exit 1
-end
+fi
 
 # Determine build mode and config file based on environment
-switch $environment
-    case development
-        set -l build_mode debug
-        set -l config_file src-tauri/tauri.development.json
-    case staging
-        set -l build_mode release
-        set -l config_file src-tauri/tauri.staging.json
-    case production
-        set -l build_mode release
-        set -l config_file src-tauri/tauri.conf.json
-end
+case "$ENVIRONMENT" in
+    development)
+        BUILD_MODE="debug"
+        CONFIG_FILE="src-tauri/tauri.development.json"
+        ;;
+    staging)
+        BUILD_MODE="release"
+        CONFIG_FILE="src-tauri/tauri.staging.json"
+        ;;
+    production)
+        BUILD_MODE="release"
+        CONFIG_FILE="src-tauri/tauri.conf.json"
+        ;;
+esac
 
-echo "$green✓$normal Environment: $environment"
-echo "$green✓$normal Build Mode: $build_mode"
-echo "$green✓$normal Config File: $config_file"
-echo "$green✓$normal API URL: $VITE_API_BASE_URL"
-echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
+echo -e "${GREEN}✓${NORMAL} Environment: $ENVIRONMENT"
+echo -e "${GREEN}✓${NORMAL} Build Mode: $BUILD_MODE"
+echo -e "${GREEN}✓${NORMAL} Config File: $CONFIG_FILE"
+echo -e "${GREEN}✓${NORMAL} API URL: $VITE_API_BASE_URL"
+echo -e "${GREEN}✓${NORMAL} Earthenware URL: $VITE_EARTHENWARE_URL"
 echo ""
 
 # Build the application
-echo "$blue📦 Building KlaayGuard for $environment...$normal"
+echo -e "${BLUE}📦 Building KlaayGuard for $ENVIRONMENT...${NORMAL}"
 echo ""
 
-if test $build_mode = "debug"
+if [ "$BUILD_MODE" = "debug" ]; then
     # Debug build for development
-    cargo tauri build --debug --config $config_file
+    cargo tauri build --debug --config "$CONFIG_FILE"
 else
     # Release build for staging/production
-    cargo tauri build --config $config_file
-end
+    cargo tauri build --config "$CONFIG_FILE"
+fi
 
-if test $status -ne 0
+if [ $? -ne 0 ]; then
     echo ""
-    echo "$red✗$normal Build failed"
+    echo -e "${RED}✗${NORMAL} Build failed"
     exit 1
-end
+fi
 
 echo ""
-echo "$green✓$normal Build completed successfully"
+echo -e "${GREEN}✓${NORMAL} Build completed successfully"
 echo ""
 
 # Determine output paths based on OS and build mode
-set -l os_type (uname -s)
-switch $os_type
-    case Darwin
+OS_TYPE="$(uname -s)"
+case "$OS_TYPE" in
+    Darwin)
         # macOS
-        if test $build_mode = "debug"
-            set -l bundle_path src-tauri/target/debug/bundle
-            echo "$blue📦 Build artifacts:$normal"
-            echo "  • $bundle_path/macos/*.app"
-            echo "  • $bundle_path/dmg/*.dmg"
+        if [ "$BUILD_MODE" = "debug" ]; then
+            BUNDLE_PATH="src-tauri/target/debug/bundle"
         else
-            set -l bundle_path src-tauri/target/release/bundle
-            echo "$blue📦 Build artifacts:$normal"
-            echo "  • $bundle_path/macos/*.app"
-            echo "  • $bundle_path/dmg/*.dmg"
-        end
-    case Linux
-        if test $build_mode = "debug"
-            set -l bundle_path src-tauri/target/debug/bundle
-            echo "$blue📦 Build artifacts:$normal"
-            echo "  • $bundle_path/appimage/*.AppImage"
-            echo "  • $bundle_path/deb/*.deb"
+            BUNDLE_PATH="src-tauri/target/release/bundle"
+        fi
+        echo -e "${BLUE}📦 Build artifacts:${NORMAL}"
+        echo "  • $BUNDLE_PATH/macos/*.app"
+        echo "  • $BUNDLE_PATH/dmg/*.dmg"
+        ;;
+    Linux)
+        if [ "$BUILD_MODE" = "debug" ]; then
+            BUNDLE_PATH="src-tauri/target/debug/bundle"
         else
-            set -l bundle_path src-tauri/target/release/bundle
-            echo "$blue📦 Build artifacts:$normal"
-            echo "  • $bundle_path/appimage/*.AppImage"
-            echo "  • $bundle_path/deb/*.deb"
-        end
-    case '*'
+            BUNDLE_PATH="src-tauri/target/release/bundle"
+        fi
+        echo -e "${BLUE}📦 Build artifacts:${NORMAL}"
+        echo "  • $BUNDLE_PATH/appimage/*.AppImage"
+        echo "  • $BUNDLE_PATH/deb/*.deb"
+        ;;
+    *)
         # Windows or other
-        if test $build_mode = "debug"
-            set -l bundle_path src-tauri/target/debug/bundle
-            echo "$blue📦 Build artifacts:$normal"
-            echo "  • $bundle_path/msi/*.msi"
-            echo "  • $bundle_path/nsis/*.exe"
+        if [ "$BUILD_MODE" = "debug" ]; then
+            BUNDLE_PATH="src-tauri/target/debug/bundle"
         else
-            set -l bundle_path src-tauri/target/release/bundle
-            echo "$blue📦 Build artifacts:$normal"
-            echo "  • $bundle_path/msi/*.msi"
-            echo "  • $bundle_path/nsis/*.exe"
-        end
-end
+            BUNDLE_PATH="src-tauri/target/release/bundle"
+        fi
+        echo -e "${BLUE}📦 Build artifacts:${NORMAL}"
+        echo "  • $BUNDLE_PATH/msi/*.msi"
+        echo "  • $BUNDLE_PATH/nsis/*.exe"
+        ;;
+esac
 
 echo ""
-echo "$blue📝 Build Info:$normal"
-echo "  • Environment: $environment"
-echo "  • Build Mode: $build_mode"
+echo -e "${BLUE}📝 Build Info:${NORMAL}"
+echo "  • Environment: $ENVIRONMENT"
+echo "  • Build Mode: $BUILD_MODE"
 echo "  • API URL: $VITE_API_BASE_URL"
 echo "  • Earthenware URL: $VITE_EARTHENWARE_URL"
 echo ""

@@ -27,11 +27,11 @@ node scripts/validate-env.js
 - Staging: `https://api.klaay.dev`
 - Production: `https://api.klaay.com`
 
-### 3. Fish Shell Environment Loading ✓
+### 3. Shell Environment Loading ✓
 
 **Test Command:**
-```fish
-source scripts/load-env.fish development
+```bash
+source scripts/load-env.sh development
 ```
 
 **Result:** Environment variables loaded correctly:
@@ -82,23 +82,15 @@ VITE_EARTHENWARE_URL=https://app.klaay.com
 
 ## Known Issues
 
-### Minor: awk Warning
-When loading env files in Fish shell, an awk usage warning appears:
-```
-usage: awk [-F fs] [-v var=value] [-f progfile | 'prog'] [file ...]
-```
+### No Known Issues
 
-**Impact:** None - this is a harmless warning and doesn't affect functionality. The environment variables are loaded correctly.
-
-**Cause:** The grep pipeline in load-env.fish triggers this on some systems.
-
-**Fix (Optional):** Can be suppressed with `2>/dev/null` if desired, but it's purely cosmetic.
+All environment loading works correctly without warnings or errors.
 
 ## Ready for Development
 
 ✅ All environment files are in place  
 ✅ Validation passes for all environments  
-✅ Environment loading works correctly in Fish shell  
+✅ Environment loading works correctly  
 ✅ bin/dev is ready to run (will build and install on first run)  
 ✅ No API URL drift - single source of truth established  
 
@@ -124,7 +116,7 @@ usage: awk [-F fs] [-v var=value] [-f progfile | 'prog'] [file ...]
 ## System Requirements Met
 
 - ✓ Rust/Cargo: 1.86.0
-- ✓ Fish shell: Available
+- ✓ Bash: Available (standard on all platforms)
 - ✓ Node.js: Available (for validation script)
 - ✓ macOS: Darwin 24.6.0
 

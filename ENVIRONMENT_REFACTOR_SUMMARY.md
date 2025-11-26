@@ -31,7 +31,6 @@ Implemented a centralized environment management system using `.env.*` files as 
 
 **Created:**
 - `scripts/load-env.sh` - Bash script to load env files
-- `scripts/load-env.fish` - Fish shell version for bin/build and bin/dev
 - `scripts/setup-env.sh` - Setup script to copy templates
 - `scripts/validate-env.js` - Validation script for CI and local use
 

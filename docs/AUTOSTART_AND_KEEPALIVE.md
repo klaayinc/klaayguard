@@ -108,19 +108,19 @@ The development environment uses a custom Launch Agent defined in `com.klaay.kla
 
 The Launch Agent is automatically installed when running `bin/dev`:
 
-```fish
+```bash
 # Install Launch Agent for auto-restart and keep-alive
-set -l launch_agent_path "$HOME/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
-if test -f com.klaay.klaayguard-dev.plist
+LAUNCH_AGENT_PATH="$HOME/Library/LaunchAgents/com.klaay.klaayguard-dev.plist"
+if [ -f com.klaay.klaayguard-dev.plist ]; then
     # Unload existing agent if present
-    launchctl unload "$launch_agent_path" 2>/dev/null; or true
+    launchctl unload "$LAUNCH_AGENT_PATH" 2>/dev/null || true
     
     # Copy plist to LaunchAgents
-    cp com.klaay.klaayguard-dev.plist "$launch_agent_path"
+    cp com.klaay.klaayguard-dev.plist "$LAUNCH_AGENT_PATH"
     
     # Load the agent
-    launchctl load "$launch_agent_path"
-end
+    launchctl load "$LAUNCH_AGENT_PATH"
+fi
 ```
 
 ### Key Features

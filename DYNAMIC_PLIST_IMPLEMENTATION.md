@@ -17,9 +17,9 @@ The `bin/dev` script now dynamically generates the plist file using the environm
 
 ### Implementation
 
-```fish
+```bash
 # Generate Launch Agent plist with current environment variables
-echo "$blue📝 Generating Launch Agent configuration...$normal"
+echo -e "${BLUE}📝 Generating Launch Agent configuration...${NORMAL}"
 printf '<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -60,12 +60,12 @@ printf '<?xml version="1.0" encoding="UTF-8"?>
     <string>/tmp/klaayguard-dev-launchd-error.log</string>
 </dict>
 </plist>' "$VITE_API_BASE_URL" "$VITE_EARTHENWARE_URL" "$KLAAYGUARD_COLLECTION_INTERVAL_SECONDS" > com.klaay.klaayguard-dev.plist
-echo "$green✓$normal Plist generated with current environment variables"
+echo -e "${GREEN}✓${NORMAL} Plist generated with current environment variables"
 ```
 
 ### How It Works
 
-1. **Load environment** from `.env.development` using `scripts/load-env.fish`
+1. **Load environment** from `.env.development` using `scripts/load-env.sh`
 2. **Generate plist** using `printf` with environment variable substitution
 3. **Write to file** `com.klaay.klaayguard-dev.plist` in project root
 4. **Kill running app** to ensure clean state
@@ -177,7 +177,7 @@ The static `com.klaay.klaayguard-dev.plist` file in the project root is now over
 ## Related Files
 
 - `bin/dev` - Development script with plist generation
-- `scripts/load-env.fish` - Environment variable loader
+- `scripts/load-env.sh` - Environment variable loader
 - `.env.development` - Source of environment variables
 - `docs/ENVIRONMENT.md` - Environment management documentation
 
