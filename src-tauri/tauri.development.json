@@ -1,5 +1,5 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "KlaayGuard-Dev",
-  "identifier": "com.klaay.app.dev"
+  "identifier": "com.klaay.app.development"
 }
