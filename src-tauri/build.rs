@@ -36,10 +36,16 @@ fn main() {
     let earthenware_url = std::env::var("VITE_EARTHENWARE_URL").unwrap();
     let klaay_env = std::env::var("KLAAY_ENV").unwrap_or_else(|_| "production".to_string());
 
-    // Debug output
-    println!("cargo:warning=KLAAY_ENV: {}", klaay_env);
-    println!("cargo:warning=VITE_API_BASE_URL: {}", api_base);
-    println!("cargo:warning=VITE_EARTHENWARE_URL: {}", earthenware_url);
+    // Debug output (only in debug builds or when KLAAY_DEBUG is set)
+    let debug_enabled = std::env::var("KLAAY_DEBUG")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    
+    if debug_enabled || cfg!(debug_assertions) {
+        println!("cargo:warning=KLAAY_ENV: {}", klaay_env);
+        println!("cargo:warning=VITE_API_BASE_URL: {}", api_base);
+        println!("cargo:warning=VITE_EARTHENWARE_URL: {}", earthenware_url);
+    }
 
     // Expose compile-time defaults for Rust side
     println!("cargo:rustc-env=APP_DEFAULT_API_BASE_URL={}", api_base);

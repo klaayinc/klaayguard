@@ -1,5 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "KlaayGuard-Staging",
-  "identifier": "com.klaay.app.staging"
+  "identifier": "com.klaay.app.staging",
+  "bundle": {
+    "macOS": {
+      "identifier": "com.klaay.app.staging"
+    },
+    "windows": {
+      "identifier": "com.klaay.app.staging"
+    },
+    "linux": {
+      "identifier": "com.klaay.app.staging"
+    }
+  }
 }

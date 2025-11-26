@@ -64,8 +64,15 @@ if (!hasKey) {
 args.push(...passThrough)
 
 function resolveTauriCommand() {
-  // Try to use cargo-installed tauri-cli first (preferred for system tray-only app)
-  return 'cargo tauri'
+  // Check if cargo-tauri is installed
+  try {
+    execSync('cargo tauri --version', { stdio: 'pipe' })
+    return 'cargo tauri'
+  } catch (error) {
+    console.error('[tauri-build] Error: cargo-tauri not found')
+    console.error('[tauri-build] Please install: cargo install tauri-cli')
+    process.exit(1)
+  }
 }
 
 const tauriCmd = resolveTauriCommand()
