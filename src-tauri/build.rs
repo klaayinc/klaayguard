@@ -1,52 +1,49 @@
 fn main() {
-    // Determine environment for compile-time defaults
-    let klaay_env = std::env::var("KLAAY_ENV")
-        .ok()
-        .or_else(|| std::env::var("NODE_ENV").ok())
-        .unwrap_or_else(|| "production".to_string())
-        .to_lowercase();
+    // Validate required environment variables
+    let required_vars = vec![
+        "VITE_API_BASE_URL",
+        "VITE_EARTHENWARE_URL",
+    ];
+
+    let mut missing_vars = Vec::new();
+    for var in &required_vars {
+        if std::env::var(var).is_err() {
+            missing_vars.push(*var);
+        }
+    }
+
+    if !missing_vars.is_empty() {
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        eprintln!("❌ Build Error: Required environment variables are missing");
+        eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        eprintln!("");
+        eprintln!("Missing variables:");
+        for var in &missing_vars {
+            eprintln!("  - {}", var);
+        }
+        eprintln!("");
+        eprintln!("Solution:");
+        eprintln!("  1. Run: scripts/setup-env.sh");
+        eprintln!("  2. Build using: bin/build <environment>");
+        eprintln!("");
+        eprintln!("See docs/ENVIRONMENT.md for details.");
+        eprintln!("");
+        panic!("Build failed: missing required environment variables");
+    }
+
+    // Get environment variables (already validated)
+    let api_base = std::env::var("VITE_API_BASE_URL").unwrap();
+    let earthenware_url = std::env::var("VITE_EARTHENWARE_URL").unwrap();
+    let klaay_env = std::env::var("KLAAY_ENV").unwrap_or_else(|_| "production".to_string());
 
     // Debug output
     println!("cargo:warning=KLAAY_ENV: {}", klaay_env);
-    println!(
-        "cargo:warning=VITE_API_BASE_URL: {:?}",
-        std::env::var("VITE_API_BASE_URL")
-    );
-
-    // Compute default API base if not explicitly provided
-    let default_api = match klaay_env.as_str() {
-        "staging" => "https://api.klaay.dev",
-        "development" => "http://localhost:3000",
-        _ => "https://api.klaay.com",
-    };
-    let api_base = std::env::var("VITE_API_BASE_URL").unwrap_or_else(|_| default_api.to_string());
-
-    // Compute default Earthenware URL if not explicitly provided
-    let default_earthenware = match klaay_env.as_str() {
-        "staging" => "https://app.klaay.dev",
-        "development" => "http://localhost:5173",
-        _ => "https://app.klaay.com",
-    };
-    let earthenware_url = std::env::var("VITE_EARTHENWARE_URL")
-        .unwrap_or_else(|_| default_earthenware.to_string());
-
-    // Debug output
-    println!("cargo:warning=default_api: {}", default_api);
-    println!("cargo:warning=final api_base: {}", api_base);
-    println!("cargo:warning=default_earthenware: {}", default_earthenware);
-    println!("cargo:warning=final earthenware_url: {}", earthenware_url);
+    println!("cargo:warning=VITE_API_BASE_URL: {}", api_base);
+    println!("cargo:warning=VITE_EARTHENWARE_URL: {}", earthenware_url);
 
     // Expose compile-time defaults for Rust side
     println!("cargo:rustc-env=APP_DEFAULT_API_BASE_URL={}", api_base);
     println!("cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}", earthenware_url);
-    println!(
-        "cargo:warning=Setting APP_DEFAULT_API_BASE_URL to: {}",
-        api_base
-    );
-    println!(
-        "cargo:warning=Setting APP_DEFAULT_EARTHENWARE_URL to: {}",
-        earthenware_url
-    );
 
     let mut windows = tauri_build::WindowsAttributes::new();
     windows = windows.app_manifest(

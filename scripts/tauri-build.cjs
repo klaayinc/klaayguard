@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { spawnSync } = require('node:child_process')
+const { spawnSync, execSync } = require('node:child_process')
 const path = require('node:path')
 const fs = require('node:fs')
 
@@ -7,18 +7,41 @@ const fs = require('node:fs')
 // Allowed values: production | staging | development
 const KLAAY_ENV = (process.env.KLAAY_ENV || process.env.NODE_ENV || 'production').toLowerCase()
 
-// Provide sensible defaults for API/Earthenware URLs if not already set
-if (!process.env.VITE_API_BASE_URL || !process.env.VITE_EARTHENWARE_URL) {
-  if (KLAAY_ENV === 'staging') {
-    process.env.VITE_API_BASE_URL ||= 'https://api.klaay.dev'
-    process.env.VITE_EARTHENWARE_URL ||= 'https://app.klaay.dev'
-  } else if (KLAAY_ENV === 'development') {
-    process.env.VITE_API_BASE_URL ||= 'http://localhost:3000'
-    process.env.VITE_EARTHENWARE_URL ||= 'http://localhost:5173'
-  } else {
-    process.env.VITE_API_BASE_URL ||= 'https://api.klaay.com'
-    process.env.VITE_EARTHENWARE_URL ||= 'https://app.klaay.com'
+// Load environment variables from .env files using bash script
+// This ensures consistency with bin/build and bin/dev
+const projectRoot = path.join(__dirname, '..')
+const loadEnvScript = path.join(projectRoot, 'scripts', 'load-env.sh')
+
+if (fs.existsSync(loadEnvScript)) {
+  try {
+    // Source the script and export variables
+    const envOutput = execSync(`bash -c 'source ${loadEnvScript} ${KLAAY_ENV} && env'`, {
+      cwd: projectRoot,
+      encoding: 'utf8'
+    })
+    
+    // Parse the output and set environment variables
+    envOutput.split('\n').forEach(line => {
+      const match = line.match(/^([^=]+)=(.*)$/)
+      if (match && !process.env[match[1]]) {
+        process.env[match[1]] = match[2]
+      }
+    })
+  } catch (error) {
+    console.error('[tauri-build] Warning: Failed to load environment from .env files:', error.message)
+    console.error('[tauri-build] Continuing with existing environment variables...')
   }
+}
+
+// Validate required variables
+const requiredVars = ['VITE_API_BASE_URL', 'VITE_EARTHENWARE_URL']
+const missingVars = requiredVars.filter(v => !process.env[v])
+
+if (missingVars.length > 0) {
+  console.error('[tauri-build] Error: Required environment variables are not set:')
+  missingVars.forEach(v => console.error(`  - ${v}`))
+  console.error('\nPlease run: scripts/setup-env.sh to create .env files')
+  process.exit(1)
 }
 
 const hasKey = !!process.env.TAURI_SIGNING_PRIVATE_KEY

@@ -50,38 +50,33 @@ if not type -q cargo-tauri
     cargo install tauri-cli --version "^2.0.0"
 end
 
-# Set environment-specific configuration
-set -lx KLAAY_ENV $environment
+# Load environment variables from .env files
+set -l script_dir (dirname (status --current-filename))
+source $script_dir/../scripts/load-env.fish $environment
 
+if test $status -ne 0
+    echo "$red✗$normal Failed to load environment configuration"
+    exit 1
+end
+
+# Determine build mode and config file based on environment
 switch $environment
     case development
-        set -lx VITE_API_BASE_URL http://localhost:3000
-        set -lx VITE_EARTHENWARE_URL http://localhost:5173
         set -l build_mode debug
         set -l config_file src-tauri/tauri.development.json
-        set -l api_url http://localhost:3000
-        set -l earthenware_url http://localhost:5173
     case staging
-        set -lx VITE_API_BASE_URL https://api.klaay.dev
-        set -lx VITE_EARTHENWARE_URL https://app.klaay.dev
         set -l build_mode release
         set -l config_file src-tauri/tauri.staging.json
-        set -l api_url https://api.klaay.dev
-        set -l earthenware_url https://app.klaay.dev
     case production
-        set -lx VITE_API_BASE_URL https://api.klaay.com
-        set -lx VITE_EARTHENWARE_URL https://app.klaay.com
         set -l build_mode release
         set -l config_file src-tauri/tauri.conf.json
-        set -l api_url https://api.klaay.com
-        set -l earthenware_url https://app.klaay.com
 end
 
 echo "$green✓$normal Environment: $environment"
 echo "$green✓$normal Build Mode: $build_mode"
 echo "$green✓$normal Config File: $config_file"
-echo "$green✓$normal API URL: $api_url"
-echo "$green✓$normal Earthenware URL: $earthenware_url"
+echo "$green✓$normal API URL: $VITE_API_BASE_URL"
+echo "$green✓$normal Earthenware URL: $VITE_EARTHENWARE_URL"
 echo ""
 
 # Build the application
@@ -153,7 +148,7 @@ echo ""
 echo "$blue📝 Build Info:$normal"
 echo "  • Environment: $environment"
 echo "  • Build Mode: $build_mode"
-echo "  • API URL: $api_url"
-echo "  • Earthenware URL: $earthenware_url"
+echo "  • API URL: $VITE_API_BASE_URL"
+echo "  • Earthenware URL: $VITE_EARTHENWARE_URL"
 echo ""
 
