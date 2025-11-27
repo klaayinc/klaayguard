@@ -9,7 +9,6 @@ mod keychain;
 mod status;
 
 use sentry::{self, Level};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
@@ -647,15 +646,6 @@ fn set_tray_icon_and_tooltip(app: &tauri::AppHandle, icon_name: &str, tooltip: &
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JsonApiResource {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<String>,
-    #[serde(rename = "type")]
-    resource_type: String,
-    attributes: serde_json::Value,
-}
-
 async fn run_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     log::info!("Starting collection cycle");
     add_breadcrumb("collection", "cycle_start", Level::Info);
@@ -1113,12 +1103,12 @@ async fn download_and_install_update_internal(
         log::info!("🐧 Installing update...");
         if file_extension == "deb" {
             std::process::Command::new("pkexec")
-                .args(&["dpkg", "-i", file_path.to_str().unwrap()])
+                .args(["dpkg", "-i", file_path.to_str().unwrap()])
                 .spawn()
                 .map_err(|e| format!("Failed to install update: {}", e))?;
         } else if file_extension == "rpm" {
             std::process::Command::new("pkexec")
-                .args(&["rpm", "-U", file_path.to_str().unwrap()])
+                .args(["rpm", "-U", file_path.to_str().unwrap()])
                 .spawn()
                 .map_err(|e| format!("Failed to install update: {}", e))?;
         }
@@ -1412,6 +1402,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct JsonApiResource {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(rename = "type")]
+        resource_type: String,
+        attributes: serde_json::Value,
+    }
 
     /// Test that AppState can be created with default values
     #[tokio::test]
