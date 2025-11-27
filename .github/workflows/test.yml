@@ -37,5 +37,7 @@ jobs:
       - name: Setup environment files
         run: scripts/setup-env.sh
 
+      # Run checks (formatting, linting with -D warnings, tests)
+      # Note: bin/check runs clippy with -D warnings to treat all warnings as errors
       - name: Run checks (formatting, linting, tests)
         run: bin/check
