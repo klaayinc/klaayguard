@@ -2239,6 +2239,13 @@ pub fn run() {
                 }
             }
 
+            #[cfg(debug_assertions)]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
+            }
+
             // Emit arch mismatch to UI if flagged by main.rs
             if std::env::var("KLAAY_ARCH_MISMATCH").ok().as_deref() == Some("1") {
                 let built = std::env::var("KLAAY_ARCH_BUILT")
