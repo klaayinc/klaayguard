@@ -54,61 +54,82 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
     });
 }
 
-/// Attempts to extract a JWT token from a klaayguard:// deep link URL and persist it
-fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
-    // Expect formats like: klaayguard://auth-callback?token=JWT
+/// Extract and shape-validate the JWT from a `klaayguard://...?token=...` deep link.
+/// Returns None for a non-klaayguard URL, a missing token, or one that isn't three
+/// dot-separated segments.
+fn parse_deep_link_token(url: &str) -> Option<String> {
     if !url.starts_with("klaayguard://") {
-        log::info!("deep_link_ignored_non_scheme url={}", url);
-        return;
+        return None;
     }
-    log::info!("deep_link_received url={}", url);
-    let token_opt = {
-        // Find the query string
-        let qs = url.splitn(2, '?').nth(1).unwrap_or("");
-        let mut out: Option<String> = None;
-        for pair in qs.split('&') {
-            let mut it = pair.splitn(2, '=');
-            let k = it.next().unwrap_or("");
-            let v = it.next().unwrap_or("");
-            if k == "token" {
-                // Basic percent-decoding for spaces and plus; JWTs rarely need full decoding
-                let decoded = v.replace("%20", " ").replace("+", " ");
-                out = Some(decoded);
-                break;
-            }
+    let qs = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let token = qs.split('&').find_map(|pair| {
+        let mut it = pair.splitn(2, '=');
+        match (it.next(), it.next()) {
+            (Some("token"), Some(v)) => Some(v.replace("%20", " ").replace('+', " ")),
+            _ => None,
         }
-        out
-    };
+    })?;
+    (token.matches('.').count() == 2).then_some(token)
+}
 
-    if let Some(tok) = token_opt {
-        // Basic shape validation: three segments separated by '.'
-        let dot_count = tok.matches('.').count();
-        if dot_count != 2 {
-            add_breadcrumb("auth", "deep_link_invalid_token_shape", Level::Warning);
-            log::warn!("deep_link_invalid_token_shape dot_count={}", dot_count);
-            return;
+/// Turn the /klaayguard/config payload into (logical_id, sql) pairs. An item with an
+/// explicit `sql` uses it; otherwise it defaults to `SELECT * FROM <id>`.
+fn parse_config_queries(cfg: &Value) -> Vec<(String, String)> {
+    cfg.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let id = item.get("id").and_then(|v| v.as_str())?;
+                    let sql = item
+                        .get("sql")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("SELECT * FROM {}", id));
+                    Some((id.to_string(), sql))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Flatten osquery results into JSON:API resources, stamping each row with collected_at.
+fn build_payload_items(results: &HashMap<String, Value>, collected_at: &str) -> Vec<JsonApiResource> {
+    let mut items = Vec::new();
+    for (table, value) in results.iter() {
+        let Some(arr) = value.as_array() else { continue };
+        for row in arr {
+            let mut attributes = row.clone();
+            if let Some(obj) = attributes.as_object_mut() {
+                obj.insert("collected_at".to_string(), json!(collected_at));
+            }
+            items.push(JsonApiResource {
+                id: None,
+                r#type: table.clone(),
+                attributes,
+            });
         }
-        // Save to memory and keychain
-        log::info!(
-            "deep_link_token_parsed length={} saving_to_keychain",
-            tok.len()
-        );
-        tauri::async_runtime::block_on(async {
-            *state.auth_token.write().await = Some(tok.clone());
-            *state.keychain_cleared_this_session.write().await = false;
-        });
-        let _ = keychain::save_token(&tok);
-        log::info!("deep_link_token_saved_to_keychain");
-        let _ = app.emit("auth:status", json!({ "authenticated": true }));
-        add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
-        sentry::capture_message("deep_link_token_saved", Level::Info);
-        // Optionally hide the window if it is visible
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.hide();
-            log::info!("deep_link_window_hidden_after_auth");
-        }
-    } else {
-        log::warn!("deep_link_missing_token_param");
+    }
+    items
+}
+
+/// Persist a JWT delivered via a klaayguard:// deep link.
+fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
+    let Some(tok) = parse_deep_link_token(url) else {
+        log::info!("deep_link_ignored url={}", url);
+        return;
+    };
+    log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
+    tauri::async_runtime::block_on(async {
+        *state.auth_token.write().await = Some(tok.clone());
+        *state.keychain_cleared_this_session.write().await = false;
+    });
+    let _ = keychain::save_token(&tok);
+    let _ = app.emit("auth:status", json!({ "authenticated": true }));
+    add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
+    sentry::capture_message("deep_link_token_saved", Level::Info);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
     }
 }
 
@@ -127,29 +148,6 @@ fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>)
             break;
         }
     }
-}
-
-#[tauri::command]
-async fn set_api_base_url(
-    state: tauri::State<'_, Arc<AppState>>,
-    base: String,
-) -> Result<(), String> {
-    *state.api_base_url.write().await = base;
-    Ok(())
-}
-
-#[tauri::command]
-async fn save_auth_token(
-    state: tauri::State<'_, Arc<AppState>>,
-    token: String,
-) -> Result<(), String> {
-    *state.auth_token.write().await = Some(token.clone());
-    // Reset the session guard; we have a fresh token now
-    *state.keychain_cleared_this_session.write().await = false;
-    let _ = keychain::save_token(&token);
-    add_breadcrumb("auth", "token_saved", Level::Info);
-    sentry::capture_message("auth_token_saved", Level::Info);
-    Ok(())
 }
 
 #[tauri::command]
@@ -187,37 +185,6 @@ async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Resu
         // first run should happen immediately after login/token
         Ok(0)
     }
-}
-
-#[tauri::command]
-/// Gets the hardware serial number from the hardware_info osquery table
-async fn get_device_serial_number(app: tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["hardware_info".to_string()];
-    let query_result = execute_query(app, tables).await?;
-
-    let serial = query_result
-        .get("hardware_info")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|obj| {
-            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
-            obj.get("serial_number")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    obj.get("hardware_serial")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-                .or_else(|| {
-                    obj.get("hardware_uuid")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-        })
-        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
-
-    Ok(serial.to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -318,62 +285,6 @@ async fn get_auth_status(
         authenticated: is_authenticated,
         display_name: name,
     })
-}
-
-#[tauri::command]
-async fn execute_query(
-    app: tauri::AppHandle,
-    table_names: Vec<String>,
-) -> Result<HashMap<String, Value>, String> {
-    #[cfg(windows)]
-    use std::os::windows::process::CommandExt;
-
-    let mut all_results = HashMap::new();
-
-    for table_name in table_names {
-        let cmd = app
-            .shell()
-            .sidecar("osqueryi")
-            .unwrap()
-            .args(["--json", &format!("SELECT * FROM {}", table_name)]);
-
-        let output = cmd.output().await.map_err(|e| e.to_string())?;
-
-        if !output.status.success() {
-            let stderr_str = String::from_utf8_lossy(&output.stderr);
-            let stderr_lc = stderr_str.to_ascii_lowercase();
-            // Gracefully handle missing/unsupported tables by recording an empty result set
-            if stderr_lc.contains("no such table")
-                || stderr_lc.contains("no such column")
-                || stderr_lc.contains("no such module")
-            {
-                all_results.insert(table_name, serde_json::json!([]));
-                continue;
-            }
-            return Err(format!(
-                "table {} failed (exit code {:?}): {}",
-                table_name,
-                output.status.code(),
-                stderr_str
-            ));
-        }
-
-        let stdout_str = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8 output for table {}: {}", table_name, e))?;
-
-        let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
-            format!(
-                "Failed to parse JSON for table {} (content: '{}'): {}",
-                table_name,
-                stdout_str.trim(),
-                e
-            )
-        })?;
-
-        all_results.insert(table_name, parsed_result);
-    }
-
-    Ok(all_results)
 }
 
 /// Executes a batch of SQL statements against osquery and returns results keyed by logical id
@@ -523,8 +434,11 @@ struct JsonApiPayload {
 }
 
 async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
-    let tables = vec!["hardware_info".to_string()];
-    let result = execute_query(app.clone(), tables).await?;
+    let result = execute_sql_batch(
+        app.clone(),
+        vec![("hardware_info".to_string(), "SELECT * FROM hardware_info".to_string())],
+    )
+    .await?;
     let serial = result
         .get("hardware_info")
         .and_then(|v| v.as_array())
@@ -650,24 +564,7 @@ async fn run_cycle(
     }
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
-    // Build query list. If item has an explicit `sql`, use it; otherwise default to SELECT * FROM <id>.
-    let queries: Vec<(String, String)> = cfg_json
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    let id = item.get("id").and_then(|v| v.as_str())?;
-                    let sql = item
-                        .get("sql")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("SELECT * FROM {}", id));
-                    Some((id.to_string(), sql))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let queries = parse_config_queries(&cfg_json);
 
     if queries.is_empty() {
         emit_error_and_focus(
@@ -691,22 +588,7 @@ async fn run_cycle(
     let device_serial = get_device_serial_number_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
-    let mut items: Vec<JsonApiResource> = Vec::new();
-    for (table, value) in results.iter() {
-        if let Some(arr) = value.as_array() {
-            for row in arr {
-                let mut attributes = row.clone();
-                if let Some(obj) = attributes.as_object_mut() {
-                    obj.insert("collected_at".to_string(), json!(collected_at));
-                }
-                items.push(JsonApiResource {
-                    id: None,
-                    r#type: table.clone(),
-                    attributes,
-                });
-            }
-        }
-    }
+    let items = build_payload_items(&results, &collected_at);
     let row_count = items.len();
     if row_count == 0 {
         let _ = app.emit("collection:success", json!({ "sent_rows": 0 }));
@@ -993,104 +875,6 @@ async fn get_arch_status() -> Result<ArchStatus, String> {
     })
 }
 
-#[derive(Serialize)]
-struct RuntimeStatusLoops {
-    collection_seconds_since_last_run: Option<u64>,
-    collection_seconds_until_next_due: Option<i64>,
-}
-
-#[derive(Serialize)]
-struct RuntimeStatusAutostart {
-    platform: String,
-    strategy: String,
-    installed: bool,
-    label: Option<String>,
-}
-
-#[derive(Serialize)]
-struct RuntimeStatus {
-    autostart: RuntimeStatusAutostart,
-    loops: RuntimeStatusLoops,
-    auth: AuthStatus,
-}
-
-#[tauri::command]
-async fn get_runtime_status(
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<RuntimeStatus, String> {
-    // Loops status
-    let collection_seconds_since_last_run = {
-        let last = *state.last_run_at.read().await;
-        last.map(|t| t.elapsed().as_secs())
-    };
-    let collection_seconds_until_next_due = {
-        if state.auth_token.read().await.is_none() {
-            Some(-1)
-        } else {
-            let last = *state.last_attempt_at.read().await;
-            let interval = std::time::Duration::from_secs(collection_interval_seconds());
-            if let Some(last) = last {
-                let elapsed = last.elapsed();
-                if elapsed >= interval {
-                    Some(0)
-                } else {
-                    Some((interval - elapsed).as_secs() as i64)
-                }
-            } else {
-                Some(0)
-            }
-        }
-    };
-    // Auth
-    let auth = if state.auth_token.read().await.is_some() {
-        AuthStatus {
-            authenticated: true,
-            display_name: None,
-        }
-    } else {
-        AuthStatus {
-            authenticated: false,
-            display_name: None,
-        }
-    };
-
-    // Autostart (platform-specific)
-    #[cfg(target_os = "macos")]
-    let autostart = {
-        let label = "com.klaay.klaayguard".to_string();
-        let uid = nix::unistd::getuid().as_raw();
-        let domain = format!("gui/{}", uid);
-        let installed = std::process::Command::new("launchctl")
-            .args(&["print", &format!("{}/{}", domain, &label)])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        RuntimeStatusAutostart {
-            platform: "macos".to_string(),
-            strategy: "launchagent".to_string(),
-            installed,
-            label: Some(label),
-        }
-    };
-
-    #[cfg(not(target_os = "macos"))]
-    let autostart = RuntimeStatusAutostart {
-        platform: std::env::consts::OS.to_string(),
-        strategy: "none".to_string(),
-        installed: false,
-        label: None,
-    };
-
-    Ok(RuntimeStatus {
-        autostart,
-        loops: RuntimeStatusLoops {
-            collection_seconds_since_last_run,
-            collection_seconds_until_next_due,
-        },
-        auth,
-    })
-}
-
 #[derive(serde::Deserialize)]
 struct ReleaseAsset {
     id: u64,
@@ -1297,15 +1081,6 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
     Ok(None)
 }
 
-#[tauri::command]
-async fn check_for_updates_command() -> Result<Option<String>, String> {
-    let api_base = get_api_base_url();
-    log::info!("🌐 Manual update check using API base URL: {}", api_base);
-    Ok(check_for_updates_internal(&api_base)
-        .await?
-        .map(|sel| sel.asset_id))
-}
-
 async fn download_and_install_update_internal(
     api_base: &str,
     asset_id: &str,
@@ -1382,16 +1157,6 @@ async fn download_and_install_update_internal(
     replace_application(&dmg_path, app).await?;
 
     Ok(())
-}
-
-#[tauri::command]
-async fn download_and_install_update(
-    asset_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    let api_base = get_api_base_url();
-    log::info!("🌐 Manual update download using API base URL: {}", api_base);
-    download_and_install_update_internal(&api_base, &asset_id, None, &app).await
 }
 
 async fn replace_application(
@@ -1821,20 +1586,13 @@ pub fn run() {
         })
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            execute_query,
-            get_device_serial_number,
-            save_auth_token,
             clear_auth_token,
-            set_api_base_url,
             get_next_run_in_seconds,
             get_auth_status,
             get_app_version,
             install_launch_agent,
             uninstall_launch_agent,
-            get_arch_status,
-            get_runtime_status,
-            check_for_updates_command,
-            download_and_install_update
+            get_arch_status
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");
@@ -1921,5 +1679,65 @@ mod update_selection_tests {
         assert!(sha256_matches(b"", expected));
         assert!(sha256_matches(b"", &format!("sha256:{}", expected)));
         assert!(!sha256_matches(b"tampered", expected));
+    }
+}
+
+#[cfg(test)]
+mod happy_path_tests {
+    use super::*;
+
+    #[test]
+    fn deep_link_token_extracted_and_shape_validated() {
+        assert_eq!(
+            parse_deep_link_token("klaayguard://auth-callback?token=aaa.bbb.ccc"),
+            Some("aaa.bbb.ccc".to_string())
+        );
+        // token among other params
+        assert_eq!(
+            parse_deep_link_token("klaayguard://x?foo=1&token=aaa.bbb.ccc&bar=2"),
+            Some("aaa.bbb.ccc".to_string())
+        );
+    }
+
+    #[test]
+    fn deep_link_token_rejected_when_invalid() {
+        assert_eq!(parse_deep_link_token("https://evil?token=aaa.bbb.ccc"), None); // wrong scheme
+        assert_eq!(parse_deep_link_token("klaayguard://x?foo=1"), None); // no token
+        assert_eq!(parse_deep_link_token("klaayguard://x?token=not-a-jwt"), None); // wrong shape
+    }
+
+    #[test]
+    fn config_queries_use_explicit_sql_or_default_select() {
+        let cfg = json!({"data": [
+            {"type": "osquery-table", "id": "system_info"},
+            {"type": "osquery-table", "id": "users", "sql": "SELECT username FROM users"}
+        ]});
+        let q = parse_config_queries(&cfg);
+        assert_eq!(q.len(), 2);
+        assert!(q.contains(&("system_info".to_string(), "SELECT * FROM system_info".to_string())));
+        assert!(q.contains(&("users".to_string(), "SELECT username FROM users".to_string())));
+    }
+
+    #[test]
+    fn config_queries_empty_when_no_data() {
+        assert!(parse_config_queries(&json!({})).is_empty());
+        assert!(parse_config_queries(&json!({"data": []})).is_empty());
+    }
+
+    #[test]
+    fn payload_items_flatten_rows_and_stamp_collected_at() {
+        let mut results = HashMap::new();
+        results.insert("users".to_string(), json!([{"username": "a"}, {"username": "b"}]));
+        let items = build_payload_items(&results, "2026-06-22T00:00:00Z");
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| i.r#type == "users"));
+        assert_eq!(items[0].attributes["collected_at"], json!("2026-06-22T00:00:00Z"));
+        assert!(items[0].attributes.get("username").is_some());
+    }
+
+    #[test]
+    fn payload_items_empty_for_no_rows() {
+        let results: HashMap<String, Value> = HashMap::new();
+        assert!(build_payload_items(&results, "T").is_empty());
     }
 }
