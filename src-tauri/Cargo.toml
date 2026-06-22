@@ -29,16 +29,14 @@ tauri-plugin-fs = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1.0.98"
 log = "0.4.27"
 dirs = "5.0"
 tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 sentry = "0.42.0"
 keyring = "2"
-rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
-uuid = { version = "1", features = ["v4"] }
 semver = "1.0"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase", "processenv"] }

@@ -13,17 +13,15 @@
 //! - System tray provides controlled access to app functionality
 
 mod keychain;
-use rusqlite::{params, Connection, ToSql};
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 // removed autostart plugin; using manual LaunchAgent management
 use tauri_plugin_shell::ShellExt;
 // use tauri_plugin_log::LogTarget; // use defaults
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 // Re-introduced minimal osquery commands used by the UI.
 
@@ -33,13 +31,9 @@ pub struct AppState {
     pub api_base_url: RwLock<String>,
     pub last_run_at: RwLock<Option<std::time::Instant>>,
     pub last_attempt_at: RwLock<Option<std::time::Instant>>,
-    pub db_path: RwLock<Option<String>>, // file-backed SQLite path
-    pub upload_in_progress: RwLock<bool>,
     // Prevent repeated Keychain delete prompts by ensuring we only delete once per session
     pub keychain_cleared_this_session: RwLock<bool>,
-    pub last_upload_tick_at: RwLock<Option<std::time::Instant>>, // wake-gap detection for uploader
-    pub last_focus_at: RwLock<Option<std::time::Instant>>,       // debounce for focus-on-failure
-    pub retention_in_progress: RwLock<bool>,
+    pub last_focus_at: RwLock<Option<std::time::Instant>>, // debounce for focus-on-failure
 }
 
 // Keychain access is centralized in src-tauri/src/keychain.rs
@@ -453,13 +447,6 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     Ok(())
 }
 
-fn wake_gap_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_WAKE_GAP_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(300)
-}
-
 fn focus_debounce_seconds() -> u64 {
     std::env::var("KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS")
         .ok()
@@ -467,39 +454,11 @@ fn focus_debounce_seconds() -> u64 {
         .unwrap_or(60)
 }
 
-fn retention_days() -> i64 {
-    std::env::var("KLAAYGUARD_RETENTION_DAYS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(30)
-}
-
-fn retention_interval_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_RETENTION_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(24 * 60 * 60)
-}
-
 fn collection_interval_seconds() -> u64 {
     std::env::var("KLAAYGUARD_COLLECTION_INTERVAL_SECONDS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(900)
-}
-
-fn prune_batch_rows() -> i64 {
-    std::env::var("KLAAYGUARD_PRUNE_BATCH_ROWS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(5000)
-}
-
-fn max_db_mb() -> u64 {
-    std::env::var("KLAAYGUARD_MAX_DB_MB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(200)
 }
 
 async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState>) {
@@ -547,15 +506,6 @@ async fn emit_error_and_focus(
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UploadRow {
-    id: i64,
-    table_name: String,
-    json: String,
-    run_id: String,
-    created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct JsonApiResource {
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
@@ -571,145 +521,6 @@ struct JsonApiPayload {
     meta: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     jsonapi: Option<serde_json::Value>,
-}
-
-async fn get_db_path_cached(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-) -> Result<PathBuf, String> {
-    let current = state.db_path.read().await.clone();
-    if let Some(p) = current {
-        Ok(PathBuf::from(p))
-    } else {
-        get_sqlite_path(app)
-    }
-}
-
-async fn get_last_upload_at(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-) -> Result<String, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    let conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    let mut stmt = conn
-        .prepare("SELECT value FROM metadata WHERE key='last_upload_at' LIMIT 1")
-        .map_err(|e| e.to_string())?;
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let v: String = row.get(0).map_err(|e| e.to_string())?;
-        Ok(v)
-    } else {
-        // Epoch-like timestamp in SQLite default format to match created_at
-        Ok("1970-01-01 00:00:00".to_string())
-    }
-}
-
-async fn select_pending_rows(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    max_rows: usize,
-) -> Result<Vec<UploadRow>, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    let conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    let watermark = get_last_upload_at(app, state).await?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, table_name, json, run_id, created_at \
-             FROM results \
-             WHERE handled=0 AND created_at > ?1 \
-             ORDER BY datetime(created_at) ASC, id ASC \
-             LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query(params![&watermark, max_rows as i64])
-        .map_err(|e| e.to_string())?;
-    let mut out: Vec<UploadRow> = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        out.push(UploadRow {
-            id: row.get(0).map_err(|e| e.to_string())?,
-            table_name: row.get(1).map_err(|e| e.to_string())?,
-            json: row.get(2).map_err(|e| e.to_string())?,
-            run_id: row.get(3).map_err(|e| e.to_string())?,
-            created_at: row.get(4).map_err(|e| e.to_string())?,
-        });
-    }
-    Ok(out)
-}
-
-fn build_in_clause_params(ids: &[i64]) -> (String, Vec<Box<dyn ToSql>>) {
-    // Produce placeholders like ?, ?, ? and corresponding params
-    let mut placeholders = String::new();
-    let mut params_vec: Vec<Box<dyn ToSql>> = Vec::new();
-    for (idx, id) in ids.iter().enumerate() {
-        if idx > 0 {
-            placeholders.push_str(",");
-        }
-        placeholders.push_str("?");
-        params_vec.push(Box::new(*id));
-    }
-    (placeholders, params_vec)
-}
-
-async fn mark_rows_handled_and_advance_watermark(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    ids: &[i64],
-) -> Result<(), String> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let db_path = get_db_path_cached(app, state).await?;
-    let mut conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    // UPDATE handled flag
-    let (ph, params_vec) = build_in_clause_params(ids);
-    let update_sql = format!(
-        "UPDATE results SET handled=1, handled_at=CURRENT_TIMESTAMP WHERE id IN ({})",
-        ph
-    );
-    {
-        let mut stmt = tx.prepare(&update_sql).map_err(|e| e.to_string())?;
-        let params_slice: Vec<&dyn ToSql> = params_vec.iter().map(|b| &**b as &dyn ToSql).collect();
-        stmt.execute(rusqlite::params_from_iter(params_slice))
-            .map_err(|e| e.to_string())?;
-    }
-    // MAX(created_at) for watermark
-    let select_sql = format!("SELECT MAX(created_at) FROM results WHERE id IN ({})", ph);
-    let max_created_at: Option<String> = {
-        let mut stmt = tx.prepare(&select_sql).map_err(|e| e.to_string())?;
-        let params_slice: Vec<&dyn ToSql> = params_vec.iter().map(|b| &**b as &dyn ToSql).collect();
-        let mut rows = stmt
-            .query(rusqlite::params_from_iter(params_slice))
-            .map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            row.get(0).ok()
-        } else {
-            None
-        }
-    };
-    if let Some(max_ts) = max_created_at {
-        tx.execute(
-            "INSERT INTO metadata(key, value) VALUES('last_upload_at', ?1) \
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![&max_ts],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
@@ -737,252 +548,6 @@ async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<Str
         })
         .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
     Ok(serial.to_string())
-}
-
-async fn run_upload_cycle(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    client: &reqwest::Client,
-) -> Result<(), String> {
-    // prevent overlap
-    {
-        let uploading = *state.upload_in_progress.read().await;
-        if uploading {
-            return Ok(());
-        }
-    }
-    *state.upload_in_progress.write().await = true;
-    let token = match state.auth_token.read().await.clone() {
-        Some(t) => t,
-        None => {
-            *state.upload_in_progress.write().await = false;
-            return Ok(());
-        }
-    };
-    let base = state.api_base_url.read().await.clone();
-    // Select pending rows
-    let max_rows: usize = std::env::var("KLAAYGUARD_UPLOAD_MAX_ROWS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(1000);
-    let rows = select_pending_rows(app, state, max_rows).await?;
-    if rows.is_empty() {
-        *state.upload_in_progress.write().await = false;
-        return Ok(());
-    }
-    add_breadcrumb(
-        "upload",
-        &format!("pending_rows:{}", rows.len()),
-        Level::Info,
-    );
-    sentry::capture_message("upload_pending_rows", Level::Info);
-    let device_serial = get_device_serial_number_internal(app)
-        .await
-        .unwrap_or_else(|_| "unknown".to_string());
-    let mut items: Vec<JsonApiResource> = Vec::with_capacity(rows.len());
-    let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
-    for r in rows {
-        ids.push(r.id);
-        let mut parsed_json: Value =
-            serde_json::from_str(&r.json).unwrap_or(json!({"_raw": r.json}));
-
-        // Add the collected_at timestamp to the attributes
-        if let Some(attributes) = parsed_json.as_object_mut() {
-            attributes.insert("collected_at".to_string(), json!(r.created_at));
-        } else {
-            // If parsed_json is not an object, create a new object with the raw data and timestamp
-            parsed_json = json!({
-                "_raw": r.json,
-                "collected_at": r.created_at
-            });
-        }
-
-        items.push(JsonApiResource {
-            id: None,
-            r#type: r.table_name,
-            attributes: parsed_json,
-        });
-    }
-    let payload = JsonApiPayload {
-        data: items,
-        meta: Some(json!({ "device_uuid": device_serial })), // Note: device_uuid field now contains hardware serial number
-        jsonapi: Some(json!({ "version": "1.0" })),
-    };
-    let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
-    let retry_delays = [60u64, 120u64];
-    let mut attempt: usize = 0;
-    loop {
-        // Serialize payload first to avoid reqwest::RequestBuilder.json() overwriting Content-Type
-        let body_json = serde_json::to_vec(&payload).unwrap_or_else(|e| {
-            add_breadcrumb("upload", &format!("serialize_error:{}", e), Level::Error);
-            // Fallback to empty object; server will 400 and we will surface the error
-            b"{}".to_vec()
-        });
-        let send_result = client
-            .post(format!("{}/klaayguard/data", base))
-            .bearer_auth(&token)
-            .header(reqwest::header::CONTENT_TYPE, "application/vnd.api+json")
-            .header(reqwest::header::ACCEPT, "application/vnd.api+json")
-            .body(body_json)
-            .send()
-            .await;
-        match send_result {
-            Ok(resp) => {
-                add_breadcrumb(
-                    "upload",
-                    &format!("post_status:{}", resp.status().as_u16()),
-                    Level::Info,
-                );
-                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                    || resp.status() == reqwest::StatusCode::FORBIDDEN
-                {
-                    add_breadcrumb("upload", "auth_invalidated_on_post", Level::Warning);
-                    invalidate_auth(app, state).await?;
-                    let _ = app.emit(
-                        "upload:error",
-                        json!({ "stage": "post", "status": resp.status().as_u16() }),
-                    );
-                    *state.upload_in_progress.write().await = false;
-                    return Ok(());
-                }
-                if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED {
-                    mark_rows_handled_and_advance_watermark(app, state, &ids).await?;
-                    let _ = app.emit("upload:success", json!({ "count": ids.len() }));
-                    log::info!("upload_success submitted_count={}", ids.len());
-                    add_breadcrumb(
-                        "upload",
-                        &format!("success_count:{}", ids.len()),
-                        Level::Info,
-                    );
-                    break;
-                } else if is_transient_status(resp.status().as_u16())
-                    && attempt < retry_delays.len()
-                {
-                    let delay = retry_delays[attempt];
-                    add_breadcrumb(
-                        "upload",
-                        &format!("transient_status_retry_in_s:{}", delay),
-                        Level::Warning,
-                    );
-                    sentry::capture_message("upload_transient_status_retry", Level::Warning);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    attempt += 1;
-                    continue;
-                } else {
-                    emit_error_and_focus(
-                        app,
-                        state,
-                        "upload:error",
-                        json!({ "stage": "post", "status": resp.status().as_u16() }),
-                    )
-                    .await;
-                    sentry::capture_message("upload_error_non_transient", Level::Warning);
-                    break;
-                }
-            }
-            Err(e) => {
-                add_breadcrumb("upload", &format!("network_error:{}", e), Level::Warning);
-                sentry::capture_message("upload_network_error", Level::Warning);
-                if attempt < retry_delays.len() {
-                    let delay = retry_delays[attempt];
-                    add_breadcrumb("upload", &format!("retry_in_s:{}", delay), Level::Warning);
-                    sentry::capture_message("upload_retry", Level::Warning);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    attempt += 1;
-                    continue;
-                } else {
-                    emit_error_and_focus(
-                        app,
-                        state,
-                        "upload:error",
-                        json!({ "stage": "network", "error": e.to_string() }),
-                    )
-                    .await;
-                    sentry::capture_message("upload_error_network_final", Level::Warning);
-                    break;
-                }
-            }
-        }
-    }
-    *state.upload_in_progress.write().await = false;
-    Ok(())
-}
-
-fn spawn_upload_loop(app: tauri::AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        let client = reqwest::Client::builder()
-            .user_agent("klaayguard/0.1")
-            .build()
-            .expect("reqwest client (uploader)");
-        // wait for token once
-        loop {
-            if state.auth_token.read().await.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-        // immediate drain
-        if let Err(e) = run_upload_cycle(&app, &state, &client).await {
-            log::error!("initial upload cycle error: {}", e);
-            emit_error_and_focus(
-                &app,
-                &state,
-                "upload:error",
-                json!({ "stage": "internal", "error": e }),
-            )
-            .await;
-        }
-        // interval loop (default 15 minutes)
-        let interval_secs: u64 = std::env::var("KLAAYGUARD_UPLOAD_INTERVAL_SECONDS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(900);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        // initialize last upload tick to now
-        *state.last_upload_tick_at.write().await = Some(std::time::Instant::now());
-        loop {
-            interval.tick().await;
-            let now = std::time::Instant::now();
-            let woke = {
-                let last = *state.last_upload_tick_at.read().await;
-                if let Some(prev) = last {
-                    let elapsed = now.duration_since(prev);
-                    let threshold = std::time::Duration::from_secs(wake_gap_seconds());
-                    elapsed >= threshold
-                } else {
-                    false
-                }
-            };
-            if let Err(e) = run_upload_cycle(&app, &state, &client).await {
-                log::error!("upload cycle error: {}", e);
-                emit_error_and_focus(
-                    &app,
-                    &state,
-                    "upload:error",
-                    json!({ "stage": "internal", "error": e }),
-                )
-                .await;
-            }
-            if woke {
-                let _ = app.emit("system:wake_detected", json!({ "loop": "upload" }));
-                add_breadcrumb("system", "wake_detected_upload", Level::Info);
-                sentry::capture_message("wake_detected_upload", Level::Info);
-                // immediate extra drain to catch up after wake
-                if let Err(e) = run_upload_cycle(&app, &state, &client).await {
-                    log::error!("upload cycle (post-wake) error: {}", e);
-                    emit_error_and_focus(
-                        &app,
-                        &state,
-                        "upload:error",
-                        json!({ "stage": "internal", "error": e, "post_wake": true }),
-                    )
-                    .await;
-                    sentry::capture_message("upload_error_post_wake", Level::Warning);
-                }
-            }
-            *state.last_upload_tick_at.write().await = Some(now);
-        }
-    });
 }
 
 async fn run_cycle(
@@ -1120,40 +685,117 @@ async fn run_cycle(
     add_breadcrumb("collection", "osquery_start", Level::Info);
     sentry::capture_message("collection_osquery_start", Level::Info);
     let results = execute_sql_batch(app.clone(), queries).await?;
-
-    // 3) Persist results to SQLite (Loop A)
-    let run_id = Uuid::new_v4().to_string();
-    let inserted = persist_results_to_sqlite(app, state, &run_id, &results).await?;
     *state.last_run_at.write().await = Some(std::time::Instant::now());
-    let _ = app.emit(
-        "collection:success",
-        json!({ "inserted_rows": inserted, "run_id": run_id }),
-    );
-    log::info!(
-        "collection_success inserted_rows={} run_id={}",
-        inserted,
-        run_id
-    );
-    add_breadcrumb(
-        "collection",
-        &format!("persisted_rows:{} run_id:{}", inserted, run_id),
-        Level::Info,
-    );
-    sentry::capture_message("collection_persisted", Level::Info);
 
-    // Trigger uploader immediately after successful collection to restart retry loop (B)
-    if let Err(e) = run_upload_cycle(app, state, client).await {
-        log::error!("upload cycle (post-collection) error: {}", e);
-        emit_error_and_focus(
-            app,
-            state,
-            "upload:error",
-            json!({ "stage": "internal", "error": e, "post_collection": true }),
-        )
-        .await;
+    // 3) Build the JSON:API payload from the freshly collected rows
+    let collected_at = chrono::Utc::now().to_rfc3339();
+    let device_serial = get_device_serial_number_internal(app)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    let mut items: Vec<JsonApiResource> = Vec::new();
+    for (table, value) in results.iter() {
+        if let Some(arr) = value.as_array() {
+            for row in arr {
+                let mut attributes = row.clone();
+                if let Some(obj) = attributes.as_object_mut() {
+                    obj.insert("collected_at".to_string(), json!(collected_at));
+                }
+                items.push(JsonApiResource {
+                    id: None,
+                    r#type: table.clone(),
+                    attributes,
+                });
+            }
+        }
     }
+    let row_count = items.len();
+    if row_count == 0 {
+        let _ = app.emit("collection:success", json!({ "sent_rows": 0 }));
+        return Ok(());
+    }
+    let payload = JsonApiPayload {
+        data: items,
+        meta: Some(json!({ "device_uuid": device_serial })),
+        jsonapi: Some(json!({ "version": "1.0" })),
+    };
 
-    Ok(())
+    // 4) POST straight to /klaayguard/data, reusing the transient-retry ladder
+    let mut post_attempt = 0usize;
+    loop {
+        let body_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        match client
+            .post(format!("{}/klaayguard/data", base))
+            .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_TYPE, "application/vnd.api+json")
+            .header(reqwest::header::ACCEPT, "application/vnd.api+json")
+            .body(body_json)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                add_breadcrumb(
+                    "collection",
+                    &format!("post_status:{}", resp.status().as_u16()),
+                    Level::Info,
+                );
+                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || resp.status() == reqwest::StatusCode::FORBIDDEN
+                {
+                    invalidate_auth(app, state).await?;
+                    let _ = app.emit(
+                        "collection:error",
+                        json!({ "stage": "post", "status": resp.status().as_u16() }),
+                    );
+                    return Ok(());
+                }
+                if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED {
+                    let _ = app.emit("collection:success", json!({ "sent_rows": row_count }));
+                    log::info!("collection_success sent_rows={}", row_count);
+                    add_breadcrumb(
+                        "collection",
+                        &format!("success_count:{}", row_count),
+                        Level::Info,
+                    );
+                    return Ok(());
+                } else if is_transient_status(resp.status().as_u16())
+                    && post_attempt < retry_delays.len()
+                {
+                    let delay = retry_delays[post_attempt];
+                    sentry::capture_message("collection_post_transient_retry", Level::Warning);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    post_attempt += 1;
+                    continue;
+                } else {
+                    emit_error_and_focus(
+                        app,
+                        state,
+                        "collection:error",
+                        json!({ "stage": "post", "status": resp.status().as_u16() }),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                if post_attempt < retry_delays.len() {
+                    let delay = retry_delays[post_attempt];
+                    sentry::capture_message("collection_post_retry", Level::Warning);
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    post_attempt += 1;
+                    continue;
+                } else {
+                    emit_error_and_focus(
+                        app,
+                        state,
+                        "collection:error",
+                        json!({ "stage": "post", "error": e.to_string() }),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
@@ -1187,20 +829,6 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             tokio::time::interval(Duration::from_secs(collection_interval_seconds()));
         loop {
             interval.tick().await;
-            // detect potential wake by long elapsed since last attempt
-            let woke = {
-                let last = *state.last_attempt_at.read().await;
-                if let Some(prev) = last {
-                    prev.elapsed() >= std::time::Duration::from_secs(wake_gap_seconds())
-                } else {
-                    false
-                }
-            };
-            if woke {
-                let _ = app.emit("system:wake_detected", json!({ "loop": "collection" }));
-                add_breadcrumb("system", "wake_detected_collection", Level::Info);
-                sentry::capture_message("wake_detected_collection", Level::Info);
-            }
             if let Err(e) = run_cycle(&app, &state, &client).await {
                 log::error!("cycle error: {}", e);
                 emit_error_and_focus(
@@ -1213,271 +841,6 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             }
         }
     });
-}
-
-fn get_sqlite_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // Mode selection: default file for development, memory for production unless overridden
-    let mode = std::env::var("KLAAYGUARD_DB_MODE").unwrap_or_else(|_| "file".to_string());
-    if mode.eq_ignore_ascii_case("memory") {
-        // Indicate memory by returning a special :memory: path
-        return Ok(PathBuf::from(":memory:"));
-    }
-    let mut base = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app_data_dir error: {}", e))?;
-    let file_override = std::env::var("KLAAYGUARD_DB_PATH").ok();
-    if let Some(p) = file_override {
-        return Ok(PathBuf::from(p));
-    }
-    base.push("klaayguard.db");
-    Ok(base)
-}
-
-fn init_sqlite(app: &tauri::AppHandle) -> Result<(), String> {
-    let db_path = get_sqlite_path(app)?;
-    if db_path != PathBuf::from(":memory:") {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create_dir_all for db parent failed: {}", e))?;
-        }
-    }
-    let conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    conn.execute_batch(
-        r#"
-        PRAGMA journal_mode=WAL;
-        PRAGMA foreign_keys=ON;
-        CREATE TABLE IF NOT EXISTS results (
-          id INTEGER PRIMARY KEY,
-          table_name TEXT NOT NULL,
-          json TEXT NOT NULL,
-          run_id TEXT NOT NULL,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          handled INTEGER DEFAULT 0,
-          handled_at DATETIME NULL
-        );
-        CREATE TABLE IF NOT EXISTS metadata (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_results_pending ON results(handled, created_at, id);
-        CREATE INDEX IF NOT EXISTS idx_results_run ON results(run_id);
-        CREATE INDEX IF NOT EXISTS idx_results_handled_at ON results(handled, handled_at);
-        "#,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-async fn get_db_size_mb(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<u64, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    if db_path == PathBuf::from(":memory:") {
-        // Estimate using page_count * page_size
-        let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let page_count: i64 = conn
-            .query_row("PRAGMA page_count;", [], |r| r.get(0))
-            .unwrap_or(0);
-        let page_size: i64 = conn
-            .query_row("PRAGMA page_size;", [], |r| r.get(0))
-            .unwrap_or(4096);
-        let bytes = page_count.saturating_mul(page_size) as u64;
-        Ok(bytes / (1024 * 1024))
-    } else {
-        let meta = std::fs::metadata(&db_path).map_err(|e| e.to_string())?;
-        Ok(meta.len() / (1024 * 1024))
-    }
-}
-
-async fn prune_time_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    let conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    let last_upload = get_last_upload_at(app, state).await?;
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days() as i64))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-    let mut total_deleted: usize = 0;
-    loop {
-        let deleted = conn
-            .execute(
-                "DELETE FROM results WHERE id IN (
-                   SELECT id FROM results
-                   WHERE handled=1
-                     AND datetime(created_at) <= datetime(?1)
-                     AND datetime(created_at) <= datetime(?2)
-                   ORDER BY datetime(created_at) ASC, id ASC
-                   LIMIT ?3
-                 )",
-                params![last_upload.as_str(), cutoff.as_str(), prune_batch_rows()],
-            )
-            .map_err(|e| e.to_string())?;
-        total_deleted += deleted as usize;
-        if deleted == 0 {
-            break;
-        }
-    }
-    Ok(total_deleted)
-}
-
-async fn prune_size_based(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<usize, String> {
-    let db_path = get_db_path_cached(app, state).await?;
-    if db_path == PathBuf::from(":memory:") {
-        // No file to size-bound in memory mode; skip
-        return Ok(0);
-    }
-    let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-    let last_upload = get_last_upload_at(app, state).await?;
-    let mut total_deleted: usize = 0;
-    let cap = max_db_mb();
-    loop {
-        let size_now = get_db_size_mb(app, state).await?;
-        if size_now <= cap {
-            break;
-        }
-        let deleted = conn
-            .execute(
-                "DELETE FROM results WHERE id IN (
-                   SELECT id FROM results
-                   WHERE handled=1
-                     AND datetime(created_at) <= datetime(?1)
-                   ORDER BY datetime(created_at) ASC, id ASC
-                   LIMIT ?2
-                 )",
-                params![last_upload.as_str(), prune_batch_rows()],
-            )
-            .map_err(|e| e.to_string())?;
-        total_deleted += deleted as usize;
-        if deleted == 0 {
-            break;
-        }
-    }
-    Ok(total_deleted)
-}
-
-async fn run_retention_cycle(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
-    // Prevent overlap
-    if *state.retention_in_progress.read().await {
-        return Ok(());
-    }
-    *state.retention_in_progress.write().await = true;
-    let before = get_db_size_mb(app, state).await.unwrap_or(0);
-    add_breadcrumb("retention", &format!("start_db_mb:{}", before), Level::Info);
-    let time_deleted = prune_time_based(app, state).await.unwrap_or(0);
-    let mut after = get_db_size_mb(app, state).await.unwrap_or(before);
-    let mut size_deleted = 0usize;
-    if after > max_db_mb() {
-        size_deleted = prune_size_based(app, state).await.unwrap_or(0);
-        after = get_db_size_mb(app, state).await.unwrap_or(after);
-    }
-    // Optimize lightweight
-    let _ = {
-        let db_path = get_db_path_cached(app, state).await?;
-        let conn = if db_path == PathBuf::from(":memory:") {
-            Connection::open_in_memory().map_err(|e| e.to_string())?
-        } else {
-            Connection::open(&db_path).map_err(|e| e.to_string())?
-        };
-        conn.execute_batch("PRAGMA optimize;").ok();
-        Ok::<(), String>(())
-    };
-    let _ = app.emit(
-        "retention:run",
-        json!({
-            "deleted_time_based": time_deleted,
-            "deleted_size_based": size_deleted,
-            "db_mb_before": before,
-            "db_mb_after": after,
-        }),
-    );
-    add_breadcrumb(
-        "retention",
-        &format!(
-            "done time_deleted:{} size_deleted:{} db_mb:{}->{}",
-            time_deleted, size_deleted, before, after
-        ),
-        Level::Info,
-    );
-    *state.retention_in_progress.write().await = false;
-    Ok(())
-}
-
-fn spawn_retention_loop(app: tauri::AppHandle, state: Arc<AppState>) {
-    tauri::async_runtime::spawn(async move {
-        // Wait for DB path to be initialized
-        loop {
-            if state.db_path.read().await.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        // Run immediately once
-        if let Err(e) = run_retention_cycle(&app, &state).await {
-            log::error!("retention initial run error: {}", e);
-            let _ = app.emit(
-                "retention:error",
-                json!({ "stage": "initial", "error": e.to_string() }),
-            );
-        }
-        let interval_secs = retention_interval_seconds();
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-        loop {
-            interval.tick().await;
-            if let Err(e) = run_retention_cycle(&app, &state).await {
-                log::error!("retention run error: {}", e);
-                let _ = app.emit(
-                    "retention:error",
-                    json!({ "stage": "interval", "error": e.to_string() }),
-                );
-            }
-        }
-    });
-}
-
-async fn persist_results_to_sqlite(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    run_id: &str,
-    results: &HashMap<String, Value>,
-) -> Result<usize, String> {
-    let db_path = {
-        let current = state.db_path.read().await.clone();
-        if let Some(p) = current {
-            PathBuf::from(p)
-        } else {
-            get_sqlite_path(app)?
-        }
-    };
-    let mut conn = if db_path == PathBuf::from(":memory:") {
-        Connection::open_in_memory().map_err(|e| e.to_string())?
-    } else {
-        Connection::open(&db_path).map_err(|e| e.to_string())?
-    };
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let mut inserted = 0usize;
-    {
-        let mut stmt = tx
-            .prepare("INSERT INTO results (table_name, json, run_id) VALUES (?1, ?2, ?3)")
-            .map_err(|e| e.to_string())?;
-        for (table, value) in results.iter() {
-            if let Some(arr) = value.as_array() {
-                for row in arr {
-                    let row_str = serde_json::to_string(row).map_err(|e| e.to_string())?;
-                    stmt.execute(params![table.as_str(), row_str.as_str(), run_id])
-                        .map_err(|e| e.to_string())?;
-                    inserted += 1;
-                }
-            }
-        }
-    }
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(inserted)
 }
 
 /// Installs a launch agent for automatic startup on macOS.
@@ -1644,7 +1007,6 @@ async fn get_arch_status() -> Result<ArchStatus, String> {
 struct RuntimeStatusLoops {
     collection_seconds_since_last_run: Option<u64>,
     collection_seconds_until_next_due: Option<i64>,
-    upload_seconds_since_last_tick: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -1689,11 +1051,6 @@ async fn get_runtime_status(
             }
         }
     };
-    let upload_seconds_since_last_tick = {
-        let last = *state.last_upload_tick_at.read().await;
-        last.map(|t| t.elapsed().as_secs())
-    };
-
     // Auth
     let auth = if state.auth_token.read().await.is_some() {
         AuthStatus {
@@ -1739,7 +1096,6 @@ async fn get_runtime_status(
         loops: RuntimeStatusLoops {
             collection_seconds_since_last_run,
             collection_seconds_until_next_due,
-            upload_seconds_since_last_tick,
         },
         auth,
     })
@@ -1748,22 +1104,18 @@ async fn get_runtime_status(
 #[derive(serde::Deserialize)]
 struct ReleaseAsset {
     id: u64,
+    // Human-facing label, e.g. "MacOS (Apple silicon)". Does NOT encode arch reliably.
     name: String,
-    // Include other fields for deserialization but mark as unused
-    #[serde(rename = "original_name")]
-    _original_name: Option<String>,
-    #[serde(rename = "content_type")]
-    _content_type: Option<String>,
-    #[serde(rename = "size")]
-    _size: Option<u64>,
-    #[serde(rename = "digest")]
-    _digest: Option<String>,
-    #[serde(rename = "sha256")]
-    _sha256: Option<String>,
-    #[serde(rename = "browser_download_url")]
-    _browser_download_url: Option<String>,
-    #[serde(rename = "api_asset_url")]
-    _api_asset_url: Option<String>,
+    // The real artifact filename, e.g. "KlaayGuard_0.1.12_macOS_arm64_production.dmg".
+    original_name: Option<String>,
+    // Expected hash of the asset bytes (bare hex or "sha256:" prefixed).
+    sha256: Option<String>,
+}
+
+/// The update asset chosen for this host: which one to download and its expected hash.
+struct SelectedUpdate {
+    asset_id: String,
+    sha256: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1782,7 +1134,7 @@ fn get_api_base_url() -> String {
         .unwrap_or_else(|| "https://api.klaay.com".to_string())
 }
 
-async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, String> {
+async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpdate>, String> {
     let current_version = env!("CARGO_PKG_VERSION");
     log::info!(
         "🔍 Starting update check - current version: {}",
@@ -1825,7 +1177,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, St
     );
     for (i, asset) in release.assets.iter().enumerate() {
         log::info!("  Asset {}: {} (ID: {})", i + 1, asset.name, asset.id);
-        if let Some(orig_name) = &asset._original_name {
+        if let Some(orig_name) = &asset.original_name {
             log::info!("    Original name: {}", orig_name);
         }
     }
@@ -1873,19 +1225,30 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, St
             release.version
         );
 
-        // Find the DMG asset for macOS
-        // Check both the user-friendly name and original name for DMG files
+        // The manifest returns every macOS build (arm64 + x64); the human-facing
+        // `name` does not distinguish them, so match on `original_name` (the real
+        // artifact filename) against THIS host's architecture. Picking the wrong
+        // arch would install an app the arch-mismatch gate then refuses to launch.
+        let (arch_tag, arch_label) = match std::env::consts::ARCH {
+            "aarch64" => ("macOS_arm64", "Apple silicon"),
+            "x86_64" => ("macOS_x64", "Intel"),
+            other => {
+                log::warn!("⚠️  No macOS update artifact for architecture: {}", other);
+                return Ok(None);
+            }
+        };
+
         if let Some(dmg_asset) = release.assets.iter().find(|asset| {
-            asset.name.ends_with(".dmg")
-                || asset.name.contains("MacOS")
-                || asset
-                    ._original_name
-                    .as_ref()
-                    .map_or(false, |orig| orig.ends_with(".dmg"))
+            match asset.original_name.as_deref() {
+                Some(orig) => orig.ends_with(".dmg") && orig.contains(arch_tag),
+                // Fall back to the friendly label only when original_name is absent.
+                None => asset.name.contains(arch_label),
+            }
         }) {
             log::info!(
-                "✅ Found DMG asset: {} (ID: {})",
-                dmg_asset.name,
+                "✅ Selected {} update: {} (ID: {})",
+                arch_tag,
+                dmg_asset.original_name.as_deref().unwrap_or(&dmg_asset.name),
                 dmg_asset.id
             );
             log::info!(
@@ -1893,9 +1256,15 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, St
                 current_version,
                 release.version
             );
-            return Ok(Some(dmg_asset.id.to_string()));
+            return Ok(Some(SelectedUpdate {
+                asset_id: dmg_asset.id.to_string(),
+                sha256: dmg_asset.sha256.clone(),
+            }));
         } else {
-            log::warn!("⚠️  No DMG asset found in release assets");
+            log::warn!(
+                "⚠️  No {} DMG asset found in release assets",
+                arch_tag
+            );
         }
     } else if release_semver < current_semver {
         log::info!(
@@ -1917,12 +1286,15 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<String>, St
 async fn check_for_updates_command() -> Result<Option<String>, String> {
     let api_base = get_api_base_url();
     log::info!("🌐 Manual update check using API base URL: {}", api_base);
-    check_for_updates_internal(&api_base).await
+    Ok(check_for_updates_internal(&api_base)
+        .await?
+        .map(|sel| sel.asset_id))
 }
 
 async fn download_and_install_update_internal(
     api_base: &str,
     asset_id: &str,
+    expected_sha256: Option<&str>,
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
     log::info!(
@@ -1971,6 +1343,27 @@ async fn download_and_install_update_internal(
 
     log::info!("📊 Downloaded {} bytes", bytes.len());
 
+    // Verify integrity before we mount and swap a running security agent.
+    if let Some(expected) = expected_sha256 {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+        let expected = expected.trim_start_matches("sha256:");
+        if !actual.eq_ignore_ascii_case(expected) {
+            let msg = format!(
+                "Update checksum mismatch: expected {}, got {}",
+                expected, actual
+            );
+            log::error!("❌ {}", msg);
+            sentry::capture_message(&msg, Level::Error);
+            return Err(msg);
+        }
+        log::info!("🔐 Update checksum verified: {}", actual);
+    } else {
+        log::warn!("⚠️  No checksum provided for update asset; skipping verification");
+    }
+
     std::io::Write::write_all(&mut file, &bytes).map_err(|e| {
         log::error!("❌ Write error: {}", e);
         format!("Write error: {}", e)
@@ -1992,7 +1385,7 @@ async fn download_and_install_update(
 ) -> Result<(), String> {
     let api_base = get_api_base_url();
     log::info!("🌐 Manual update download using API base URL: {}", api_base);
-    download_and_install_update_internal(&api_base, &asset_id, &app).await
+    download_and_install_update_internal(&api_base, &asset_id, None, &app).await
 }
 
 async fn replace_application(
@@ -2167,12 +1560,8 @@ pub fn run() {
         api_base_url: RwLock::new(api_base),
         last_run_at: RwLock::new(None),
         last_attempt_at: RwLock::new(None),
-        db_path: RwLock::new(None),
-        upload_in_progress: RwLock::new(false),
         keychain_cleared_this_session: RwLock::new(false),
-        last_upload_tick_at: RwLock::new(None),
         last_focus_at: RwLock::new(None),
-        retention_in_progress: RwLock::new(false),
     });
 
     let app = tauri::Builder::default()
@@ -2274,11 +1663,15 @@ pub fn run() {
                 log::info!("🚀 Starting automatic update check on app startup");
                 let api_base = get_api_base_url();
                 log::info!("🌐 Using API base URL: {}", api_base);
-                if let Ok(Some(asset_id)) = check_for_updates_internal(&api_base).await {
+                if let Ok(Some(update)) = check_for_updates_internal(&api_base).await {
                     log::info!("🔄 Update available, starting download and install process...");
-                    if let Err(e) =
-                        download_and_install_update_internal(&api_base, &asset_id, &app_handle)
-                            .await
+                    if let Err(e) = download_and_install_update_internal(
+                        &api_base,
+                        &update.asset_id,
+                        update.sha256.as_deref(),
+                        &app_handle,
+                    )
+                    .await
                     {
                         log::error!("💥 Auto-update failed: {}", e);
                     }
@@ -2413,30 +1806,10 @@ pub fn run() {
                     log::error!("Failed to create system tray icon: {}", e);
                     e
                 })?;
-            // Spawn background monitoring loop
+            // Spawn the single collect-and-send loop
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
-
-            // (duplicate initial keychain load removed)
-
-            // Initialize SQLite (file-backed) path and schema
-            if let Err(e) = init_sqlite(&app.handle()) {
-                log::error!("Failed to initialize SQLite: {}", e);
-                sentry::capture_message(&format!("sqlite_init_failed:{}", e), Level::Error);
-            } else {
-                if let Some(p) = get_sqlite_path(&app.handle()).ok() {
-                    tauri::async_runtime::block_on(async {
-                        *state_for_loop.db_path.write().await =
-                            Some(p.to_string_lossy().to_string());
-                    });
-                }
-            }
-
-            spawn_background_loop(app_handle.clone(), state_for_loop.clone());
-            // Spawn uploader loop (Loop B)
-            spawn_upload_loop(app_handle.clone(), state_for_loop.clone());
-            // Spawn retention loop (maintenance)
-            spawn_retention_loop(app_handle, state_for_loop);
+            spawn_background_loop(app_handle, state_for_loop);
 
             Ok(())
         })
