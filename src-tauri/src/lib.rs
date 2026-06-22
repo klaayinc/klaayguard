@@ -433,34 +433,29 @@ struct JsonApiPayload {
     jsonapi: Option<serde_json::Value>,
 }
 
+/// Pull a stable device identifier from osquery `system_info` rows. osquery has no
+/// `hardware_info` table; the serial lives in `system_info.hardware_serial`, with
+/// `uuid` as a fallback.
+fn extract_serial(rows: &Value) -> Option<String> {
+    let obj = rows.as_array()?.first()?;
+    ["hardware_serial", "serial_number", "uuid", "hardware_uuid"]
+        .iter()
+        .find_map(|k| {
+            obj.get(*k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(|s| s.to_string())
+}
+
 async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
     let result = execute_sql_batch(
         app.clone(),
-        vec![("hardware_info".to_string(), "SELECT * FROM hardware_info".to_string())],
+        vec![("system_info".to_string(), "SELECT * FROM system_info".to_string())],
     )
     .await?;
-    let serial = result
-        .get("hardware_info")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|obj| {
-            // Try serial_number first, then hardware_serial, then hardware_uuid as fallback
-            obj.get("serial_number")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    obj.get("hardware_serial")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-                .or_else(|| {
-                    obj.get("hardware_uuid")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                })
-        })
-        .ok_or_else(|| "Couldn't find hardware serial number".to_string())?;
-    Ok(serial.to_string())
+    extract_serial(result.get("system_info").unwrap_or(&Value::Null))
+        .ok_or_else(|| "Couldn't find hardware serial number".to_string())
 }
 
 async fn run_cycle(
@@ -1739,5 +1734,20 @@ mod happy_path_tests {
     fn payload_items_empty_for_no_rows() {
         let results: HashMap<String, Value> = HashMap::new();
         assert!(build_payload_items(&results, "T").is_empty());
+    }
+
+    #[test]
+    fn serial_extracted_from_system_info_hardware_serial() {
+        // Shaped like real osquery system_info: serial is `hardware_serial`, not `serial_number`.
+        let rows = json!([{"hardware_serial": "G97L3X4KYV", "uuid": "9082C1CD", "computer_name": "Athene"}]);
+        assert_eq!(extract_serial(&rows), Some("G97L3X4KYV".to_string()));
+    }
+
+    #[test]
+    fn serial_falls_back_to_uuid_then_none() {
+        let only_uuid = json!([{"uuid": "9082C1CD"}]);
+        assert_eq!(extract_serial(&only_uuid), Some("9082C1CD".to_string()));
+        assert_eq!(extract_serial(&json!([])), None);
+        assert_eq!(extract_serial(&Value::Null), None);
     }
 }
