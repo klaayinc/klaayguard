@@ -391,39 +391,38 @@ async fn execute_sql_batch(
             .unwrap()
             .args(["--json", sql.as_str()]);
 
+        // osquery failing to spawn at all is a systemic problem — surface it.
         let output = cmd.output().await.map_err(|e| e.to_string())?;
 
+        // A single failed or unparseable query must not sink the cycle: record an
+        // empty result for it and keep collecting (and sending) the others.
         if !output.status.success() {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
-            let stderr_lc = stderr_str.to_ascii_lowercase();
-            if stderr_lc.contains("no such table")
-                || stderr_lc.contains("no such column")
-                || stderr_lc.contains("no such module")
-            {
-                all_results.insert(logical_id, serde_json::json!([]));
-                continue;
-            }
-            return Err(format!(
-                "sql for '{}' failed (exit code {:?}): {}",
-                logical_id,
-                output.status.code(),
-                stderr_str
-            ));
+            add_breadcrumb(
+                "collection",
+                &format!("osquery_query_skipped '{}': {}", logical_id, stderr_str.trim()),
+                Level::Warning,
+            );
+            all_results.insert(logical_id, serde_json::json!([]));
+            continue;
         }
 
-        let stdout_str = String::from_utf8(output.stdout)
-            .map_err(|e| format!("Invalid UTF-8 output for {}: {}", logical_id, e))?;
-
-        let parsed_result: Value = serde_json::from_str(&stdout_str).map_err(|e| {
-            format!(
-                "Failed to parse JSON for {} (content: '{}'): {}",
-                logical_id,
-                stdout_str.trim(),
-                e
-            )
-        })?;
-
-        all_results.insert(logical_id, parsed_result);
+        let parsed = String::from_utf8(output.stdout)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        match parsed {
+            Some(v) => {
+                all_results.insert(logical_id, v);
+            }
+            None => {
+                add_breadcrumb(
+                    "collection",
+                    &format!("osquery_parse_skipped '{}'", logical_id),
+                    Level::Warning,
+                );
+                all_results.insert(logical_id, serde_json::json!([]));
+            }
+        }
     }
 
     Ok(all_results)
@@ -813,20 +812,11 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
 
-        // run immediately
-        if let Err(e) = run_cycle(&app, &state, &client).await {
-            log::error!("initial cycle error: {}", e);
-            emit_error_and_focus(
-                &app,
-                &state,
-                "collection:error",
-                json!({ "stage": "internal", "error": e }),
-            )
-            .await;
-        }
-
+        // interval's first tick fires immediately, giving the initial collection.
+        // Skip (don't burst) ticks missed while the machine was asleep.
         let mut interval =
             tokio::time::interval(Duration::from_secs(collection_interval_seconds()));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             if let Err(e) = run_cycle(&app, &state, &client).await {
