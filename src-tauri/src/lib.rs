@@ -1108,6 +1108,38 @@ struct SelectedUpdate {
     sha256: Option<String>,
 }
 
+/// macOS artifact tags for the current host: (filename infix, friendly-name infix).
+fn host_arch_tags() -> Option<(&'static str, &'static str)> {
+    match std::env::consts::ARCH {
+        "aarch64" => Some(("macOS_arm64", "Apple silicon")),
+        "x86_64" => Some(("macOS_x64", "Intel")),
+        _ => None,
+    }
+}
+
+/// Pick the DMG asset matching this host's architecture. Prefers the real
+/// artifact filename (`original_name`); falls back to the friendly label only
+/// when it is absent. Returns None rather than guess the wrong architecture.
+fn select_dmg_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    arch_tag: &str,
+    arch_label: &str,
+) -> Option<&'a ReleaseAsset> {
+    assets.iter().find(|asset| match asset.original_name.as_deref() {
+        Some(orig) => orig.ends_with(".dmg") && orig.contains(arch_tag),
+        None => asset.name.contains(arch_label),
+    })
+}
+
+/// Whether `bytes` hashes to `expected` (bare hex or "sha256:"-prefixed).
+fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    actual.eq_ignore_ascii_case(expected.trim_start_matches("sha256:"))
+}
+
 #[derive(serde::Deserialize)]
 struct ReleaseInfo {
     #[serde(rename = "name")]
@@ -1219,22 +1251,15 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         // `name` does not distinguish them, so match on `original_name` (the real
         // artifact filename) against THIS host's architecture. Picking the wrong
         // arch would install an app the arch-mismatch gate then refuses to launch.
-        let (arch_tag, arch_label) = match std::env::consts::ARCH {
-            "aarch64" => ("macOS_arm64", "Apple silicon"),
-            "x86_64" => ("macOS_x64", "Intel"),
-            other => {
-                log::warn!("⚠️  No macOS update artifact for architecture: {}", other);
-                return Ok(None);
-            }
+        let Some((arch_tag, arch_label)) = host_arch_tags() else {
+            log::warn!(
+                "⚠️  No macOS update artifact for architecture: {}",
+                std::env::consts::ARCH
+            );
+            return Ok(None);
         };
 
-        if let Some(dmg_asset) = release.assets.iter().find(|asset| {
-            match asset.original_name.as_deref() {
-                Some(orig) => orig.ends_with(".dmg") && orig.contains(arch_tag),
-                // Fall back to the friendly label only when original_name is absent.
-                None => asset.name.contains(arch_label),
-            }
-        }) {
+        if let Some(dmg_asset) = select_dmg_asset(&release.assets, arch_tag, arch_label) {
             log::info!(
                 "✅ Selected {} update: {} (ID: {})",
                 arch_tag,
@@ -1334,24 +1359,15 @@ async fn download_and_install_update_internal(
     log::info!("📊 Downloaded {} bytes", bytes.len());
 
     // Verify integrity before we mount and swap a running security agent.
-    if let Some(expected) = expected_sha256 {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let actual: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
-        let expected = expected.trim_start_matches("sha256:");
-        if !actual.eq_ignore_ascii_case(expected) {
-            let msg = format!(
-                "Update checksum mismatch: expected {}, got {}",
-                expected, actual
-            );
+    match expected_sha256 {
+        Some(expected) if !sha256_matches(&bytes, expected) => {
+            let msg = format!("Update checksum mismatch for expected {}", expected);
             log::error!("❌ {}", msg);
             sentry::capture_message(&msg, Level::Error);
             return Err(msg);
         }
-        log::info!("🔐 Update checksum verified: {}", actual);
-    } else {
-        log::warn!("⚠️  No checksum provided for update asset; skipping verification");
+        Some(expected) => log::info!("🔐 Update checksum verified against {}", expected),
+        None => log::warn!("⚠️  No checksum provided for update asset; skipping verification"),
     }
 
     std::io::Write::write_all(&mut file, &bytes).map_err(|e| {
@@ -1838,4 +1854,72 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod update_selection_tests {
+    use super::*;
+
+    // Mirrors the real /klaayguard/updates/latest manifest: both macOS arches
+    // plus Linux artifacts in one release.
+    fn manifest() -> Vec<ReleaseAsset> {
+        serde_json::from_str(
+            r#"[
+              {"id":1,"name":"Linux (Debian/Ubuntu .deb)","original_name":"KlaayGuard_0.1.12_Linux_x86_64_production.deb","sha256":"aa"},
+              {"id":2,"name":"MacOS (Apple silicon)","original_name":"KlaayGuard_0.1.12_macOS_arm64_production.dmg","sha256":"bb"},
+              {"id":3,"name":"MacOS (Intel)","original_name":"KlaayGuard_0.1.12_macOS_x64_production.dmg","sha256":"cc"}
+            ]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn selects_arm64_dmg_for_apple_silicon() {
+        let assets = manifest();
+        let sel = select_dmg_asset(&assets, "macOS_arm64", "Apple silicon").unwrap();
+        assert_eq!(sel.id, 2);
+        assert_eq!(
+            sel.original_name.as_deref(),
+            Some("KlaayGuard_0.1.12_macOS_arm64_production.dmg")
+        );
+    }
+
+    #[test]
+    fn selects_x64_dmg_for_intel() {
+        let assets = manifest();
+        let sel = select_dmg_asset(&assets, "macOS_x64", "Intel").unwrap();
+        assert_eq!(sel.id, 3);
+    }
+
+    #[test]
+    fn never_selects_a_non_dmg_or_wrong_arch() {
+        // The pre-fix bug returned the first ".dmg"/"MacOS" match; assert each
+        // arch resolves to its OWN dmg and never a Linux artifact.
+        let assets = manifest();
+        for (tag, label, want) in [
+            ("macOS_arm64", "Apple silicon", 2u64),
+            ("macOS_x64", "Intel", 3u64),
+        ] {
+            let sel = select_dmg_asset(&assets, tag, label).unwrap();
+            assert_eq!(sel.id, want);
+            assert!(sel.original_name.as_deref().unwrap().ends_with(".dmg"));
+        }
+    }
+
+    #[test]
+    fn falls_back_to_friendly_label_without_original_name() {
+        let assets: Vec<ReleaseAsset> =
+            serde_json::from_str(r#"[{"id":9,"name":"MacOS (Intel)","sha256":null}]"#).unwrap();
+        assert_eq!(select_dmg_asset(&assets, "macOS_x64", "Intel").unwrap().id, 9);
+        assert!(select_dmg_asset(&assets, "macOS_arm64", "Apple silicon").is_none());
+    }
+
+    #[test]
+    fn checksum_accepts_match_and_rejects_mismatch() {
+        // sha256("") well-known digest, bare and "sha256:"-prefixed.
+        let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(sha256_matches(b"", expected));
+        assert!(sha256_matches(b"", &format!("sha256:{}", expected)));
+        assert!(!sha256_matches(b"tampered", expected));
+    }
 }
