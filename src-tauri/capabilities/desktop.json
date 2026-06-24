@@ -1,13 +1,9 @@
 {
   "identifier": "desktop-capability",
   "platforms": ["macOS", "windows", "linux"],
-  "windows": ["main"],
   "permissions": [
     "core:default",
-    "os:default",
-    "opener:default",
     "shell:default",
-    "fs:default",
     "log:default",
     "core:event:default"
   ]

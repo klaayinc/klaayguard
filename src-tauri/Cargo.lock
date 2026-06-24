@@ -19,10 +19,7 @@ dependencies = [
  "sha2",
  "tauri",
  "tauri-build",
- "tauri-plugin-fs",
  "tauri-plugin-log",
- "tauri-plugin-opener",
- "tauri-plugin-os",
  "tauri-plugin-shell",
  "tauri-plugin-single-instance",
  "tokio",
@@ -1797,16 +1794,6 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
-]
-
-[[package]]
-name = "gethostname"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc257fdb4038301ce4b9cd1b3b51704509692bb3ff716a410cbd07925d9dae55"
-dependencies = [
- "rustix 1.1.2",
- "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -5075,15 +5062,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sys-locale"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "system-configuration"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5313,28 +5291,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tauri-plugin-fs"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "315784ec4be45e90a987687bae7235e6be3d6e9e350d2b75c16b8a4bf22c1db7"
-dependencies = [
- "anyhow",
- "dunce",
- "glob",
- "percent-encoding",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "serde_repr",
- "tauri",
- "tauri-plugin",
- "tauri-utils",
- "thiserror 2.0.16",
- "toml 0.9.6",
- "url",
-]
-
-[[package]]
 name = "tauri-plugin-log"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5354,46 +5310,6 @@ dependencies = [
  "tauri-plugin",
  "thiserror 2.0.16",
  "time",
-]
-
-[[package]]
-name = "tauri-plugin-opener"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "786156aa8e89e03d271fbd3fe642207da8e65f3c961baa9e2930f332bf80a1f5"
-dependencies = [
- "dunce",
- "glob",
- "objc2-app-kit",
- "objc2-foundation 0.3.1",
- "open",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "tauri",
- "tauri-plugin",
- "thiserror 2.0.16",
- "url",
- "windows",
- "zbus 5.11.0",
-]
-
-[[package]]
-name = "tauri-plugin-os"
-version = "2.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77a1c77ebf6f20417ab2a74e8c310820ba52151406d0c80fbcea7df232e3f6ba"
-dependencies = [
- "gethostname",
- "log",
- "os_info",
- "serde",
- "serde_json",
- "serialize-to-javascript",
- "sys-locale",
- "tauri",
- "tauri-plugin",
- "thiserror 2.0.16",
 ]
 
 [[package]]

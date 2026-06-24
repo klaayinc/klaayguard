@@ -128,9 +128,6 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
     let _ = app.emit("auth:status", json!({ "authenticated": true }));
     add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
     sentry::capture_message("deep_link_token_saved", Level::Info);
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
-    }
 }
 
 /// Scan process args for a klaayguard deep link and handle it
@@ -148,143 +145,6 @@ fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>)
             break;
         }
     }
-}
-
-#[tauri::command]
-async fn clear_auth_token(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    *state.auth_token.write().await = None;
-    // Allow a single delete per session to avoid repeated Keychain prompts
-    let already_cleared = *state.keychain_cleared_this_session.read().await;
-    if !already_cleared {
-        let _ = keychain::delete_token();
-        *state.keychain_cleared_this_session.write().await = true;
-    }
-    add_breadcrumb("auth", "token_cleared", Level::Info);
-    sentry::capture_message("auth_token_cleared", Level::Info);
-    Ok(())
-}
-
-/// Returns seconds until next scheduled run (120s default interval).
-/// -1 indicates not signed in (no token yet). 0 means due now or overdue.
-#[tauri::command]
-async fn get_next_run_in_seconds(state: tauri::State<'_, Arc<AppState>>) -> Result<i64, String> {
-    if state.auth_token.read().await.is_none() {
-        return Ok(-1);
-    }
-    // Use last attempt time so countdown advances even if last run failed
-    let last = *state.last_attempt_at.read().await;
-    let interval = std::time::Duration::from_secs(collection_interval_seconds());
-    if let Some(last) = last {
-        let elapsed = last.elapsed();
-        if elapsed >= interval {
-            Ok(0)
-        } else {
-            Ok((interval - elapsed).as_secs() as i64)
-        }
-    } else {
-        // first run should happen immediately after login/token
-        Ok(0)
-    }
-}
-
-#[derive(serde::Serialize)]
-struct AuthStatus {
-    authenticated: bool,
-    display_name: Option<String>,
-}
-
-#[tauri::command]
-async fn get_app_version() -> Result<String, String> {
-    let version = env!("CARGO_PKG_VERSION").to_string();
-    log::info!("📱 Frontend requested app version: {}", version);
-    Ok(version)
-}
-
-#[tauri::command]
-async fn get_auth_status(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<AppState>>,
-) -> Result<AuthStatus, String> {
-    let token_opt = state.auth_token.read().await.clone();
-    if token_opt.is_none() {
-        return Ok(AuthStatus {
-            authenticated: false,
-            display_name: None,
-        });
-    }
-    let base = state.api_base_url.read().await.clone();
-    let token = token_opt.unwrap();
-    let client = reqwest::Client::builder()
-        .user_agent("klaayguard/0.1")
-        .build()
-        .map_err(|e| e.to_string())?;
-    add_breadcrumb("auth", "me_request_start", Level::Info);
-    sentry::capture_message("auth_me_request_start", Level::Info);
-
-    // Determine authentication state and display name from /me
-    let (is_authenticated, name): (bool, Option<String>) = match client
-        .get(format!("{}/me", base))
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
-        Ok(resp) => {
-            add_breadcrumb(
-                "auth",
-                &format!("me_response_status:{}", resp.status().as_u16()),
-                Level::Info,
-            );
-            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                || resp.status() == reqwest::StatusCode::FORBIDDEN
-            {
-                // Invalidate and prompt login
-                invalidate_auth(&app, &state).await.ok();
-                add_breadcrumb("auth", "auth_invalidated_on_me", Level::Warning);
-                sentry::capture_message("auth_invalidated_on_me", Level::Warning);
-                (false, None)
-            } else if resp.status().is_success() {
-                match resp.json::<Value>().await {
-                    Ok(body) => {
-                        let attrs = body
-                            .get("data")
-                            .and_then(|d| d.get("attributes"))
-                            .cloned()
-                            .unwrap_or(json!({}));
-                        let first = attrs
-                            .get("first_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let last = attrs
-                            .get("last_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let email = attrs.get("email").and_then(|v| v.as_str());
-                        let full = format!("{} {}", first, last).trim().to_string();
-                        let name = if !full.is_empty() {
-                            Some(full)
-                        } else {
-                            email.map(|s| s.to_string())
-                        };
-                        (true, name)
-                    }
-                    Err(_) => (true, None),
-                }
-            } else {
-                // Non-401/403 error; consider unauthenticated
-                (false, None)
-            }
-        }
-        Err(e) => {
-            add_breadcrumb("auth", &format!("me_request_error:{}", e), Level::Warning);
-            sentry::capture_message("auth_me_request_error", Level::Warning);
-            (false, None)
-        }
-    };
-
-    Ok(AuthStatus {
-        authenticated: is_authenticated,
-        display_name: name,
-    })
 }
 
 /// Executes a batch of SQL statements against osquery and returns results keyed by logical id
@@ -347,9 +207,9 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
         let _ = keychain::delete_token();
         *state.keychain_cleared_this_session.write().await = true;
     }
-    // Log locally and bring the app to focus to prompt re-login
-    log::warn!("Authentication invalidated; focusing window for re-login");
-    focus_window_with_debounce(app, state).await;
+    // Log locally and notify the user that re-login is needed (no window now).
+    log::warn!("Authentication invalidated; notifying user to re-sign-in");
+    notify_signin_needed(state).await;
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     add_breadcrumb("auth", "auth_invalidated", Level::Warning);
@@ -371,29 +231,29 @@ fn collection_interval_seconds() -> u64 {
         .unwrap_or(900)
 }
 
-async fn focus_window_with_debounce(app: &tauri::AppHandle, state: &Arc<AppState>) {
+/// Debounced native notification telling the user to sign in again. Replaces the
+/// old "focus the window" nudge now that the app is tray-only.
+async fn notify_signin_needed(state: &Arc<AppState>) {
     let now = std::time::Instant::now();
     let debounce = std::time::Duration::from_secs(focus_debounce_seconds());
-    let should_focus = {
-        let last = *state.last_focus_at.read().await;
-        match last {
-            Some(prev) => now.duration_since(prev) >= debounce,
-            None => true,
-        }
+    let should = match *state.last_focus_at.read().await {
+        Some(prev) => now.duration_since(prev) >= debounce,
+        None => true,
     };
-    if should_focus {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
-            let _ = window.set_focus();
-        }
-        // Log locally when focusing for user-required action (e.g., sign-in)
-        log::warn!("Focusing main window for user action (debounced)");
-        *state.last_focus_at.write().await = Some(now);
-        let _ = app.emit(
-            "focus:on_failure",
-            json!({ "at": chrono::Utc::now().to_rfc3339() }),
-        );
-        add_breadcrumb("ui", "focus_on_failure", Level::Info);
+    if !should {
+        return;
+    }
+    *state.last_focus_at.write().await = Some(now);
+    log::warn!("sign-in required; notifying user (debounced)");
+    add_breadcrumb("ui", "signin_required_notification", Level::Info);
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                "display notification \"Open KlaayGuard in the menu bar to sign in.\" with title \"KlaayGuard\"",
+            ])
+            .spawn();
     }
 }
 
@@ -715,7 +575,6 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
 /// This function creates a launchd plist file in the user's LaunchAgents directory
 /// and loads it to ensure the app starts automatically on login. This is a mandatory
 /// security feature that cannot be disabled by users.
-#[tauri::command]
 async fn install_launch_agent() -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
@@ -818,58 +677,6 @@ async fn install_launch_agent() -> Result<String, String> {
     }
 }
 
-#[tauri::command]
-async fn uninstall_launch_agent() -> Result<String, String> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::fs;
-        let home_dir = dirs::home_dir().ok_or("Could not find home directory")?;
-        let launch_agents_dir = home_dir.join("Library/LaunchAgents");
-        let label = "com.klaay.klaayguard";
-        let plist_path = launch_agents_dir.join(format!("{}.plist", label));
-        let uid = nix::unistd::getuid().as_raw();
-        let domain = format!("gui/{}", uid);
-
-        // Try to bootout if loaded
-        let _ = std::process::Command::new("launchctl")
-            .args(&["bootout", &format!("{}/{}", domain, label)])
-            .output();
-
-        // Remove plist file
-        if plist_path.exists() {
-            if let Err(e) = fs::remove_file(&plist_path) {
-                return Err(format!("Failed to remove launch agent plist: {}", e));
-            }
-        }
-
-        Ok("LaunchAgent uninstalled".to_string())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("Launch agent uninstallation is only supported on macOS".to_string())
-    }
-}
-
-#[derive(Serialize)]
-struct ArchStatus {
-    mismatch: bool,
-    built: String,
-    host: String,
-}
-
-#[tauri::command]
-async fn get_arch_status() -> Result<ArchStatus, String> {
-    let mismatch = std::env::var("KLAAY_ARCH_MISMATCH").ok().as_deref() == Some("1");
-    let built =
-        std::env::var("KLAAY_ARCH_BUILT").unwrap_or_else(|_| std::env::consts::ARCH.to_string());
-    let host = std::env::var("KLAAY_ARCH_HOST").unwrap_or_else(|_| "unknown".to_string());
-    Ok(ArchStatus {
-        mismatch,
-        built,
-        host,
-    })
-}
-
 #[derive(serde::Deserialize)]
 struct ReleaseAsset {
     id: u64,
@@ -933,6 +740,23 @@ fn get_api_base_url() -> String {
         .ok()
         .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
         .unwrap_or_else(|| "https://api.klaay.com".to_string())
+}
+
+fn get_earthenware_url() -> String {
+    std::env::var("VITE_EARTHENWARE_URL")
+        .ok()
+        .or_else(|| option_env!("APP_DEFAULT_EARTHENWARE_URL").map(|s| s.to_string()))
+        .unwrap_or_else(|| "https://app.klaay.com".to_string())
+}
+
+/// Open the browser to the Earthenware sign-in page; it deep-links back via
+/// `klaayguard://auth-callback?token=…`. Invoked from the tray "Sign in" item.
+fn open_sign_in(app: &tauri::AppHandle) {
+    let url = format!("{}/login?app=klaayguard", get_earthenware_url());
+    log::info!("opening sign-in url={}", url);
+    if let Err(e) = app.shell().open(url, None) {
+        log::error!("failed to open sign-in url: {}", e);
+    }
 }
 
 async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpdate>, String> {
@@ -1332,7 +1156,6 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(state.clone())
-        .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(
             tauri_plugin_log::Builder::new()
@@ -1354,69 +1177,34 @@ pub fn run() {
                     break;
                 }
             }
-            // Only focus if sign-in is required
-            let needs_login =
-                tauri::async_runtime::block_on(async { st.auth_token.read().await.is_none() });
-            if let Some(window) = app.get_webview_window("main") {
-                if needs_login {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            }
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
-        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
-            let _handle2 = app.handle().clone();
-
-            // Hide the app from the dock on macOS for security monitoring
+            // Tray-only background service: hide from dock, no window.
             #[cfg(target_os = "macos")]
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-                log::info!("KlaayGuard configured as background service - hidden from dock");
+                log::info!("KlaayGuard configured as background service - tray only, hidden from dock");
             }
 
-            // Ensure no window is created before activation policy; create programmatically now
-            if app.get_webview_window("main").is_none() {
-                if let Err(e) = tauri::webview::WebviewWindowBuilder::new(
-                    app,
-                    "main",
-                    tauri::WebviewUrl::default(),
-                )
-                .title("KlaayGuard")
-                .visible(false)
-                .inner_size(520.0, 680.0)
-                .min_inner_size(480.0, 600.0)
-                .center()
-                .build()
-                {
-                    log::error!("Failed to create main window: {}", e);
-                }
-            }
-
-            #[cfg(debug_assertions)]
-            {
-                if let Some(window) = app.get_webview_window("main") {
-                    window.open_devtools();
-                }
-            }
-
-            // Emit arch mismatch to UI if flagged by main.rs
+            // Architecture mismatch: warn the user natively and do NOT start the
+            // collection loop (the binary can't run correctly on this hardware).
             if std::env::var("KLAAY_ARCH_MISMATCH").ok().as_deref() == Some("1") {
                 let built = std::env::var("KLAAY_ARCH_BUILT")
                     .unwrap_or_else(|_| std::env::consts::ARCH.to_string());
                 let host =
                     std::env::var("KLAAY_ARCH_HOST").unwrap_or_else(|_| "unknown".to_string());
-                let _ = app.emit(
-                    "arch:mismatch",
-                    serde_json::json!({ "built": built, "host": host }),
-                );
-                // Show window to present error page
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+                log::error!("arch_mismatch built={} host={}", built, host);
+                #[cfg(target_os = "macos")]
+                {
+                    let script = format!(
+                        "display dialog \"KlaayGuard was built for {} but this Mac is {}. Please reinstall the correct build.\" buttons {{\"OK\"}} with icon stop with title \"KlaayGuard\"",
+                        built, host
+                    );
+                    let _ = std::process::Command::new("osascript")
+                        .args(["-e", &script])
+                        .spawn();
                 }
-                // Do not start background loops; return early
                 return Ok(());
             }
 
@@ -1459,119 +1247,41 @@ pub fn run() {
                     }
                 });
             }
-            let window = app.get_webview_window("main").unwrap();
-            let window_ = window.clone();
-
-            // Load token from keychain at startup and emit status BEFORE deciding focus
+            // Load any saved token; if absent, nudge the user to sign in via the tray.
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
-            if let Ok(Some(tok)) = keychain::load_token() {
+            let authed = if let Ok(Some(tok)) = keychain::load_token() {
                 tauri::async_runtime::block_on(async {
                     *state_for_loop.auth_token.write().await = Some(tok);
                 });
-                let _ = app.emit("auth:status", json!({ "authenticated": true }));
+                true
             } else {
-                let _ = app.emit("auth:status", json!({ "authenticated": false }));
-            }
-
-            // Only take focus on startup if sign-in is required
-            {
-                let needs_login = tauri::async_runtime::block_on(async {
-                    state_for_loop.auth_token.read().await.is_none()
-                });
-                if needs_login {
-                    window.show().unwrap();
-                    window.set_focus().unwrap();
-                    log::info!("KlaayGuard started - login screen displayed");
-                } else {
-                    log::info!("KlaayGuard started - running in background (no focus)");
-                }
+                false
+            };
+            if authed {
+                log::info!("KlaayGuard started - authenticated, collecting in background");
+            } else {
+                log::info!("KlaayGuard started - sign-in required");
+                let st = state_for_loop.clone();
+                tauri::async_runtime::spawn(async move { notify_signin_needed(&st).await });
             }
 
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
 
-            window.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    window_.hide().unwrap();
-                    api.prevent_close();
-                }
-            });
-
-            // Create tray menu with security-focused options (no quit option)
-            let show_i = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)
-                .map_err(|e| {
-                    log::error!("Failed to create 'Show' menu item: {}", e);
-                    e
-                })?;
-            let hide_i = tauri::menu::MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)
-                .map_err(|e| {
-                    log::error!("Failed to create 'Hide' menu item: {}", e);
-                    e
-                })?;
-            let menu = tauri::menu::Menu::with_items(app, &[&show_i, &hide_i]).map_err(|e| {
-                log::error!("Failed to create system tray menu: {}", e);
-                e
-            })?;
-
-            // Create tray icon with security monitoring tooltip
+            // Tray: a single "Sign in" action that opens the browser; no quit (by design).
+            let signin_i =
+                tauri::menu::MenuItem::with_id(app, "signin", "Sign in", true, None::<&str>)?;
+            let menu = tauri::menu::Menu::with_items(app, &[&signin_i])?;
             tauri::tray::TrayIconBuilder::new()
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        log::info!("Show window requested from system tray");
-                        // Show window; only force focus if sign-in is required
-                        let needs_login = {
-                            let st = app.state::<Arc<AppState>>().inner().clone();
-                            tauri::async_runtime::block_on(async {
-                                st.auth_token.read().await.is_none()
-                            })
-                        };
-                        if let Some(window) = app.get_webview_window("main") {
-                            if let Err(e) = window.show() {
-                                log::error!("Failed to show window: {}", e);
-                            } else {
-                                log::info!("Window shown successfully");
-                            }
-                            if needs_login {
-                                if let Err(e) = window.set_focus() {
-                                    log::error!("Failed to focus window: {}", e);
-                                }
-                            }
-                        }
+                .on_menu_event(|app, event| {
+                    if event.id.as_ref() == "signin" {
+                        open_sign_in(app);
                     }
-                    "hide" => {
-                        log::info!("Hide window requested from system tray");
-                        if let Some(window) = app.get_webview_window("main") {
-                            if let Err(e) = window.hide() {
-                                log::error!("Failed to hide window: {}", e);
-                            } else {
-                                log::info!("Window hidden successfully");
-                            }
-                        }
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| match event {
-                    tauri::tray::TrayIconEvent::Enter { .. } => {
-                        if let Err(e) =
-                            tray.set_tooltip(Some("KlaayGuard - Security Monitoring".to_string()))
-                        {
-                            log::error!("Failed to set tooltip: {}", e);
-                        }
-                    }
-                    tauri::tray::TrayIconEvent::Leave { .. } => {
-                        if let Err(e) = tray.set_tooltip(Some("".to_string())) {
-                            log::error!("Failed to clear tooltip: {}", e);
-                        }
-                    }
-                    _ => {}
                 })
                 .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("KlaayGuard")
                 .menu(&menu)
-                .build(app)
-                .map_err(|e| {
-                    log::error!("Failed to create system tray icon: {}", e);
-                    e
-                })?;
+                .build(app)?;
             // Spawn the single collect-and-send loop
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
@@ -1579,16 +1289,6 @@ pub fn run() {
 
             Ok(())
         })
-        .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![
-            clear_auth_token,
-            get_next_run_in_seconds,
-            get_auth_status,
-            get_app_version,
-            install_launch_agent,
-            uninstall_launch_agent,
-            get_arch_status
-        ])
         .build(tauri::generate_context!())
         .expect("error building tauri application");
 

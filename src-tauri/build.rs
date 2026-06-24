@@ -32,6 +32,17 @@ fn main() {
         api_base
     );
 
+    // Earthenware (web app) base — needed by the tray "Sign in" action now that
+    // the login UI lives in Rust, not a webview.
+    let default_earthenware = match klaay_env.as_str() {
+        "staging" => "https://app.klaay.dev",
+        "development" => "http://localhost:5173",
+        _ => "https://app.klaay.com",
+    };
+    let earthenware =
+        std::env::var("VITE_EARTHENWARE_URL").unwrap_or_else(|_| default_earthenware.to_string());
+    println!("cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}", earthenware);
+
     let mut windows = tauri_build::WindowsAttributes::new();
     windows = windows.app_manifest(
         r#"

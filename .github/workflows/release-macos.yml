@@ -44,21 +44,16 @@ jobs:
         with:
           lfs: true
 
-      - name: setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - name: install frontend dependencies
-        run: yarn install
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
 
       - name: Setup osquery binaries (macOS)
-        run: yarn setup-osquery
+        run: rake
 
       - name: Verify sidecar binaries exist (macOS)
         shell: bash
@@ -69,8 +64,11 @@ jobs:
           test -f src-tauri/vendor/osqueryi-aarch64-apple-darwin || (echo "Missing macOS arm64 sidecar" && exit 1)
           test -f src-tauri/vendor/osqueryi-x86_64-apple-darwin || (echo "Missing macOS x64 sidecar" && exit 1)
 
-      - name: Sync version across all files
-        run: yarn sync-version
+      - name: Set bundle version from release
+        run: |
+          V="${{ inputs.version }}"; V="${V#v}"
+          sed -i '' -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
+          sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
 
       - name: (Mac) Import Apple Developer Certificate
         env:
@@ -108,7 +106,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          yarn tauri:build --target ${{ matrix.target }}
+          cargo tauri build --target ${{ matrix.target }}
 
       - name: Rename and upload artifacts (macOS)
         env:
