@@ -126,6 +126,7 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
     });
     let _ = keychain::save_token(&tok);
     let _ = app.emit("auth:status", json!({ "authenticated": true }));
+    set_tray_signed_in(app, true);
     add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
     sentry::capture_message("deep_link_token_saved", Level::Info);
 }
@@ -210,6 +211,7 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     // Log locally and notify the user that re-login is needed (no window now).
     log::warn!("Authentication invalidated; notifying user to re-sign-in");
     notify_signin_needed(state).await;
+    set_tray_signed_in(app, false);
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     add_breadcrumb("auth", "auth_invalidated", Level::Warning);
@@ -759,6 +761,27 @@ fn open_sign_in(app: &tauri::AppHandle) {
     }
 }
 
+/// Handles to the tray menu items whose text reflects auth state.
+struct TrayMenu {
+    status: tauri::menu::MenuItem<tauri::Wry>,
+    action: tauri::menu::MenuItem<tauri::Wry>,
+}
+
+/// Update the tray's status line and Sign in/Sign out action to match auth state.
+/// Safe to call from any thread (menu mutations run on the main thread).
+fn set_tray_signed_in(app: &tauri::AppHandle, signed_in: bool) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray) = handle.try_state::<TrayMenu>() {
+            let _ = tray
+                .status
+                .set_text(if signed_in { "Signed in" } else { "Not signed in" });
+            // "Sign in" is only actionable when signed out; we never offer sign-out.
+            let _ = tray.action.set_enabled(!signed_in);
+        }
+    });
+}
+
 async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpdate>, String> {
     let current_version = env!("CARGO_PKG_VERSION");
     log::info!(
@@ -1268,13 +1291,30 @@ pub fn run() {
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
 
-            // Tray: a single "Sign in" action that opens the browser; no quit (by design).
-            let signin_i =
-                tauri::menu::MenuItem::with_id(app, "signin", "Sign in", true, None::<&str>)?;
-            let menu = tauri::menu::Menu::with_items(app, &[&signin_i])?;
+            // Tray: a disabled status line reflecting auth state, plus an action that
+            // toggles between "Sign in" (opens the browser) and "Sign out". No quit.
+            let status_i = tauri::menu::MenuItem::with_id(
+                app,
+                "status",
+                if authed { "Signed in" } else { "Not signed in" },
+                false,
+                None::<&str>,
+            )?;
+            let action_i = tauri::menu::MenuItem::with_id(
+                app,
+                "auth_action",
+                "Sign in",
+                !authed,
+                None::<&str>,
+            )?;
+            app.manage(TrayMenu {
+                status: status_i.clone(),
+                action: action_i.clone(),
+            });
+            let menu = tauri::menu::Menu::with_items(app, &[&status_i, &action_i])?;
             tauri::tray::TrayIconBuilder::new()
                 .on_menu_event(|app, event| {
-                    if event.id.as_ref() == "signin" {
+                    if event.id.as_ref() == "auth_action" {
                         open_sign_in(app);
                     }
                 })
