@@ -1204,6 +1204,51 @@ async fn replace_application(
 /// - Background operation prevents easy termination
 /// - System tray provides controlled access
 /// - Automatic updates ensure latest security patches
+fn update_check_interval_seconds() -> u64 {
+    std::env::var("KLAAYGUARD_UPDATE_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(6 * 60 * 60)
+}
+
+/// One update check: if a newer build is offered, download + verify + install it
+/// (which restarts the app). No-op if already current.
+async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
+    match check_for_updates_internal(api_base).await {
+        Ok(Some(update)) => {
+            log::info!("🔄 Update available, starting download and install process...");
+            if let Err(e) = download_and_install_update_internal(
+                api_base,
+                &update.asset_id,
+                update.sha256.as_deref(),
+                app,
+            )
+            .await
+            {
+                log::error!("💥 Auto-update failed: {}", e);
+            }
+        }
+        Ok(None) => log::info!("✅ No updates available - app is up to date"),
+        Err(e) => log::warn!("update check failed: {}", e),
+    }
+}
+
+/// Check for updates immediately, then on a recurring interval (default 6h), so the
+/// always-on agent self-updates in place rather than only at restart.
+fn spawn_update_loop(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(update_check_interval_seconds()));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await; // first tick is immediate (startup check)
+            let api_base = get_api_base_url();
+            log::info!("🚀 Update check against {}", api_base);
+            run_update_check(&api_base, &app).await;
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Prefer runtime env; fall back to compile-time embedded default; then hard-coded prod
@@ -1300,28 +1345,9 @@ pub fn run() {
             // Check if we're already running as a regular process to prevent duplicates
             // Duplicate instance prevention handled by single-instance plugin; remove manual pgrep/exit logic
 
-            // Check for updates on startup and install automatically
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                log::info!("🚀 Starting automatic update check on app startup");
-                let api_base = get_api_base_url();
-                log::info!("🌐 Using API base URL: {}", api_base);
-                if let Ok(Some(update)) = check_for_updates_internal(&api_base).await {
-                    log::info!("🔄 Update available, starting download and install process...");
-                    if let Err(e) = download_and_install_update_internal(
-                        &api_base,
-                        &update.asset_id,
-                        update.sha256.as_deref(),
-                        &app_handle,
-                    )
-                    .await
-                    {
-                        log::error!("💥 Auto-update failed: {}", e);
-                    }
-                } else {
-                    log::info!("✅ No updates available - app is up to date");
-                }
-            });
+            // Check for updates on startup AND on a recurring interval, so an
+            // always-on agent self-updates in place without waiting for a restart.
+            spawn_update_loop(app.handle().clone());
 
             // Install and kickstart LaunchAgent with KeepAlive
             #[cfg(target_os = "macos")]
