@@ -765,9 +765,32 @@ fn open_sign_in(app: &tauri::AppHandle) {
     open_earthenware(app, "/login?app=klaayguard");
 }
 
-/// Handle to the single tray item whose text + enabled state reflect auth state.
+/// Handles + assets for keeping the tray in sync with auth state.
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
+    tray: tauri::tray::TrayIcon<tauri::Wry>,
+    green: tauri::image::Image<'static>,
+    red: tauri::image::Image<'static>,
+    last_signed_in: std::sync::atomic::AtomicBool,
+}
+
+/// Composite a filled status dot into the bottom-right of an RGBA icon. The base
+/// icon is already decoded by Tauri, so no image-decode dependency is needed.
+fn icon_with_dot(base: &tauri::image::Image, color: [u8; 4]) -> tauri::image::Image<'static> {
+    let (w, h) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+    let r = ((w.min(h) as f32) * 0.30) as i32;
+    let (cx, cy) = (w as i32 - r - 1, h as i32 - r - 1);
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let (dx, dy) = (x - cx, y - cy);
+            if dx * dx + dy * dy <= r * r {
+                let i = ((y as u32 * w + x as u32) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    tauri::image::Image::new_owned(rgba, w, h)
 }
 
 /// Format seconds-until-next-fetch as a short countdown string.
@@ -796,11 +819,20 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
     } else {
         ("Sign in".to_string(), true)
     };
+    let signed_in = !enabled;
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray.item.set_text(&text);
             let _ = tray.item.set_enabled(enabled);
+            // Swap the menubar icon's status dot only when auth state flips.
+            let prev = tray
+                .last_signed_in
+                .swap(signed_in, std::sync::atomic::Ordering::Relaxed);
+            if prev != signed_in {
+                let icon = if signed_in { tray.green.clone() } else { tray.red.clone() };
+                let _ = tray.tray.set_icon(Some(icon));
+            }
         }
     });
 }
@@ -1349,7 +1381,6 @@ pub fn run() {
                 None::<&str>,
             )?;
             let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
-            app.manage(TrayMenu { item: item.clone() });
             let menu = tauri::menu::Menu::with_items(
                 app,
                 &[
@@ -1359,16 +1390,31 @@ pub fn run() {
                     &version_i,
                 ],
             )?;
-            tauri::tray::TrayIconBuilder::new()
+            // Status-dot icons: green when signed in, red when not.
+            let (green, red) = {
+                let base = app.default_window_icon().expect("default window icon");
+                (
+                    icon_with_dot(base, [46, 204, 113, 255]),
+                    icon_with_dot(base, [231, 76, 60, 255]),
+                )
+            };
+            let tray = tauri::tray::TrayIconBuilder::new()
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "auth_action" => open_sign_in(app),
                     "employee_hub" => open_earthenware(app, "/employee-hub"),
                     _ => {}
                 })
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(if authed { green.clone() } else { red.clone() })
                 .tooltip("KlaayGuard")
                 .menu(&menu)
                 .build(app)?;
+            app.manage(TrayMenu {
+                item: item.clone(),
+                tray,
+                green,
+                red,
+                last_signed_in: std::sync::atomic::AtomicBool::new(authed),
+            });
             // Spawn the single collect-and-send loop + the tray countdown clock.
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
