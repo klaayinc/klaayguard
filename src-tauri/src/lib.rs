@@ -751,12 +751,18 @@ fn get_earthenware_url() -> String {
 
 /// Open the browser to the Earthenware sign-in page; it deep-links back via
 /// `klaayguard://auth-callback?token=…`. Invoked from the tray "Sign in" item.
-fn open_sign_in(app: &tauri::AppHandle) {
-    let url = format!("{}/login?app=klaayguard", get_earthenware_url());
-    log::info!("opening sign-in url={}", url);
-    if let Err(e) = app.shell().open(url, None) {
-        log::error!("failed to open sign-in url: {}", e);
+/// Open an Earthenware path in the default browser.
+fn open_earthenware(app: &tauri::AppHandle, path: &str) {
+    let url = format!("{}{}", get_earthenware_url(), path);
+    log::info!("opening url={}", url);
+    if let Err(e) = app.shell().open(url.clone(), None) {
+        log::error!("failed to open url {}: {}", url, e);
     }
+}
+
+/// Open the Earthenware sign-in page; it deep-links back via klaayguard://.
+fn open_sign_in(app: &tauri::AppHandle) {
+    open_earthenware(app, "/login?app=klaayguard");
 }
 
 /// Handle to the single tray item whose text + enabled state reflect auth state.
@@ -1319,8 +1325,8 @@ pub fn run() {
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
 
-            // Tray: one item that reflects auth state — a greyed "Signed in" when
-            // authenticated, or a clickable "Sign in" when not. No quit, no sign-out.
+            // Tray menu: live auth/countdown item, an Employee Hub link, and a version
+            // line. No quit, no sign-out. Only the auth item updates at runtime.
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
@@ -1328,13 +1334,36 @@ pub fn run() {
                 !authed,
                 None::<&str>,
             )?;
+            let hub_i = tauri::menu::MenuItem::with_id(
+                app,
+                "employee_hub",
+                "Employee Hub",
+                true,
+                None::<&str>,
+            )?;
+            let version_i = tauri::menu::MenuItem::with_id(
+                app,
+                "version",
+                format!("Version {}", env!("CARGO_PKG_VERSION")),
+                false,
+                None::<&str>,
+            )?;
+            let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
             app.manage(TrayMenu { item: item.clone() });
-            let menu = tauri::menu::Menu::with_items(app, &[&item])?;
+            let menu = tauri::menu::Menu::with_items(
+                app,
+                &[
+                    &item as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
+                    &hub_i,
+                    &sep,
+                    &version_i,
+                ],
+            )?;
             tauri::tray::TrayIconBuilder::new()
-                .on_menu_event(|app, event| {
-                    if event.id.as_ref() == "auth_action" {
-                        open_sign_in(app);
-                    }
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "auth_action" => open_sign_in(app),
+                    "employee_hub" => open_earthenware(app, "/employee-hub"),
+                    _ => {}
                 })
                 .icon(app.default_window_icon().unwrap().clone())
                 .tooltip("KlaayGuard")
