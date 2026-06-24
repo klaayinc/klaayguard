@@ -126,7 +126,6 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
     });
     let _ = keychain::save_token(&tok);
     let _ = app.emit("auth:status", json!({ "authenticated": true }));
-    set_tray_signed_in(app, true);
     add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
     sentry::capture_message("deep_link_token_saved", Level::Info);
 }
@@ -211,7 +210,6 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     // Log locally and notify the user that re-login is needed (no window now).
     log::warn!("Authentication invalidated; notifying user to re-sign-in");
     notify_signin_needed(state).await;
-    set_tray_signed_in(app, false);
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     add_breadcrumb("auth", "auth_invalidated", Level::Warning);
@@ -766,17 +764,48 @@ struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
 }
 
-/// Update the tray's one item to match auth state: a greyed "Signed in" when
-/// authenticated, or a clickable "Sign in" when not. Never offers sign-out.
-/// Safe to call from any thread (menu mutations run on the main thread).
-fn set_tray_signed_in(app: &tauri::AppHandle, signed_in: bool) {
+/// Format seconds-until-next-fetch as a short countdown string.
+fn fmt_countdown(secs: i64) -> String {
+    if secs <= 0 {
+        return "Fetching now…".to_string();
+    }
+    let (m, s) = (secs / 60, secs % 60);
+    if m > 0 {
+        format!("Next fetch in {}m {:02}s", m, s)
+    } else {
+        format!("Next fetch in {}s", s)
+    }
+}
+
+/// Refresh the single tray item: a clickable "Sign in" when signed out, or a greyed
+/// countdown to the next fetch when signed in. Menu mutation runs on the main thread.
+async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    let (text, enabled) = if state.auth_token.read().await.is_some() {
+        let interval = collection_interval_seconds() as i64;
+        let remaining = match *state.last_attempt_at.read().await {
+            Some(t) => (interval - t.elapsed().as_secs() as i64).max(0),
+            None => 0,
+        };
+        (fmt_countdown(remaining), false)
+    } else {
+        ("Sign in".to_string(), true)
+    };
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
-            let _ = tray
-                .item
-                .set_text(if signed_in { "Signed in" } else { "Sign in" });
-            let _ = tray.item.set_enabled(!signed_in);
+            let _ = tray.item.set_text(&text);
+            let _ = tray.item.set_enabled(enabled);
+        }
+    });
+}
+
+/// Tick the tray countdown once a second so it's current whenever the menu opens.
+fn spawn_tray_clock(app: tauri::AppHandle, state: Arc<AppState>) {
+    tauri::async_runtime::spawn(async move {
+        let mut iv = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            iv.tick().await;
+            refresh_tray(&app, &state).await;
         }
     });
 }
@@ -1311,9 +1340,10 @@ pub fn run() {
                 .tooltip("KlaayGuard")
                 .menu(&menu)
                 .build(app)?;
-            // Spawn the single collect-and-send loop
+            // Spawn the single collect-and-send loop + the tray countdown clock.
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
+            spawn_tray_clock(app_handle.clone(), state_for_loop.clone());
             spawn_background_loop(app_handle, state_for_loop);
 
             Ok(())
