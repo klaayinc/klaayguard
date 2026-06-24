@@ -761,23 +761,22 @@ fn open_sign_in(app: &tauri::AppHandle) {
     }
 }
 
-/// Handles to the tray menu items whose text reflects auth state.
+/// Handle to the single tray item whose text + enabled state reflect auth state.
 struct TrayMenu {
-    status: tauri::menu::MenuItem<tauri::Wry>,
-    action: tauri::menu::MenuItem<tauri::Wry>,
+    item: tauri::menu::MenuItem<tauri::Wry>,
 }
 
-/// Update the tray's status line and Sign in/Sign out action to match auth state.
+/// Update the tray's one item to match auth state: a greyed "Signed in" when
+/// authenticated, or a clickable "Sign in" when not. Never offers sign-out.
 /// Safe to call from any thread (menu mutations run on the main thread).
 fn set_tray_signed_in(app: &tauri::AppHandle, signed_in: bool) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray
-                .status
-                .set_text(if signed_in { "Signed in" } else { "Not signed in" });
-            // "Sign in" is only actionable when signed out; we never offer sign-out.
-            let _ = tray.action.set_enabled(!signed_in);
+                .item
+                .set_text(if signed_in { "Signed in" } else { "Sign in" });
+            let _ = tray.item.set_enabled(!signed_in);
         }
     });
 }
@@ -1291,27 +1290,17 @@ pub fn run() {
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
 
-            // Tray: a disabled status line reflecting auth state, plus an action that
-            // toggles between "Sign in" (opens the browser) and "Sign out". No quit.
-            let status_i = tauri::menu::MenuItem::with_id(
-                app,
-                "status",
-                if authed { "Signed in" } else { "Not signed in" },
-                false,
-                None::<&str>,
-            )?;
-            let action_i = tauri::menu::MenuItem::with_id(
+            // Tray: one item that reflects auth state — a greyed "Signed in" when
+            // authenticated, or a clickable "Sign in" when not. No quit, no sign-out.
+            let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
-                "Sign in",
+                if authed { "Signed in" } else { "Sign in" },
                 !authed,
                 None::<&str>,
             )?;
-            app.manage(TrayMenu {
-                status: status_i.clone(),
-                action: action_i.clone(),
-            });
-            let menu = tauri::menu::Menu::with_items(app, &[&status_i, &action_i])?;
+            app.manage(TrayMenu { item: item.clone() });
+            let menu = tauri::menu::Menu::with_items(app, &[&item])?;
             tauri::tray::TrayIconBuilder::new()
                 .on_menu_event(|app, event| {
                     if event.id.as_ref() == "auth_action" {
