@@ -31,8 +31,6 @@ pub struct AppState {
     pub api_base_url: RwLock<String>,
     pub last_run_at: RwLock<Option<std::time::Instant>>,
     pub last_attempt_at: RwLock<Option<std::time::Instant>>,
-    // Prevent repeated Keychain delete prompts by ensuring we only delete once per session
-    pub keychain_cleared_this_session: RwLock<bool>,
     pub last_focus_at: RwLock<Option<std::time::Instant>>, // debounce for focus-on-failure
 }
 
@@ -122,7 +120,6 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
     log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
     tauri::async_runtime::block_on(async {
         *state.auth_token.write().await = Some(tok.clone());
-        *state.keychain_cleared_this_session.write().await = false;
     });
     let _ = keychain::save_token(&tok);
     let _ = app.emit("auth:status", json!({ "authenticated": true }));
@@ -200,14 +197,10 @@ async fn execute_sql_batch(
 }
 
 async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+    // Stop using the token, but DON'T delete it from the keychain: a keychain write
+    // pops a second OS prompt on unsigned builds, and the stale token is harmless
+    // (overwritten on next sign-in). Just clear it in memory and prompt re-login.
     *state.auth_token.write().await = None;
-    // Delete the token at most once per session to reduce prompts
-    let already_cleared = *state.keychain_cleared_this_session.read().await;
-    if !already_cleared {
-        let _ = keychain::delete_token();
-        *state.keychain_cleared_this_session.write().await = true;
-    }
-    // Log locally and notify the user that re-login is needed (no window now).
     log::warn!("Authentication invalidated; notifying user to re-sign-in");
     notify_signin_needed(state).await;
     let _ = app.emit("auth:invalidated", ());
@@ -1284,7 +1277,6 @@ pub fn run() {
         api_base_url: RwLock::new(api_base),
         last_run_at: RwLock::new(None),
         last_attempt_at: RwLock::new(None),
-        keychain_cleared_this_session: RwLock::new(false),
         last_focus_at: RwLock::new(None),
     });
 

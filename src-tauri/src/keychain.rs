@@ -9,23 +9,17 @@ fn entry() -> Result<Entry, String> {
 }
 
 pub fn save_token(token: &str) -> Result<(), String> {
+    log::info!("🔑 keychain access: set_password");
     entry()?
         .set_password(token)
         .map_err(|e| format!("keychain set_password error: {}", e))
 }
 
 pub fn load_token() -> Result<Option<String>, String> {
+    log::info!("🔑 keychain access: get_password");
     match entry()?.get_password() {
         Ok(p) => Ok(Some(p)),
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(format!("keychain get_password error: {}", e)),
-    }
-}
-
-pub fn delete_token() -> Result<(), String> {
-    match entry()?.delete_password() {
-        Ok(_) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("keychain delete_password error: {}", e)),
     }
 }
