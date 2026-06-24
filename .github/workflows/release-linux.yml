@@ -35,24 +35,19 @@ jobs:
         with:
           lfs: true
 
-      - name: setup node
-        uses: actions/setup-node@v4
-        with:
-          node-version: lts/*
-
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: install tauri-cli
+        run: cargo install tauri-cli --version "^2" --locked
 
       - name: (Ubuntu) install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.0-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-
-      - name: install frontend dependencies
-        run: yarn install
+          sudo apt-get install -y libwebkit2gtk-4.0-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake
 
       - name: Setup osquery binaries (Linux)
-        run: yarn setup-osquery
+        run: rake
 
       - name: Verify sidecar binaries exist (Linux x86_64)
         shell: bash
@@ -62,8 +57,11 @@ jobs:
           ls -l src-tauri/vendor || true
           test -f src-tauri/vendor/osqueryi-x86_64-unknown-linux-gnu || (echo "Missing Linux x86_64 sidecar" && exit 1)
 
-      - name: Sync version across all files
-        run: yarn sync-version
+      - name: Set bundle version from release
+        run: |
+          V="${{ inputs.version }}"; V="${V#v}"
+          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
 
       - name: Build Tauri (Linux x86_64)
         env:
@@ -72,7 +70,7 @@ jobs:
           VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
           VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
         run: |
-          yarn tauri:build --bundles deb rpm
+          cargo tauri build --bundles deb rpm
 
       - name: Rename and upload artifacts (Linux x86_64)
         env:
