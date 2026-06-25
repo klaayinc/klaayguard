@@ -81,52 +81,48 @@ sequenceDiagram
 
 ### Prerequisites
 
-```bash
-# Install Node.js (v22+ recommended)
-curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
-nvm install 22
-nvm use 22
+KlaayGuard is a tray-only Rust/Tauri agent — no Node.js or frontend toolchain.
 
+```bash
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source ~/.cargo/env
 
-# Install Tauri CLI
-cargo install tauri-cli
+# Install the Tauri CLI (Rust, not npm)
+cargo install tauri-cli --version "^2"
 
-# Install Yarn (if not using npm)
-npm install -g yarn
+# Ruby/rake (for vendoring the osquery sidecars) — preinstalled on macOS
 ```
 
 ### Setup & Development
 
 ```bash
-# Clone and setup
 git clone https://github.com/klaayinc/klaayguard.git
 cd klaayguard
 
-# Install dependencies
-yarn install
+# Vendor the osquery sidecars (once)
+rake
 
-# Run in development (uses http://localhost:3000 by default; CI overrides with env)
-yarn tauri dev
+# Build & run against a local stack (kiln :3000 / earthenware :5173)
+KLAAY_ENV=development VITE_API_BASE_URL=http://localhost:3000 VITE_EARTHENWARE_URL=http://localhost:5173 \
+  cargo tauri build && open src-tauri/target/release/bundle/macos/KlaayGuard.app
 ```
 
 ### Build
 
 ```bash
 # Default environment is production
-yarn tauri:build
+cargo tauri build
 
-# Staging/Development overrides
-KLAAY_ENV=staging yarn tauri:build
-KLAAY_ENV=development yarn tauri:build
+# Staging/Development overrides (env feeds the build script defaults)
+KLAAY_ENV=staging cargo tauri build
+KLAAY_ENV=development cargo tauri build
 
 # Pass through platform targets
-yarn tauri:build --target aarch64-apple-darwin      # macOS Apple Silicon
-yarn tauri:build --target x86_64-apple-darwin       # macOS Intel
-yarn tauri:build --target x86_64-pc-windows-msvc    # Windows
-yarn tauri:build --target x86_64-unknown-linux-gnu  # Linux
+cargo tauri build --target aarch64-apple-darwin      # macOS Apple Silicon
+cargo tauri build --target x86_64-apple-darwin       # macOS Intel
+cargo tauri build --target x86_64-pc-windows-msvc    # Windows
+cargo tauri build --target x86_64-unknown-linux-gnu  # Linux
 ```
 
 ## 🏗️ Multi-Platform Support

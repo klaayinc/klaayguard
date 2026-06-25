@@ -4,10 +4,7 @@
   "version": "0.1.12",
   "identifier": "com.klaay.app",
   "build": {
-    "beforeDevCommand": "yarn dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "yarn build --mode production",
-    "frontendDist": "../dist"
+    "frontendDist": "frontend"
   },
   "app": {
     "windows": [],
