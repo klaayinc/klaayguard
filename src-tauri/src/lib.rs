@@ -202,7 +202,7 @@ async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Resul
     // (overwritten on next sign-in). Just clear it in memory and prompt re-login.
     *state.auth_token.write().await = None;
     log::warn!("Authentication invalidated; notifying user to re-sign-in");
-    notify_signin_needed(state).await;
+    notify_signin_needed(app, state).await;
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     add_breadcrumb("auth", "auth_invalidated", Level::Warning);
@@ -224,9 +224,10 @@ fn collection_interval_seconds() -> u64 {
         .unwrap_or(900)
 }
 
-/// Debounced native notification telling the user to sign in again. Replaces the
-/// old "focus the window" nudge now that the app is tray-only.
-async fn notify_signin_needed(state: &Arc<AppState>) {
+/// Debounced sign-in nudge: opens the login page in the browser and posts a native
+/// notification. Replaces the old "focus the window" nudge now that the app is
+/// tray-only. The debounce keeps repeated 401s from spamming browser tabs.
+async fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
     let now = std::time::Instant::now();
     let debounce = std::time::Duration::from_secs(focus_debounce_seconds());
     let should = match *state.last_focus_at.read().await {
@@ -237,8 +238,9 @@ async fn notify_signin_needed(state: &Arc<AppState>) {
         return;
     }
     *state.last_focus_at.write().await = Some(now);
-    log::warn!("sign-in required; notifying user (debounced)");
+    log::warn!("sign-in required; opening login page (debounced)");
     add_breadcrumb("ui", "signin_required_notification", Level::Info);
+    open_sign_in(app);
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("osascript")
@@ -1369,7 +1371,10 @@ pub fn run() {
             } else {
                 log::info!("KlaayGuard started - sign-in required");
                 let st = state_for_loop.clone();
-                tauri::async_runtime::spawn(async move { notify_signin_needed(&st).await });
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(
+                    async move { notify_signin_needed(&app_handle, &st).await },
+                );
             }
 
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
