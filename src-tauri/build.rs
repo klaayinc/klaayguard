@@ -53,7 +53,10 @@ fn main() {
     };
     let earthenware =
         std::env::var("VITE_EARTHENWARE_URL").unwrap_or_else(|_| default_earthenware.to_string());
-    println!("cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}", earthenware);
+    println!(
+        "cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}",
+        earthenware
+    );
 
     let mut windows = tauri_build::WindowsAttributes::new();
     windows = windows.app_manifest(
