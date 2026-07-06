@@ -43,3 +43,24 @@ jobs:
       release_tag: ${{ needs.prepare.outputs.tag }}
       version: ${{ needs.prepare.outputs.version }}
     secrets: inherit
+
+  # Publish the release to customers only after every platform build has uploaded
+  # its assets, and only on main. Until this runs the release stays a draft, so a
+  # failed build never ships a half-populated version. Marking it --latest is what
+  # makes the download endpoints (GET /releases/latest) serve it.
+  publish:
+    needs: [prepare, macos, linux, windows]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release edit "${{ needs.prepare.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest
