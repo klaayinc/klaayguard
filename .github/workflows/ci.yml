@@ -63,3 +63,16 @@ jobs:
         working-directory: src-tauri
         continue-on-error: true
         run: cargo clippy --all-targets
+
+      # Dependency vulnerability scan against the RustSec advisory DB. Advisory for
+      # now so a transitive advisory (which a given PR often can't fix) doesn't
+      # block unrelated work; review its output and tighten once the tree is clean.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit (advisory)
+        working-directory: src-tauri
+        continue-on-error: true
+        run: cargo audit
