@@ -1,4 +1,16 @@
 fn main() {
+    // Re-run this script when any env that feeds the compiled-in defaults changes.
+    // Without these, cargo caches build.rs output and a later build with a different
+    // KLAAY_ENV/VITE_* silently keeps the previously-compiled environment.
+    for var in [
+        "KLAAY_ENV",
+        "NODE_ENV",
+        "VITE_API_BASE_URL",
+        "VITE_EARTHENWARE_URL",
+    ] {
+        println!("cargo:rerun-if-env-changed={}", var);
+    }
+
     // Determine environment for compile-time defaults
     let klaay_env = std::env::var("KLAAY_ENV")
         .ok()
