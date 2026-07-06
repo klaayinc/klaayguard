@@ -9,6 +9,7 @@
     "core:image:default",
     "core:menu:default",
     "core:tray:default",
-    "shell:default"
+    "shell:default",
+    "opener:default"
   ]
 }

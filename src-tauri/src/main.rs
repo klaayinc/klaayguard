@@ -67,12 +67,10 @@ fn main() {
         }
 
         if let Some(is_arm_hw) = is_apple_silicon_hw {
-            let mismatch = match (is_arm_hw, built_arch) {
-                (true, "x86_64") => true,
-                (false, "aarch64") => true,
-                (false, "arm") => true,
-                _ => false,
-            };
+            let mismatch = matches!(
+                (is_arm_hw, built_arch),
+                (true, "x86_64") | (false, "aarch64") | (false, "arm")
+            );
 
             if mismatch {
                 let human_built = if built_arch == "aarch64" {
