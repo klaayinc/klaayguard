@@ -4,6 +4,7 @@
   "permissions": [
     "core:default",
     "shell:default",
+    "opener:default",
     "log:default",
     "core:event:default"
   ]

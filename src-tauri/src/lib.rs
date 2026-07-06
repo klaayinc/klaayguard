@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tauri::{Emitter, Manager};
 // removed autostart plugin; using manual LaunchAgent management
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::ShellExt;
 // use tauri_plugin_log::LogTarget; // use defaults
 use tokio::sync::RwLock;
@@ -92,10 +93,15 @@ fn parse_config_queries(cfg: &Value) -> Vec<(String, String)> {
 }
 
 /// Flatten osquery results into JSON:API resources, stamping each row with collected_at.
-fn build_payload_items(results: &HashMap<String, Value>, collected_at: &str) -> Vec<JsonApiResource> {
+fn build_payload_items(
+    results: &HashMap<String, Value>,
+    collected_at: &str,
+) -> Vec<JsonApiResource> {
     let mut items = Vec::new();
     for (table, value) in results.iter() {
-        let Some(arr) = value.as_array() else { continue };
+        let Some(arr) = value.as_array() else {
+            continue;
+        };
         for row in arr {
             let mut attributes = row.clone();
             if let Some(obj) = attributes.as_object_mut() {
@@ -117,7 +123,10 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
         log::info!("deep_link_ignored url={}", url);
         return;
     };
-    log::info!("deep_link_token_parsed length={} saving_to_keychain", tok.len());
+    log::info!(
+        "deep_link_token_parsed length={} saving_to_keychain",
+        tok.len()
+    );
     tauri::async_runtime::block_on(async {
         *state.auth_token.write().await = Some(tok.clone());
     });
@@ -168,7 +177,11 @@ async fn execute_sql_batch(
             let stderr_str = String::from_utf8_lossy(&output.stderr);
             add_breadcrumb(
                 "collection",
-                &format!("osquery_query_skipped '{}': {}", logical_id, stderr_str.trim()),
+                &format!(
+                    "osquery_query_skipped '{}': {}",
+                    logical_id,
+                    stderr_str.trim()
+                ),
                 Level::Warning,
             );
             all_results.insert(logical_id, serde_json::json!([]));
@@ -306,7 +319,10 @@ fn extract_serial(rows: &Value) -> Option<String> {
 async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
     let result = execute_sql_batch(
         app.clone(),
-        vec![("system_info".to_string(), "SELECT * FROM system_info".to_string())],
+        vec![(
+            "system_info".to_string(),
+            "SELECT * FROM system_info".to_string(),
+        )],
     )
     .await?;
     extract_serial(result.get("system_info").unwrap_or(&Value::Null))
@@ -622,7 +638,7 @@ async fn install_launch_agent() -> Result<String, String> {
         if let Ok(existing) = fs::read_to_string(&plist_path) {
             if existing == plist_content {
                 let output = std::process::Command::new("launchctl")
-                    .args(&["print", &format!("{}/{}", domain, label)])
+                    .args(["print", &format!("{}/{}", domain, label)])
                     .output()
                     .map_err(|e| format!("Failed to check launch agent status: {}", e))?;
                 if output.status.success() {
@@ -638,12 +654,12 @@ async fn install_launch_agent() -> Result<String, String> {
         if installed_exists {
             if needs_reload {
                 let _ = std::process::Command::new("launchctl")
-                    .args(&["bootout", &format!("{}/{}", domain, label)])
+                    .args(["bootout", &format!("{}/{}", domain, label)])
                     .output();
             }
 
             let output = std::process::Command::new("launchctl")
-                .args(&["bootstrap", &domain, plist_path.to_str().unwrap()])
+                .args(["bootstrap", &domain, plist_path.to_str().unwrap()])
                 .output()
                 .map_err(|e| format!("Failed to bootstrap launch agent: {}", e))?;
             if !output.status.success() {
@@ -654,10 +670,10 @@ async fn install_launch_agent() -> Result<String, String> {
             }
 
             let _ = std::process::Command::new("launchctl")
-                .args(&["enable", &format!("{}/{}", domain, label)])
+                .args(["enable", &format!("{}/{}", domain, label)])
                 .output();
             let _ = std::process::Command::new("launchctl")
-                .args(&["kickstart", "-k", &format!("{}/{}", domain, label)])
+                .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
                 .output();
         } else {
             // Not installed under /Applications; skip bootstrap to avoid immediate launch errors in dev.
@@ -706,10 +722,12 @@ fn select_dmg_asset<'a>(
     arch_tag: &str,
     arch_label: &str,
 ) -> Option<&'a ReleaseAsset> {
-    assets.iter().find(|asset| match asset.original_name.as_deref() {
-        Some(orig) => orig.ends_with(".dmg") && orig.contains(arch_tag),
-        None => asset.name.contains(arch_label),
-    })
+    assets
+        .iter()
+        .find(|asset| match asset.original_name.as_deref() {
+            Some(orig) => orig.ends_with(".dmg") && orig.contains(arch_tag),
+            None => asset.name.contains(arch_label),
+        })
 }
 
 /// Whether `bytes` hashes to `expected` (bare hex or "sha256:"-prefixed).
@@ -717,7 +735,11 @@ fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let actual: String = hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect();
+    let actual: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     actual.eq_ignore_ascii_case(expected.trim_start_matches("sha256:"))
 }
 
@@ -750,7 +772,7 @@ fn get_earthenware_url() -> String {
 fn open_earthenware(app: &tauri::AppHandle, path: &str) {
     let url = format!("{}{}", get_earthenware_url(), path);
     log::info!("opening url={}", url);
-    if let Err(e) = app.shell().open(url.clone(), None) {
+    if let Err(e) = app.opener().open_url(url.clone(), None::<&str>) {
         log::error!("failed to open url {}: {}", url, e);
     }
 }
@@ -825,7 +847,11 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
                 .last_signed_in
                 .swap(signed_in, std::sync::atomic::Ordering::Relaxed);
             if prev != signed_in {
-                let icon = if signed_in { tray.green.clone() } else { tray.red.clone() };
+                let icon = if signed_in {
+                    tray.green.clone()
+                } else {
+                    tray.red.clone()
+                };
                 let _ = tray.tray.set_icon(Some(icon));
             }
         }
@@ -858,7 +884,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
 
     // Get latest release info
     let response = client
-        .get(&format!("{}/klaayguard/updates/latest", api_base))
+        .get(format!("{}/klaayguard/updates/latest", api_base))
         .send()
         .await
         .map_err(|e| {
@@ -950,7 +976,10 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             log::info!(
                 "✅ Selected {} update: {} (ID: {})",
                 arch_tag,
-                dmg_asset.original_name.as_deref().unwrap_or(&dmg_asset.name),
+                dmg_asset
+                    .original_name
+                    .as_deref()
+                    .unwrap_or(&dmg_asset.name),
                 dmg_asset.id
             );
             log::info!(
@@ -963,10 +992,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 sha256: dmg_asset.sha256.clone(),
             }));
         } else {
-            log::warn!(
-                "⚠️  No {} DMG asset found in release assets",
-                arch_tag
-            );
+            log::warn!("⚠️  No {} DMG asset found in release assets", arch_tag);
         }
     } else if release_semver < current_semver {
         log::info!(
@@ -1070,7 +1096,7 @@ async fn replace_application(
 
     // Mount the DMG
     let mount_output = std::process::Command::new("hdiutil")
-        .args(&["attach", dmg_path.to_str().unwrap()])
+        .args(["attach", dmg_path.to_str().unwrap()])
         .output()
         .map_err(|e| {
             log::error!("❌ Failed to mount DMG: {}", e);
@@ -1099,7 +1125,7 @@ async fn replace_application(
             "Could not find mount point"
         })?
         .split('\t')
-        .last()
+        .next_back()
         .ok_or_else(|| {
             log::error!("❌ Could not parse mount point from line");
             "Could not parse mount point"
@@ -1138,7 +1164,7 @@ async fn replace_application(
         target_app
     );
     let copy_result = std::process::Command::new("cp")
-        .args(&[
+        .args([
             "-R",
             source_app.to_str().unwrap(),
             target_app.to_str().unwrap(),
@@ -1160,7 +1186,7 @@ async fn replace_application(
     // Unmount the DMG
     log::info!("💿 Unmounting DMG from: {}", mount_point);
     let unmount_result = std::process::Command::new("hdiutil")
-        .args(&["detach", mount_point])
+        .args(["detach", mount_point])
         .status()
         .map_err(|e| {
             log::error!("❌ Failed to unmount DMG: {}", e);
@@ -1285,6 +1311,7 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(state.clone())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -1296,12 +1323,12 @@ pub fn run() {
             log::info!(
                 "single_instance_args count={} sample_arg0={}",
                 args.len(),
-                args.get(0).cloned().unwrap_or_default()
+                args.first().cloned().unwrap_or_default()
             );
             for a in args {
                 if a.starts_with("klaayguard://") {
                     log::info!("single_instance_deep_link_received");
-                    handle_deep_link_url(&app, &st, &a);
+                    handle_deep_link_url(app, &st, &a);
                     break;
                 }
             }
@@ -1378,7 +1405,7 @@ pub fn run() {
             }
 
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
-            try_handle_deep_link_from_args(&app.handle(), &state_for_loop);
+            try_handle_deep_link_from_args(app.handle(), &state_for_loop);
 
             // Tray menu: live auth/countdown item, an Employee Hub link, and a version
             // line. No quit, no sign-out. Only the auth item updates at runtime.
@@ -1458,7 +1485,7 @@ pub fn run() {
                 for u in urls {
                     let s = u.to_string();
                     log::info!("run_event_opened url={}", s);
-                    handle_deep_link_url(&_app_handle, &st, &s);
+                    handle_deep_link_url(_app_handle, &st, &s);
                 }
             }
         }
@@ -1520,7 +1547,10 @@ mod update_selection_tests {
     fn falls_back_to_friendly_label_without_original_name() {
         let assets: Vec<ReleaseAsset> =
             serde_json::from_str(r#"[{"id":9,"name":"MacOS (Intel)","sha256":null}]"#).unwrap();
-        assert_eq!(select_dmg_asset(&assets, "macOS_x64", "Intel").unwrap().id, 9);
+        assert_eq!(
+            select_dmg_asset(&assets, "macOS_x64", "Intel").unwrap().id,
+            9
+        );
         assert!(select_dmg_asset(&assets, "macOS_arm64", "Apple silicon").is_none());
     }
 
@@ -1553,9 +1583,15 @@ mod happy_path_tests {
 
     #[test]
     fn deep_link_token_rejected_when_invalid() {
-        assert_eq!(parse_deep_link_token("https://evil?token=aaa.bbb.ccc"), None); // wrong scheme
+        assert_eq!(
+            parse_deep_link_token("https://evil?token=aaa.bbb.ccc"),
+            None
+        ); // wrong scheme
         assert_eq!(parse_deep_link_token("klaayguard://x?foo=1"), None); // no token
-        assert_eq!(parse_deep_link_token("klaayguard://x?token=not-a-jwt"), None); // wrong shape
+        assert_eq!(
+            parse_deep_link_token("klaayguard://x?token=not-a-jwt"),
+            None
+        ); // wrong shape
     }
 
     #[test]
@@ -1566,8 +1602,14 @@ mod happy_path_tests {
         ]});
         let q = parse_config_queries(&cfg);
         assert_eq!(q.len(), 2);
-        assert!(q.contains(&("system_info".to_string(), "SELECT * FROM system_info".to_string())));
-        assert!(q.contains(&("users".to_string(), "SELECT username FROM users".to_string())));
+        assert!(q.contains(&(
+            "system_info".to_string(),
+            "SELECT * FROM system_info".to_string()
+        )));
+        assert!(q.contains(&(
+            "users".to_string(),
+            "SELECT username FROM users".to_string()
+        )));
     }
 
     #[test]
@@ -1579,11 +1621,17 @@ mod happy_path_tests {
     #[test]
     fn payload_items_flatten_rows_and_stamp_collected_at() {
         let mut results = HashMap::new();
-        results.insert("users".to_string(), json!([{"username": "a"}, {"username": "b"}]));
+        results.insert(
+            "users".to_string(),
+            json!([{"username": "a"}, {"username": "b"}]),
+        );
         let items = build_payload_items(&results, "2026-06-22T00:00:00Z");
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|i| i.r#type == "users"));
-        assert_eq!(items[0].attributes["collected_at"], json!("2026-06-22T00:00:00Z"));
+        assert_eq!(
+            items[0].attributes["collected_at"],
+            json!("2026-06-22T00:00:00Z")
+        );
         assert!(items[0].attributes.get("username").is_some());
     }
 
