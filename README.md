@@ -139,6 +139,36 @@ cargo tauri build --target x86_64-unknown-linux-gnu  # Linux
 - **osquery**: Installed via official PKG installer
 - **Features**: System tray, background monitoring, auto-start on login
 
+#### Installer (`.pkg`) vs disk image (`.dmg`)
+
+The release pipeline ships **both** a drag-to-Applications `.dmg` and a
+double-click `.pkg` installer. The installer is preferred for first-time setup:
+its `postinstall` script ([`src-tauri/macos/scripts/postinstall`](src-tauri/macos/scripts/postinstall))
+registers the launchd LaunchAgent **at install time**, so auto-start and the
+`KeepAlive` auto-restart are active immediately — the user never has to remember
+to launch the app first. (The DMG relies on the app installing its own agent on
+first launch, which is skipped if the user drags it to /Applications but never
+opens it.)
+
+The postinstall reuses the app's own logic via the `--install-agent` CLI seam
+rather than re-implementing `launchctl` in shell; the app still self-installs the
+agent on launch as an idempotent fallback. The in-app auto-updater continues to
+use the `.dmg` (the agent is already running during an update, so the
+first-launch gap doesn't apply).
+
+Building the signed installer requires a **Developer ID Installer** identity
+(separate from the Developer ID Application cert used to codesign the `.app`),
+provided to CI as the `APPLE_INSTALLER_CERTIFICATE` /
+`APPLE_INSTALLER_CERTIFICATE_PASSWORD` secrets. Until those are configured the
+`.pkg` step is skipped and only the `.dmg` ships. Build one locally with:
+
+```bash
+# after `cargo tauri build` has produced KlaayGuard.app
+INSTALLER_SIGNING_IDENTITY="Developer ID Installer: …" \
+  src-tauri/scripts/build-macos-pkg.sh \
+  src-tauri/target/release/bundle/macos/KlaayGuard.app "$(cat VERSION)" KlaayGuard.pkg
+```
+
 ### Linux
 
 - **Target**: `x86_64-unknown-linux-gnu`

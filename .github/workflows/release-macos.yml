@@ -108,6 +108,60 @@ jobs:
         run: |
           cargo tauri build --target ${{ matrix.target }}
 
+      - name: (Mac) Build, sign & notarize .pkg installer
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ inputs.version }}
+          APPLE_INSTALLER_CERTIFICATE: ${{ secrets.APPLE_INSTALLER_CERTIFICATE }}
+          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          # The .pkg needs a "Developer ID Installer" identity, which is separate
+          # from the "Developer ID Application" cert used to sign the .app. If it
+          # isn't configured yet, skip the installer — the DMG still ships.
+          if [ -z "${APPLE_INSTALLER_CERTIFICATE:-}" ]; then
+            echo "::notice::APPLE_INSTALLER_CERTIFICATE not set — skipping .pkg installer (DMG still shipped)."
+            exit 0
+          fi
+
+          APP_PATH=$(find ${{ matrix.dmg_dir }} -path "*/bundle/macos/KlaayGuard.app" -type d | head -n1 || true)
+          if [ -z "${APP_PATH:-}" ]; then
+            echo "::error::Built KlaayGuard.app not found under ${{ matrix.dmg_dir }}; cannot build .pkg"
+            exit 1
+          fi
+
+          # Import the Developer ID Installer cert into the keychain created earlier.
+          echo "$APPLE_INSTALLER_CERTIFICATE" | base64 --decode > installer_certificate.p12
+          security import installer_certificate.p12 -k build.keychain \
+            -P "$APPLE_INSTALLER_CERTIFICATE_PASSWORD" -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain >/dev/null
+          INSTALLER_ID=$(security find-identity -v build.keychain | grep "Developer ID Installer" | head -n1 | awk -F'"' '{print $2}')
+          if [ -z "${INSTALLER_ID:-}" ]; then
+            echo "::error::No 'Developer ID Installer' identity found in keychain"
+            exit 1
+          fi
+          echo "Installer identity: $INSTALLER_ID"
+
+          PKG="KlaayGuard_${VERSION}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.pkg"
+          INSTALLER_SIGNING_IDENTITY="$INSTALLER_ID" \
+            bash src-tauri/scripts/build-macos-pkg.sh "$APP_PATH" "${VERSION#v}" "$PKG"
+
+          echo "Notarizing $PKG"
+          xcrun notarytool submit "$PKG" \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$PKG"
+
+          gh release upload "$RELEASE_TAG" "$PKG" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Uploaded $PKG"
+
       - name: Rename and upload artifacts (macOS)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

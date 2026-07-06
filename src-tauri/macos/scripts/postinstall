@@ -1,0 +1,55 @@
+#!/bin/bash
+# macOS .pkg postinstall — runs as root after KlaayGuard.app is placed in
+# /Applications. It registers the launchd LaunchAgent for the logged-in GUI user
+# by invoking the app's own `--install-agent` seam inside that user's GUI
+# session, so the security agent is running immediately after install instead of
+# waiting for the user to remember to launch it.
+#
+# This MUST always exit 0: a non-zero postinstall fails the whole installation.
+# Every failure path is best-effort because the app also self-installs the agent
+# on first launch (RunAtLoad in the plist covers next login as well).
+set -u
+
+APP="/Applications/KlaayGuard.app"
+BIN="$APP/Contents/MacOS/KlaayGuard"
+
+log() { /usr/bin/logger -t com.klaay.klaayguard.postinstall "$1"; echo "$1"; }
+
+if [ ! -x "$BIN" ]; then
+  log "postinstall: binary not found at $BIN; skipping agent setup"
+  exit 0
+fi
+
+# The human at the GUI, not the installer's root context.
+CONSOLE_USER=$(/usr/bin/stat -f "%Su" /dev/console 2>/dev/null || true)
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+  # No GUI user (e.g. an MDM install at the login window). The plist's RunAtLoad
+  # and the app's first-launch self-install both cover this case.
+  log "postinstall: no console user; agent will register at next user launch"
+  exit 0
+fi
+
+CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)
+if [ -z "$CONSOLE_UID" ]; then
+  log "postinstall: could not resolve uid for $CONSOLE_USER; skipping"
+  exit 0
+fi
+
+PLIST="/Users/$CONSOLE_USER/Library/LaunchAgents/com.klaay.klaayguard.plist"
+log "postinstall: registering LaunchAgent for $CONSOLE_USER (uid $CONSOLE_UID)"
+
+# Step 1 — render + write the plist as the user. The seam also tries to bootstrap,
+# but that inner bootstrap runs behind `sudo -u`, which drops the Aqua-session Mach
+# bootstrap port and fails with EIO. We ignore that; step 2 does the bootstrap right.
+/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" "$BIN" --install-agent \
+  || log "postinstall: plist written; deferring activation to step 2"
+
+# Step 2 — enable, then bootstrap. `enable` is the critical step: if the label was
+# ever left `disabled` in launchd's override DB, both bootstrap AND RunAtLoad-at-login
+# are blocked until it's re-enabled. Enable must come before bootstrap.
+/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl enable "gui/$CONSOLE_UID/com.klaay.klaayguard" 2>/dev/null || true
+/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" 2>/dev/null \
+  || log "postinstall: live bootstrap deferred; enabled label will load at next login (RunAtLoad)"
+/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.klaay.klaayguard" 2>/dev/null || true
+
+exit 0

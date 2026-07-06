@@ -656,6 +656,14 @@ async fn install_launch_agent() -> Result<String, String> {
                 .output();
         }
 
+        // Enable the label BEFORE bootstrap. If it was left `disabled` in launchd's
+        // override DB (e.g. by a prior `bootout`/`disable`), bootstrap fails with
+        // "Input/output error" and RunAtLoad never fires at login. Enabling afterwards
+        // can never recover, because bootstrap's failure returns early.
+        let _ = std::process::Command::new("launchctl")
+            .args(["enable", &format!("{}/{}", domain, label)])
+            .output();
+
         let output = std::process::Command::new("launchctl")
             .args(["bootstrap", &domain, plist_path.to_str().unwrap()])
             .output()
@@ -667,9 +675,6 @@ async fn install_launch_agent() -> Result<String, String> {
             }
         }
 
-        let _ = std::process::Command::new("launchctl")
-            .args(["enable", &format!("{}/{}", domain, label)])
-            .output();
         let _ = std::process::Command::new("launchctl")
             .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
             .output();
@@ -1265,6 +1270,31 @@ fn spawn_update_loop(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // CLI seam: `--install-agent` registers the launchd LaunchAgent and exits
+    // immediately, without entering the Tauri event loop. The macOS .pkg
+    // postinstall script invokes this (as the console user) so setup happens at
+    // install time instead of relying on the user launching the app manually.
+    if std::env::args().any(|a| a == "--install-agent") {
+        #[cfg(target_os = "macos")]
+        {
+            match tauri::async_runtime::block_on(install_launch_agent()) {
+                Ok(msg) => {
+                    println!("install-agent: {}", msg);
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("install-agent failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("install-agent is only supported on macOS");
+            std::process::exit(1);
+        }
+    }
+
     // Prefer runtime env; fall back to compile-time embedded default; then hard-coded prod
     let api_base = std::env::var("VITE_API_BASE_URL")
         .ok()
