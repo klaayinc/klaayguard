@@ -73,8 +73,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Every target that release actually ships (release-windows is a no-op and
-      # release-linux drops arm64, so those are intentionally excluded).
+      # Every target that release ships. (release-linux drops arm64, so that one
+      # stays excluded.)
       matrix:
         include:
           - os: macos-latest
@@ -83,6 +83,8 @@ jobs:
             target: x86_64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     env:
       # Fail the build on any compiler warning in our own code. Dependencies are
       # compiled with --cap-lints by cargo, so this only gates first-party code.
@@ -111,7 +113,10 @@ jobs:
             libwebkit2gtk-4.0-dev libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake
 
+      # rake (verify) needs Ruby/Unix; on Windows the LFS sidecar is validated by
+      # tauri_build during the build below.
       - name: Verify osquery sidecars (from LFS)
+        if: runner.os != 'Windows'
         run: rake
 
       - name: cargo build (release, warning-free)
