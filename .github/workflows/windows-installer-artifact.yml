@@ -5,6 +5,8 @@ name: Windows installer artifact
 #   gh workflow run windows-installer-artifact.yml --ref enable-windows-builds
 on:
   workflow_dispatch:
+  push:
+    branches: [enable-windows-builds]
 
 permissions:
   contents: read
