@@ -20,13 +20,25 @@ jobs:
       version: ${{ steps.set_tag.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Compute version and tag
+      - name: Compute next version and tag
         id: set_tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          VERSION=$(cat VERSION)
-          TAG="app-v${VERSION}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          # Auto-bump: patch of the latest PUBLISHED release (non-draft/non-prerelease,
+          # which is what /releases/latest and the download endpoints serve). Falls back
+          # to the VERSION file if there is no published release yet. So every merge to
+          # main produces a new, higher version.
+          LATEST_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          BASE="${LATEST_TAG##*v}"           # handles both v1.2.3 and app-v1.2.3
+          if [ -z "$BASE" ]; then BASE=$(cat VERSION); fi
+          IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
+          VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          TAG="v${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Next version ${VERSION} (tag ${TAG}) — bumped from ${LATEST_TAG:-VERSION file}"
       - name: Create draft release if missing
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
