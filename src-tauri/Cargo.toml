@@ -35,6 +35,7 @@ sentry = "0.42.0"
 keyring = "2"
 semver = "1.0"
 sha2 = "0.10"
+getrandom = "0.2"  # CSPRNG for the sign-in state nonce (reuses the version already in-tree)
 
 [target.'cfg(unix)'.dependencies]
 nix = "0.26"  # For Unix-specific system calls if needed

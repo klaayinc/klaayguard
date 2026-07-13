@@ -77,7 +77,12 @@ fn main() {
         <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
             <security>
                 <requestedPrivileges>
-                    <requestedExecutionLevel level="requireAdministrator" uiAccess="false" />
+                    <!-- Run with the invoking user's rights, not elevated. This is an
+                         always-on, network-facing, server-configurable agent; it has no
+                         code path that needs Administrator, so requesting it would only
+                         widen the blast radius of any bug or malicious update. Elevate a
+                         specific operation explicitly if one ever genuinely needs it. -->
+                    <requestedExecutionLevel level="asInvoker" uiAccess="false" />
                 </requestedPrivileges>
             </security>
         </trustInfo>
