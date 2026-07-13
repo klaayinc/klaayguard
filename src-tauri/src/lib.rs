@@ -1897,6 +1897,21 @@ mod happy_path_tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn xml_escape_neutralizes_plist_injection() {
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
+        // A value trying to break out of <string> and inject a launchd key is neutralized.
+        let evil = "x</string><key>RunAtLoad</key><true/><string>";
+        let escaped = xml_escape(evil);
+        assert!(!escaped.contains("</string>"));
+        assert!(!escaped.contains("<key>"));
+        assert!(escaped.contains("&lt;/string&gt;"));
+    }
+
     #[test]
     fn config_queries_use_explicit_sql_or_default_select() {
         let cfg = json!({"data": [
