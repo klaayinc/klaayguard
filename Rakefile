@@ -97,8 +97,20 @@ def checksums
 end
 
 def verify_checksum(file_path)
-    # Temporarily disabled to avoid CI rate limits on GitHub API during matrix builds
-    log "Skipping checksum verification for #{File.basename(file_path)}"
+    # These binaries are bundled into the signed app and run with the user's full
+    # privileges to collect security telemetry, so we must not vendor them on the
+    # word of the CDN alone. `checksums` fetches the pinned release's SHA256 map once
+    # per rake run (memoized in $osq_checksums), so re-enabling this does NOT
+    # reintroduce per-download GitHub API calls — the original reason it was disabled.
+    name = File.basename(file_path)
+    expected = checksums[name]
+    raise "No published SHA256 for #{name}; refusing to vendor an unverified osquery binary" if expected.nil?
+
+    actual = Digest::SHA256.file(file_path).hexdigest.downcase
+    unless actual == expected.downcase
+        raise "Checksum mismatch for #{name}: expected #{expected}, got #{actual}"
+    end
+    log "Verified checksum for #{name}"
 end
 
 

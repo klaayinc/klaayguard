@@ -33,6 +33,7 @@ pub struct AppState {
     pub last_run_at: RwLock<Option<std::time::Instant>>,
     pub last_attempt_at: RwLock<Option<std::time::Instant>>,
     pub last_focus_at: RwLock<Option<std::time::Instant>>, // debounce for focus-on-failure
+    pub pending_auth_state: RwLock<Option<String>>, // single-use nonce for the sign-in round-trip
 }
 
 // Keychain access is centralized in src-tauri/src/keychain.rs
@@ -53,26 +54,75 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
     });
 }
 
-/// Extract and shape-validate the JWT from a `klaayguard://...?token=...` deep link.
-/// Returns None for a non-klaayguard URL, a missing token, or one that isn't three
-/// dot-separated segments.
-fn parse_deep_link_token(url: &str) -> Option<String> {
+/// Read a query-string value from a klaayguard:// deep link, with the same minimal
+/// space-decoding the token parser has always used. Returns None for a non-klaayguard
+/// URL or a missing key.
+fn deep_link_query_value(url: &str, key: &str) -> Option<String> {
     if !url.starts_with("klaayguard://") {
         return None;
     }
     let qs = url.split_once('?').map(|(_, q)| q).unwrap_or("");
-    let token = qs.split('&').find_map(|pair| {
+    qs.split('&').find_map(|pair| {
         let mut it = pair.splitn(2, '=');
         match (it.next(), it.next()) {
-            (Some("token"), Some(v)) => Some(v.replace("%20", " ").replace('+', " ")),
+            (Some(k), Some(v)) if k == key => Some(v.replace("%20", " ").replace('+', " ")),
             _ => None,
         }
-    })?;
+    })
+}
+
+/// Extract and shape-validate the JWT from a `klaayguard://...?token=...` deep link.
+/// Returns None for a non-klaayguard URL, a missing token, or one that isn't three
+/// dot-separated segments.
+fn parse_deep_link_token(url: &str) -> Option<String> {
+    let token = deep_link_query_value(url, "token")?;
     (token.matches('.').count() == 2).then_some(token)
 }
 
+/// When true, a sign-in callback MUST carry a `state` that matches the nonce we issued.
+/// Left false until Earthenware echoes `state` in the klaayguard:// redirect; flip to
+/// true once that ships to fully close the deep-link confused-deputy. A *mismatch* is
+/// rejected regardless of this flag — only a *missing* state is tolerated during rollout.
+const AUTH_STATE_STRICT: bool = false;
+
+/// Decide whether the callback's `state` clears the nonce check. A present-but-wrong
+/// state is always rejected (a positive attack signal); a missing nonce or missing
+/// state is accepted only while `strict` is false (the Earthenware rollout window).
+fn auth_state_ok(strict: bool, expected: Option<&str>, provided: Option<&str>) -> bool {
+    match (expected, provided) {
+        (Some(want), Some(got)) => want == got,
+        _ => !strict,
+    }
+}
+
+/// 32 bytes of OS CSPRNG as hex, for the sign-in state nonce. Returns None only if the
+/// OS RNG is unavailable (effectively never); callers then skip the nonce rather than
+/// panic, degrading to the rollout accept-missing path.
+fn generate_auth_nonce() -> Option<String> {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).ok()?;
+    Some(buf.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Defense-in-depth against a compromised/MITM'd config endpoint: only accept a
+/// single read-only osquery statement. osquery can still read arbitrary user-readable
+/// files via tables like `file`/`hash`, so this does not make the SQL harmless — but it
+/// refuses anything that isn't one plain `SELECT` (or a `WITH …` CTE), blocking stacked
+/// statements (`SELECT 1; ATTACH …`) and non-query verbs. A table-level allowlist, owned
+/// by the product, is the fuller control and should layer on top of this.
+fn is_read_only_query(sql: &str) -> bool {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    // Any remaining ';' means a second statement was stacked on.
+    if trimmed.contains(';') {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("select") || lower.starts_with("with")
+}
+
 /// Turn the /klaayguard/config payload into (logical_id, sql) pairs. An item with an
-/// explicit `sql` uses it; otherwise it defaults to `SELECT * FROM <id>`.
+/// explicit `sql` uses it; otherwise it defaults to `SELECT * FROM <id>`. Statements
+/// that aren't a single read-only query are dropped (see `is_read_only_query`).
 fn parse_config_queries(cfg: &Value) -> Vec<(String, String)> {
     cfg.get("data")
         .and_then(|d| d.as_array())
@@ -85,6 +135,15 @@ fn parse_config_queries(cfg: &Value) -> Vec<(String, String)> {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| format!("SELECT * FROM {}", id));
+                    if !is_read_only_query(&sql) {
+                        log::warn!("rejecting non-read-only config query id={}", id);
+                        add_breadcrumb(
+                            "collection",
+                            &format!("config_query_rejected id={}", id),
+                            Level::Warning,
+                        );
+                        return None;
+                    }
                     Some((id.to_string(), sql))
                 })
                 .collect()
@@ -117,23 +176,89 @@ fn build_payload_items(
     items
 }
 
-/// Persist a JWT delivered via a klaayguard:// deep link.
+/// Returns true only when the API positively rejects the token (401/403). Network
+/// errors, timeouts, or any other status return false ("not definitely invalid") so a
+/// transient blip never blocks a legitimate sign-in — the collection loop's own 401
+/// handling stays the backstop for a token that later turns out bad.
+async fn token_definitely_invalid(base: &str, token: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .user_agent("klaayguard/0.1")
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client
+        .get(format!("{}/me", base))
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        Ok(resp) => matches!(
+            resp.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Persist a JWT delivered via a klaayguard:// deep link, but only after the API
+/// accepts it. The custom URL scheme is registered system-wide, so any local app or
+/// web page can fire `klaayguard://…?token=…`; adopting an unvalidated token would let
+/// them silently redirect this device's telemetry onto an account they control. We
+/// reject only on a definitive 401/403 (see `token_definitely_invalid`).
+///
+/// NOTE: this still can't stop an attacker who injects a token for *their own valid*
+/// account (a confused-deputy). Closing that fully needs an app-generated `state` nonce
+/// echoed back by the Earthenware login redirect — tracked as a separate cross-repo task.
 fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
     let Some(tok) = parse_deep_link_token(url) else {
         log::info!("deep_link_ignored url={}", url);
         return;
     };
+    let provided_state = deep_link_query_value(url, "state");
     log::info!(
-        "deep_link_token_parsed length={} saving_to_keychain",
-        tok.len()
+        "deep_link_token_parsed length={} has_state={} validating",
+        tok.len(),
+        provided_state.is_some()
     );
-    tauri::async_runtime::block_on(async {
+
+    // Outcome: None = state-nonce check failed, Some(false) = token rejected by API,
+    // Some(true) = accepted. The nonce is consumed (single-use) before anything else.
+    let outcome = tauri::async_runtime::block_on(async {
+        let expected = state.pending_auth_state.write().await.take();
+        if !auth_state_ok(AUTH_STATE_STRICT, expected.as_deref(), provided_state.as_deref()) {
+            return None;
+        }
+        let base = state.api_base_url.read().await.clone();
+        if token_definitely_invalid(&base, &tok).await {
+            return Some(false);
+        }
         *state.auth_token.write().await = Some(tok.clone());
+        Some(true)
     });
-    let _ = keychain::save_token(&tok);
-    let _ = app.emit("auth:status", json!({ "authenticated": true }));
-    add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
-    sentry::capture_message("deep_link_token_saved", Level::Info);
+
+    match outcome {
+        Some(true) => {
+            let _ = keychain::save_token(&tok);
+            let _ = app.emit("auth:status", json!({ "authenticated": true }));
+            add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
+            sentry::capture_message("deep_link_token_saved", Level::Info);
+        }
+        Some(false) => {
+            log::warn!("deep_link_token_rejected_by_api length={}", tok.len());
+            add_breadcrumb("auth", "deep_link_token_rejected", Level::Warning);
+            sentry::capture_message("deep_link_token_rejected", Level::Warning);
+            let _ = app.emit("auth:status", json!({ "authenticated": false }));
+        }
+        None => {
+            log::warn!("deep_link_state_check_failed rejecting token");
+            add_breadcrumb("auth", "deep_link_state_rejected", Level::Warning);
+            sentry::capture_message("deep_link_state_rejected", Level::Warning);
+            let _ = app.emit("auth:status", json!({ "authenticated": false }));
+        }
+    }
 }
 
 /// Scan process args for a klaayguard deep link and handle it
@@ -165,7 +290,7 @@ async fn execute_sql_batch(
         let cmd = app
             .shell()
             .sidecar("osqueryi")
-            .unwrap()
+            .map_err(|e| format!("osqueryi sidecar unavailable: {}", e))?
             .args(["--json", sql.as_str()]);
 
         // osquery failing to spawn at all is a systemic problem — surface it.
@@ -586,6 +711,18 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
 /// This function creates a launchd plist file in the user's LaunchAgents directory
 /// and loads it to ensure the app starts automatically on login. This is a mandatory
 /// security feature that cannot be disabled by users.
+/// Minimal XML text/attribute escaping for values interpolated into the plist
+/// template. Keeps a stray `&`/`<`/`>` (or an injected `</string>…`) in a path or URL
+/// from corrupting — or injecting keys into — the generated launchd plist.
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 #[cfg(target_os = "macos")]
 async fn install_launch_agent() -> Result<String, String> {
     use std::fs;
@@ -628,9 +765,9 @@ async fn install_launch_agent() -> Result<String, String> {
     let plist_content = include_str!("../resources/com.klaay.klaayguard.plist")
         .replace("__LABEL__", label)
         .replace("__OPEN_PATH__", "/usr/bin/open")
-        .replace("__APP_PATH__", &app_path)
-        .replace("__VITE_API_BASE_URL__", &api_base_for_plist)
-        .replace("__LOG_DIR__", &log_dir.to_string_lossy());
+        .replace("__APP_PATH__", &xml_escape(&app_path))
+        .replace("__VITE_API_BASE_URL__", &xml_escape(&api_base_for_plist))
+        .replace("__LOG_DIR__", &xml_escape(&log_dir.to_string_lossy()));
 
     let mut needs_reload = true;
     if let Ok(existing) = fs::read_to_string(&plist_path) {
@@ -775,9 +912,21 @@ fn open_earthenware(app: &tauri::AppHandle, path: &str) {
     }
 }
 
-/// Open the Earthenware sign-in page; it deep-links back via klaayguard://.
+/// Open the Earthenware sign-in page; it deep-links back via klaayguard://. Issues a
+/// fresh single-use `state` nonce (stored in AppState) and passes it along so the
+/// callback can be bound to a sign-in *this* app initiated. If the OS RNG is somehow
+/// unavailable we open without a nonce (rollout accept-missing path) rather than block
+/// sign-in entirely.
 fn open_sign_in(app: &tauri::AppHandle) {
-    open_earthenware(app, "/login?app=klaayguard");
+    let mut path = "/login?app=klaayguard".to_string();
+    if let Some(nonce) = generate_auth_nonce() {
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        tauri::async_runtime::block_on(async {
+            *state.pending_auth_state.write().await = Some(nonce.clone());
+        });
+        path.push_str(&format!("&state={}", nonce));
+    }
+    open_earthenware(app, &path);
 }
 
 /// Handles + assets for keeping the tray in sync with auth state.
@@ -1038,12 +1187,12 @@ async fn download_and_install_update_internal(
         return Err(error_msg);
     }
 
-    // Get the download path
-    let downloads_dir = dirs::download_dir().ok_or_else(|| {
-        log::error!("❌ Could not find downloads directory");
-        "Could not find downloads directory"
-    })?;
-    let dmg_path = downloads_dir.join("KlaayGuard-update.dmg");
+    // Stage the download in a private, process-scoped temp path rather than the
+    // world-known ~/Downloads/KlaayGuard-update.dmg. The signature gate in
+    // replace_application verifies the *mounted* bundle, so this is defense-in-depth
+    // against a local process swapping the file between write and mount (TOCTOU).
+    let dmg_path =
+        std::env::temp_dir().join(format!("KlaayGuard-update-{}.dmg", std::process::id()));
 
     log::info!("💾 Downloading to: {:?}", dmg_path);
 
@@ -1083,6 +1232,71 @@ async fn download_and_install_update_internal(
     log::info!("🔄 Starting application replacement process...");
     replace_application(&dmg_path, app).await?;
 
+    Ok(())
+}
+
+/// Klaay's Apple Developer Team ID (the OU of our Developer ID Application cert).
+/// The update's signature MUST chain to Apple and carry this team, or we refuse to
+/// install it.
+#[cfg(target_os = "macos")]
+const KLAAY_TEAM_ID: &str = "8QK45RW8QK";
+
+/// The independent trust anchor the update channel otherwise lacks.
+///
+/// The server supplies both the DMG and its "expected" SHA-256, so that hash only
+/// proves the bytes arrived intact — not that Klaay produced them. Before we delete
+/// the running agent and swap in a downloaded app, verify that the mounted bundle is
+/// (1) structurally sound, (2) signed by *our* Developer ID team under an Apple
+/// anchor, and (3) accepted by Gatekeeper (i.e. notarized). Any failure is fatal:
+/// the update is abandoned and the current, known-good agent keeps running.
+#[cfg(target_os = "macos")]
+fn verify_klaay_signature(app_path: &std::path::Path) -> Result<(), String> {
+    // 1) Structural integrity of the signature over the whole bundle.
+    let verify = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--deep", "--strict", "--verbose=2"])
+        .arg(app_path)
+        .output()
+        .map_err(|e| format!("codesign spawn failed: {}", e))?;
+    if !verify.status.success() {
+        return Err(format!(
+            "codesign --verify failed: {}",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        ));
+    }
+
+    // 2) Bind to our team: the leaf cert's OU must be KLAAY_TEAM_ID. codesign prints
+    //    signing details to stderr with `-d`. Matching the whole `TeamIdentifier=...`
+    //    line (not a bare substring) avoids a forged team id that merely contains ours.
+    let details = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "--verbose=4"])
+        .arg(app_path)
+        .output()
+        .map_err(|e| format!("codesign -d spawn failed: {}", e))?;
+    let details_text = String::from_utf8_lossy(&details.stderr);
+    let team_ok = details_text
+        .lines()
+        .any(|l| l.trim() == format!("TeamIdentifier={}", KLAAY_TEAM_ID));
+    if !team_ok {
+        return Err(format!(
+            "update not signed by Klaay team {} (rejecting)",
+            KLAAY_TEAM_ID
+        ));
+    }
+
+    // 3) Gatekeeper / notarization assessment as an executable.
+    let assess = std::process::Command::new("/usr/sbin/spctl")
+        .args(["--assess", "--type", "execute", "--verbose=4"])
+        .arg(app_path)
+        .output()
+        .map_err(|e| format!("spctl spawn failed: {}", e))?;
+    if !assess.status.success() {
+        return Err(format!(
+            "Gatekeeper assessment failed (not notarized/accepted): {}",
+            String::from_utf8_lossy(&assess.stderr).trim()
+        ));
+    }
+
+    log::info!("🔏 Update signature verified: Apple-anchored, team {}, notarized", KLAAY_TEAM_ID);
     Ok(())
 }
 
@@ -1142,6 +1356,22 @@ async fn replace_application(
         let error_msg = format!("Source app not found at: {:?}", source_app);
         log::error!("❌ {}", error_msg);
         return Err(error_msg);
+    }
+
+    // Independent trust anchor: refuse to install anything not signed by Klaay and
+    // notarized. This is the gate that turns "the server said so" into a verifiable
+    // guarantee. On failure, detach the DMG and abort — the running agent is untouched.
+    #[cfg(target_os = "macos")]
+    if let Err(e) = verify_klaay_signature(&source_app) {
+        log::error!("❌ Update signature verification failed: {}", e);
+        sentry::capture_message(
+            &format!("update_signature_rejected:{}", e),
+            Level::Error,
+        );
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach", mount_point])
+            .output();
+        return Err(format!("Refusing unverified update: {}", e));
     }
 
     // Remove old app and copy new one
@@ -1329,6 +1559,7 @@ pub fn run() {
         last_run_at: RwLock::new(None),
         last_attempt_at: RwLock::new(None),
         last_focus_at: RwLock::new(None),
+        pending_auth_state: RwLock::new(None),
     });
 
     let app = tauri::Builder::default()
@@ -1618,6 +1849,48 @@ mod happy_path_tests {
     }
 
     #[test]
+    fn deep_link_state_param_extracted() {
+        assert_eq!(
+            deep_link_query_value("klaayguard://auth-callback?token=a.b.c&state=deadbeef", "state"),
+            Some("deadbeef".to_string())
+        );
+        assert_eq!(
+            deep_link_query_value("klaayguard://auth-callback?token=a.b.c", "state"),
+            None
+        );
+        assert_eq!(deep_link_query_value("https://evil?state=x", "state"), None);
+    }
+
+    #[test]
+    fn auth_state_rollout_semantics() {
+        // Rollout (strict=false): missing state OR missing nonce is tolerated...
+        assert!(auth_state_ok(false, Some("n"), None)); // old Earthenware: no echo
+        assert!(auth_state_ok(false, None, None)); // no pending nonce
+        assert!(auth_state_ok(false, None, Some("x"))); // unsolicited-ish, tolerated in rollout
+        // ...but a present-and-matching state always passes...
+        assert!(auth_state_ok(false, Some("n"), Some("n")));
+        // ...and a present-but-WRONG state is always rejected, even in rollout.
+        assert!(!auth_state_ok(false, Some("n"), Some("bad")));
+    }
+
+    #[test]
+    fn auth_state_strict_requires_matching_nonce() {
+        assert!(auth_state_ok(true, Some("n"), Some("n")));
+        assert!(!auth_state_ok(true, Some("n"), None)); // missing echo now rejected
+        assert!(!auth_state_ok(true, None, Some("x"))); // unsolicited rejected
+        assert!(!auth_state_ok(true, Some("n"), Some("bad")));
+    }
+
+    #[test]
+    fn auth_nonce_is_64_hex_chars_and_fresh() {
+        let a = generate_auth_nonce().expect("rng");
+        let b = generate_auth_nonce().expect("rng");
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn config_queries_use_explicit_sql_or_default_select() {
         let cfg = json!({"data": [
             {"type": "osquery-table", "id": "system_info"},
@@ -1639,6 +1912,31 @@ mod happy_path_tests {
     fn config_queries_empty_when_no_data() {
         assert!(parse_config_queries(&json!({})).is_empty());
         assert!(parse_config_queries(&json!({"data": []})).is_empty());
+    }
+
+    #[test]
+    fn read_only_guard_allows_select_and_cte_rejects_the_rest() {
+        assert!(is_read_only_query("SELECT * FROM system_info"));
+        assert!(is_read_only_query("  select username from users ;  "));
+        assert!(is_read_only_query(
+            "WITH t AS (SELECT 1) SELECT * FROM t"
+        ));
+        // Stacked statement smuggled after a legit SELECT.
+        assert!(!is_read_only_query("SELECT 1; ATTACH DATABASE 'x' AS y"));
+        // Non-query verbs.
+        assert!(!is_read_only_query("PRAGMA table_info(users)"));
+        assert!(!is_read_only_query("DROP TABLE users"));
+    }
+
+    #[test]
+    fn config_queries_drops_non_read_only_sql() {
+        let cfg = json!({"data": [
+            {"id": "system_info"},
+            {"id": "evil", "sql": "SELECT 1; ATTACH DATABASE 'x' AS y"}
+        ]});
+        let q = parse_config_queries(&cfg);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].0, "system_info");
     }
 
     #[test]

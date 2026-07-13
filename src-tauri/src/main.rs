@@ -26,7 +26,10 @@ fn main() {
         sentry::ClientOptions {
             release: sentry::release_name!(),
             environment: std::env::var("KLAAY_ENV").ok().map(|s| s.into()),
-            send_default_pii: true,
+            // Do not attach client IP / user identifiers by default. This agent runs on
+            // employee endpoints; crash telemetry should not carry PII unless we make a
+            // deliberate, documented decision to collect a specific field.
+            send_default_pii: false,
             attach_stacktrace: true,
             ..Default::default()
         },
