@@ -228,7 +228,11 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
     // Some(true) = accepted. The nonce is consumed (single-use) before anything else.
     let outcome = tauri::async_runtime::block_on(async {
         let expected = state.pending_auth_state.write().await.take();
-        if !auth_state_ok(AUTH_STATE_STRICT, expected.as_deref(), provided_state.as_deref()) {
+        if !auth_state_ok(
+            AUTH_STATE_STRICT,
+            expected.as_deref(),
+            provided_state.as_deref(),
+        ) {
             return None;
         }
         let base = state.api_base_url.read().await.clone();
@@ -1296,7 +1300,10 @@ fn verify_klaay_signature(app_path: &std::path::Path) -> Result<(), String> {
         ));
     }
 
-    log::info!("🔏 Update signature verified: Apple-anchored, team {}, notarized", KLAAY_TEAM_ID);
+    log::info!(
+        "🔏 Update signature verified: Apple-anchored, team {}, notarized",
+        KLAAY_TEAM_ID
+    );
     Ok(())
 }
 
@@ -1364,10 +1371,7 @@ async fn replace_application(
     #[cfg(target_os = "macos")]
     if let Err(e) = verify_klaay_signature(&source_app) {
         log::error!("❌ Update signature verification failed: {}", e);
-        sentry::capture_message(
-            &format!("update_signature_rejected:{}", e),
-            Level::Error,
-        );
+        sentry::capture_message(&format!("update_signature_rejected:{}", e), Level::Error);
         let _ = std::process::Command::new("hdiutil")
             .args(["detach", mount_point])
             .output();
@@ -1851,7 +1855,10 @@ mod happy_path_tests {
     #[test]
     fn deep_link_state_param_extracted() {
         assert_eq!(
-            deep_link_query_value("klaayguard://auth-callback?token=a.b.c&state=deadbeef", "state"),
+            deep_link_query_value(
+                "klaayguard://auth-callback?token=a.b.c&state=deadbeef",
+                "state"
+            ),
             Some("deadbeef".to_string())
         );
         assert_eq!(
@@ -1867,7 +1874,7 @@ mod happy_path_tests {
         assert!(auth_state_ok(false, Some("n"), None)); // old Earthenware: no echo
         assert!(auth_state_ok(false, None, None)); // no pending nonce
         assert!(auth_state_ok(false, None, Some("x"))); // unsolicited-ish, tolerated in rollout
-        // ...but a present-and-matching state always passes...
+                                                        // ...but a present-and-matching state always passes...
         assert!(auth_state_ok(false, Some("n"), Some("n")));
         // ...and a present-but-WRONG state is always rejected, even in rollout.
         assert!(!auth_state_ok(false, Some("n"), Some("bad")));
@@ -1918,9 +1925,7 @@ mod happy_path_tests {
     fn read_only_guard_allows_select_and_cte_rejects_the_rest() {
         assert!(is_read_only_query("SELECT * FROM system_info"));
         assert!(is_read_only_query("  select username from users ;  "));
-        assert!(is_read_only_query(
-            "WITH t AS (SELECT 1) SELECT * FROM t"
-        ));
+        assert!(is_read_only_query("WITH t AS (SELECT 1) SELECT * FROM t"));
         // Stacked statement smuggled after a legit SELECT.
         assert!(!is_read_only_query("SELECT 1; ATTACH DATABASE 'x' AS y"));
         // Non-query verbs.
