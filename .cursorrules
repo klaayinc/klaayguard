@@ -131,4 +131,19 @@ if (!response.ok) {
 - Verify osquery integration works
 - Ensure proper signing for releases
 - Test system tray functionality
-- Verify background monitoring works correctly 
+- Verify background monitoring works correctly
+
+## Writing standard
+
+Write all prose that this file governs in ASD-STE100 (Simplified Technical English)
+and follow Orwell's six rules of writing:
+
+- Write in the active voice and the present tense.
+- Keep sentences short: maximum 20 words in an instruction, 25 in descriptive text.
+- Give one instruction per sentence. Start it with the command form of the verb.
+- Use short everyday words. Never use a long word where a short one will do.
+- Do not use idioms, stock metaphors, slang, or jargon.
+- Do not use Latin abbreviations (no "e.g.", "i.e.", "etc.", "via").
+- Cut every word you can. Break any rule sooner than write something unclear.
+
+Full rules: the "Writing standard" section of CLAUDE.md at the repository root.
