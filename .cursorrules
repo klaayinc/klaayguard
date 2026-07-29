@@ -131,4 +131,10 @@ if (!response.ok) {
 - Verify osquery integration works
 - Ensure proper signing for releases
 - Test system tray functionality
-- Verify background monitoring works correctly 
+- Verify background monitoring works correctly
+
+## Writing standard
+
+Write all prose that this file governs in ASD-STE100 (Simplified Technical English).
+Follow Orwell's six rules of writing. The full rules are in the "Writing standard"
+section of CLAUDE.md at the repository root.
