@@ -61,8 +61,8 @@ running:
   starts when you log in. The system restarts the agent if it stops. This
   keeps posture reports continuous.
 - **Logs.** The agent writes its own status messages to log files in your
-  user folder. It sends crash reports to Sentry. Crash reports contain no
-  collected posture data.
+  user folder. It can send crash reports to Sentry when Klaay turns that on.
+  Crash reports contain no collected posture data.
 
 ## 3. What the application does not do
 
@@ -82,7 +82,7 @@ the OS permissions that the agent does not request.
 
 - Posture reports go to the Klaay API (`https://api.klaay.com`) over HTTPS.
 - Sign-in uses the Klaay web application (`https://app.klaay.com`).
-- Crash reports go to Sentry.
+- Crash reports go to Sentry, when Klaay turns that on.
 - No other party receives data.
 
 ## 5. Installation
