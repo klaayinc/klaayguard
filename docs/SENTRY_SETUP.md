@@ -24,13 +24,13 @@ Configuration lives in `src-tauri/src/main.rs`:
 - **DSN:** read from the `VITE_SENTRY_DSN` environment variable at process
   start. When the variable is empty, Sentry is off.
 
-  > **Known gap:** CI sets `VITE_SENTRY_DSN` only in the *build* environment
+  > **Note:** CI sets `VITE_SENTRY_DSN` only in the *build* environment
   > (`.github/workflows/release-macos.yml`). Nothing bakes it into the binary
   > (`build.rs` does not handle it) and the LaunchAgent plist does not pass it
-  > at runtime. Released builds therefore start without a DSN and Sentry is
-  > effectively **off** in production. To activate it, bake the DSN in
-  > `build.rs` (as done for the API URLs) or add it to the plist's
-  > `EnvironmentVariables`.
+  > at runtime. Released builds therefore start without a DSN, and Sentry is
+  > off in production. It is not recorded whether this is intentional. To turn
+  > it on, bake the DSN in `build.rs` (as done for the API URLs) or add it to
+  > the plist's `EnvironmentVariables`.
 - **Environment:** the `KLAAY_ENV` value (`production`, `staging`,
   `development`).
 - **Release:** set from the crate version with `sentry::release_name!()`.

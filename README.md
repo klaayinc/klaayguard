@@ -235,7 +235,7 @@ The Rust process reports crashes and lifecycle events to Sentry when the
 `VITE_SENTRY_DSN` environment variable is set at process start.
 `send_default_pii` is off: crash telemetry carries no user data and no
 collected osquery data. Note: released builds currently start without a DSN,
-so Sentry is off in production — see the known gap in
+so Sentry is off in production — see the note in
 [docs/SENTRY_SETUP.md](docs/SENTRY_SETUP.md).
 
 ## Logs
