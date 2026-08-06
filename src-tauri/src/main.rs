@@ -21,11 +21,21 @@ fn main() {
     }
 
     // Initialize Sentry for error tracking
+    // Runtime env first, then the compile-time default from build.rs. Released
+    // builds run under launchd without these variables, so without the baked-in
+    // fallback Sentry never activates in production.
     let _guard = sentry::init((
-        std::env::var("VITE_SENTRY_DSN").unwrap_or_default(),
+        std::env::var("VITE_SENTRY_DSN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| option_env!("APP_DEFAULT_SENTRY_DSN").map(|s| s.to_string()))
+            .unwrap_or_default(),
         sentry::ClientOptions {
             release: sentry::release_name!(),
-            environment: std::env::var("KLAAY_ENV").ok().map(|s| s.into()),
+            environment: std::env::var("KLAAY_ENV")
+                .ok()
+                .or_else(|| option_env!("APP_DEFAULT_KLAAY_ENV").map(|s| s.to_string()))
+                .map(|s| s.into()),
             // Do not attach client IP / user identifiers by default. This agent runs on
             // employee endpoints; crash telemetry should not carry PII unless we make a
             // deliberate, documented decision to collect a specific field.

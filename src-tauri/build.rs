@@ -7,6 +7,7 @@ fn main() {
         "NODE_ENV",
         "VITE_API_BASE_URL",
         "VITE_EARTHENWARE_URL",
+        "VITE_SENTRY_DSN",
     ] {
         println!("cargo:rerun-if-env-changed={}", var);
     }
@@ -57,6 +58,14 @@ fn main() {
         "cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}",
         earthenware
     );
+
+    // Sentry DSN and environment. main.rs reads these at runtime, but released
+    // builds start under launchd with a near-empty environment, so the runtime
+    // lookup finds nothing. Bake the build-time values in as defaults, like the
+    // URLs above. An empty DSN keeps Sentry off.
+    let sentry_dsn = std::env::var("VITE_SENTRY_DSN").unwrap_or_default();
+    println!("cargo:rustc-env=APP_DEFAULT_SENTRY_DSN={}", sentry_dsn);
+    println!("cargo:rustc-env=APP_DEFAULT_KLAAY_ENV={}", klaay_env);
 
     let mut windows = tauri_build::WindowsAttributes::new();
     windows = windows.app_manifest(
