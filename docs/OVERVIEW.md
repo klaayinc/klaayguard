@@ -2,7 +2,9 @@
 
 **Product:** KlaayGuard desktop agent
 **Version of this document:** 2026-08-06
-**Audience:** Everyone. No technical knowledge is necessary.
+**Audience:** Team members who want the full picture of what the agent does.
+For a short, non-technical version, see the
+[Employee Guide](./EMPLOYEE_GUIDE.md).
 
 ## 1. Summary
 
