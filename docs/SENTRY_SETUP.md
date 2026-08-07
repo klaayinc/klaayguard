@@ -1,55 +1,45 @@
 # Sentry Setup for KlaayGuard
 
-This document describes how to set up and configure Sentry.io error tracking for the KlaayGuard application.
+This document describes how Sentry error tracking is configured for the
+KlaayGuard agent.
 
 ## Overview
 
-KlaayGuard uses Sentry for error tracking and monitoring across both the React frontend and Rust backend. This provides comprehensive error reporting and performance monitoring.
+KlaayGuard is a Rust-only Tauri app. There is no frontend, so there is no
+JavaScript Sentry SDK. All reporting comes from the Rust process, configured
+in `src-tauri/src/main.rs`.
+
+The agent sends:
+
+- panics and errors, with stack traces;
+- lifecycle messages (collection start, deep-link token saved, update steps)
+  that make remote debugging possible without log access.
+
+It never sends collected osquery data.
 
 ## Configuration
 
-### Environment Variables
+Configuration lives in `src-tauri/src/main.rs`:
 
-Create a `.env.local` file in the project root with the following variables:
+- **DSN:** read from the `VITE_SENTRY_DSN` environment variable at process
+  start. When the variable is empty, Sentry is off.
 
-```bash
-# Sentry Configuration
-VITE_SENTRY_DSN=your_sentry_dsn_here
+  > **Note:** CI sets `VITE_SENTRY_DSN` only in the *build* environment
+  > (`.github/workflows/release-macos.yml`). Nothing bakes it into the binary
+  > (`build.rs` does not handle it) and the LaunchAgent plist does not pass it
+  > at runtime. Released builds therefore start without a DSN, and Sentry is
+  > off in production. It is not recorded whether this is intentional. To turn
+  > it on, bake the DSN in `build.rs` (as done for the API URLs) or add it to
+  > the plist's `EnvironmentVariables`.
+- **Environment:** the `KLAAY_ENV` value (`production`, `staging`,
+  `development`).
+- **Release:** set from the crate version with `sentry::release_name!()`.
+- **PII:** `send_default_pii: false`. Crash telemetry must not carry client
+  IPs or user identifiers. Do not enable this without a documented decision.
+- **Stack traces:** `attach_stacktrace: true`.
+- **Tags:** `component`, `os`, `arch`, and `app_version`.
 
-# API Configuration
-VITE_API_BASE_URL=http://localhost:3000
-```
-
-### Frontend Configuration
-
-The frontend Sentry configuration is located in `src/sentry.ts`:
-
-- **DSN**: Retrieved from `VITE_SENTRY_DSN` environment variable
-- **Environment**: Set to the current Vite mode (development/production)
-- **Release**: Uses `VITE_APP_VERSION` or defaults to package version
-- **Sample Rate**: 100% for comprehensive error tracking
-- **Integrations**: Browser tracing for performance monitoring
-
-### Backend Configuration
-
-The backend Sentry configuration is in `src-tauri/src/main.rs`:
-
-- **DSN**: Retrieved from `VITE_SENTRY_DSN` environment variable
-- **Release**: Uses `sentry::release_name!()` macro
-- **PII**: Enabled for comprehensive debugging
-- **Default Options**: Uses Sentry's default configuration
-
-## Installation
-
-### Frontend Dependencies
-
-```bash
-npm install @sentry/react @sentry/tracing
-```
-
-### Backend Dependencies
-
-The Rust dependency is already added to `Cargo.toml`:
+The Rust dependency is declared in `src-tauri/Cargo.toml`:
 
 ```toml
 sentry = "0.42.0"
@@ -57,27 +47,10 @@ sentry = "0.42.0"
 
 ## Usage
 
-### Frontend
-
-Sentry is automatically initialized when the app starts. You can manually report errors:
-
-```typescript
-import { Sentry } from "../sentry";
-
-// Report an error
-Sentry.captureException(new Error("Something went wrong"));
-
-// Report a message
-Sentry.captureMessage("User performed action", "info");
-```
-
-### Backend
-
-Sentry is automatically initialized when the Rust application starts. Errors are automatically captured, but you can also manually report:
+Sentry initializes before the Tauri app starts. Panics are captured
+automatically through the panic hook. Report manually with:
 
 ```rust
-use sentry;
-
 // Report an error
 sentry::capture_error(&error);
 
@@ -85,62 +58,26 @@ sentry::capture_error(&error);
 sentry::capture_message("Something happened", sentry::Level::Info);
 ```
 
-## Testing
+## Local testing
 
-A test component is available at `src/components/common/SentryTestButton.tsx` that provides buttons to test both error reporting and message capture.
+```bash
+VITE_SENTRY_DSN=<your-dsn> KLAAY_ENV=development cargo tauri build
+open src-tauri/target/release/bundle/macos/KlaayGuard.app
+```
 
-## Development vs Production
-
-- **Development**: Errors are logged to console and sent to Sentry
-- **Production**: Errors are sent to Sentry with full context
-
-## Security Considerations
-
-- **PII**: Personally Identifiable Information is captured (configurable)
-- **Data Scrubbing**: Configure in Sentry dashboard to scrub sensitive data
-- **Release Tracking**: Each release is tracked for better error context
+Then check the Sentry project for the startup lifecycle messages.
 
 ## Troubleshooting
 
-### Common Issues
+No events appear in Sentry:
 
-1. **No errors appearing in Sentry**:
-
-   - Check that `VITE_SENTRY_DSN` is set correctly
-   - Verify the DSN is valid and the project exists in Sentry
-
-2. **Frontend errors not captured**:
-
-   - Ensure Sentry is initialized before React renders
-   - Check browser console for Sentry initialization errors
-
-3. **Backend errors not captured**:
-   - Verify `VITE_SENTRY_DSN` environment variable is set
-   - Check that the Rust application is running with the environment variable
-
-### Debug Mode
-
-To enable debug logging for Sentry:
-
-```typescript
-// In src/sentry.ts
-Sentry.init({
-  // ... other options
-  debug: true, // Enable debug logging
-});
-```
-
-## Monitoring
-
-Once configured, you can monitor:
-
-- **Error Rates**: Track application stability
-- **Performance**: Monitor app performance with tracing
-- **Release Health**: Track errors by release version
-- **User Impact**: See which errors affect users most
+1. Confirm `VITE_SENTRY_DSN` was set **when the process started**. The DSN is
+   read at startup, not at build time, unless CI baked it in.
+2. Confirm the DSN is valid and the project exists in Sentry.
+3. Check the local log at `~/Library/Logs/com.klaay.app/KlaayGuard.log` —
+   panics are written there even when Sentry is off.
 
 ## Resources
 
-- [Sentry React Documentation](https://docs.sentry.io/platforms/javascript/guides/react/)
 - [Sentry Rust Documentation](https://docs.sentry.io/platforms/rust/)
 - [Sentry Dashboard](https://sentry.io/)
