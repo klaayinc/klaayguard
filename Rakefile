@@ -198,7 +198,7 @@ file OSQUERYD_LINUX_AARCH64_PATH => [LINUX_AARCH64_TARBALL_PATH] do
     sh "chmod +x #{OSQUERYD_LINUX_AARCH64_PATH}"
 end
 
-OSQUERYI_PATH = File.join(DIR_SIDECAR, "osqueryi")
+OSQUERYI_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi")
 
 file OSQUERYI_PATH => [OSQUERYD_PATH] do
     sh "mkdir -p #{DIR_SIDECAR}"
@@ -206,14 +206,17 @@ file OSQUERYI_PATH => [OSQUERYD_PATH] do
     sh "cp #{OSQUERYD_PATH} #{OSQUERYI_PATH}-x86_64-apple-darwin"
 end
 
-OSQUERYI_LINUX_X64_PATH = File.join(DIR_SIDECAR, "osqueryi-x86_64-unknown-linux-gnu")
-OSQUERYI_LINUX_AARCH64_PATH = File.join(DIR_SIDECAR, "osqueryi-aarch64-unknown-linux-gnu")
-OSQUERYI_WINDOWS_X64_PATH = File.join(DIR_SIDECAR, "osqueryi-x86_64-pc-windows-msvc.exe")
-OSQUERYI_WINDOWS_AARCH64_PATH = File.join(DIR_SIDECAR, "osqueryi-aarch64-pc-windows-msvc.exe")
+OSQUERYI_LINUX_X64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-x86_64-unknown-linux-gnu")
+OSQUERYI_LINUX_AARCH64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-aarch64-unknown-linux-gnu")
+OSQUERYI_WINDOWS_X64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-x86_64-pc-windows-msvc.exe")
+OSQUERYI_WINDOWS_AARCH64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-aarch64-pc-windows-msvc.exe")
 
 file OSQUERYI_LINUX_X64_PATH => [OSQUERYD_LINUX_PATH] do
     sh "mkdir -p #{DIR_SIDECAR}"
     sh "cp #{OSQUERYD_LINUX_PATH} #{OSQUERYI_LINUX_X64_PATH}"
+    # Debug info is ~180 MB of dead weight in every package. Strip needs a
+    # host toolchain that reads ELF, so only do it on a Linux host.
+    sh "strip #{OSQUERYI_LINUX_X64_PATH}" if RUBY_PLATFORM =~ /linux/ && `uname -m`.strip == "x86_64"
 end
 
 file OSQUERYI_LINUX_AARCH64_PATH => [OSQUERYD_LINUX_AARCH64_PATH] do
@@ -286,7 +289,7 @@ task :refresh_binaries => [OSQUERYI_PATH, OSQUERYI_LINUX_X64_PATH, OSQUERYI_LINU
 task default: [:verify]
 
 task :clean_vendor do
-    sh "rm -f src-tauri/vendor/osqueryi*"
+    sh "rm -f src-tauri/vendor/*osqueryi*"
 end
 
 # Validate that all expected download URLs are reachable with curl

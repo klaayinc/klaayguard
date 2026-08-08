@@ -302,7 +302,7 @@ async fn execute_sql_batch(
     for (logical_id, sql) in queries {
         let cmd = app
             .shell()
-            .sidecar("osqueryi")
+            .sidecar("klaayguard-osqueryi")
             .map_err(|e| format!("osqueryi sidecar unavailable: {}", e))?
             .args(["--json", sql.as_str()]);
 
