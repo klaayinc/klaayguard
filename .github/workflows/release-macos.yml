@@ -50,7 +50,7 @@ jobs:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: install tauri-cli
-        run: cargo install tauri-cli --version "^2" --locked
+        run: cargo install tauri-cli --version "=2.11.4" --locked
 
       - name: Setup osquery binaries (macOS)
         run: rake
