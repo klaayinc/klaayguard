@@ -1734,18 +1734,26 @@ fn install_appimage_update(bytes: &[u8], app: &tauri::AppHandle) -> Result<(), S
     // The single-instance plugin allows one process at a time, so the new one
     // must start only after this one exits. Poll this PID rather than sleep a
     // fixed time: a fixed sleep that is too short forwards to the dying
-    // primary and leaves the agent down. Pass the pid and path as positional
-    // arguments, never interpolated into the script text.
+    // primary and leaves the agent down. Pass the pid, path, and log path as
+    // positional arguments, never interpolated into the script text. If this
+    // process outlives the 30s cap, record it in the log before exec'ing.
+    let log_file = dirs::data_local_dir()
+        .map(|d| d.join("com.klaay.app/logs/KlaayGuard.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
     let spawn = std::process::Command::new("sh")
         .arg("-c")
         .arg(
-            "pid=\"$1\"; target=\"$2\"; i=0; \
+            "pid=\"$1\"; target=\"$2\"; logf=\"$3\"; i=0; \
              while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 150 ]; do \
-             sleep 0.2; i=$((i+1)); done; exec \"$target\"",
+             sleep 0.2; i=$((i+1)); done; \
+             if kill -0 \"$pid\" 2>/dev/null; then \
+             echo \"[relaunch] old pid $pid still alive after 30s cap; exec anyway\" >>\"$logf\"; \
+             fi; exec \"$target\"",
         )
         .arg("sh")
         .arg(std::process::id().to_string())
         .arg(&target)
+        .arg(&log_file)
         .spawn();
     if let Err(e) = spawn {
         // The update is already installed; only the relaunch failed. Report
