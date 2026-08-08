@@ -463,8 +463,10 @@ fn normalize_machine_id(raw: &str) -> Option<String> {
 }
 
 /// App-scoped hash of the systemd machine id. The systemd manual says to not
-/// send the raw id off the machine; the HMAC keeps the value stable but
-/// specific to Klaay, so other software cannot correlate the device by it.
+/// send the raw id off the machine; the HMAC derives a stable, Klaay-specific
+/// value from it. The key is compiled into the binary, so this is not a
+/// secret — it stops other software from reusing our exact identifier, not a
+/// determined attacker who reads the key.
 fn hash_machine_id(machine_id: &str) -> String {
     use hmac::Mac;
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"com.klaay.klaayguard")
@@ -770,14 +772,14 @@ async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, 
         }
     };
 
-    let identity = match decide_device_identity(
+    let (identity, source) = match decide_device_identity(
         None,
         hardware_serial.as_deref(),
         read_machine_id().as_deref(),
     ) {
-        IdentityDecision::Use(v) => v,
-        IdentityDecision::Adopt(v) => v,
-        IdentityDecision::Generate => generate_device_identity()?,
+        IdentityDecision::Use(v) => (v, "stored"),
+        IdentityDecision::Adopt(v) => (v, "adopted from host"),
+        IdentityDecision::Generate => (generate_device_identity()?, "generated"),
     };
 
     if let Err(e) = keychain::save_device_identity(&identity) {
@@ -786,7 +788,7 @@ async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, 
         log::error!("identity: keychain save failed: {}", e);
         sentry::capture_message(&format!("device_identity_save_failed: {}", e), Level::Error);
     }
-    log::info!("identity: adopted new device identity");
+    log::info!("identity: device identity {}", source);
     Ok(identity)
 }
 
@@ -2358,8 +2360,8 @@ pub fn run() {
         // This is a tray-only background agent. Closing the Linux fallback
         // window destroys the last window, which would otherwise exit the
         // whole app and stop collection. A window-triggered exit carries
-        // code None; veto it. An explicit app.exit(code) carries Some and is
-        // allowed through (the self-updater relaunch relies on it).
+        // code None; veto only that. A deliberate app.exit(code) carries
+        // Some and still exits normally.
         tauri::RunEvent::ExitRequested { code, api, .. } if code.is_none() => {
             log::info!("exit requested by window close; keeping the agent running");
             api.prevent_exit();
