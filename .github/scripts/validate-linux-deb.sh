@@ -37,9 +37,12 @@ else
   pass "no collision with the osquery package"
 fi
 
-# The Linux sidecar must be stripped; debug info is 263 MB of dead weight
-# in every package.
-if file data/usr/bin/klaayguard-osqueryi 2>/dev/null | grep -q "not stripped"; then
+# The Linux sidecar must be stripped; debug info is ~180 MB of dead weight
+# in every package. Requires the `file` tool — fail loudly if it is absent
+# rather than pass vacuously.
+if ! command -v file >/dev/null; then
+  fail "the 'file' tool is missing; cannot check the sidecar is stripped"
+elif file data/usr/bin/klaayguard-osqueryi | grep -q "not stripped"; then
   fail "sidecar ships unstripped with debug info"
 else
   pass "sidecar is stripped"
@@ -57,13 +60,19 @@ if test -f "$DESKTOP"; then
   if command -v desktop-file-validate >/dev/null; then
     desktop-file-validate "$DESKTOP" && pass "desktop-file-validate" \
       || fail "desktop-file-validate rejected the entry"
+  else
+    echo "  WARN: desktop-file-validate not installed; skipping that check" >&2
   fi
 else
   fail "desktop entry $DESKTOP is missing"
 fi
 
 # A stray copy outside /usr means a files-mapping path bug.
-if find data -name "*.desktop" -not -path "data/usr/*" | grep -q .; then
+# Capture into a variable rather than `find | grep -q`: grep -q exits on the
+# first match, find then dies with SIGPIPE, and pipefail would flip this check
+# to a false pass — the exact bug class this script exists to catch.
+STRAY_DESKTOP="$(find data -name "*.desktop" -not -path "data/usr/*")"
+if [ -n "$STRAY_DESKTOP" ]; then
   fail "a desktop file is installed outside /usr — files mapping path bug"
 else
   pass "no desktop file outside /usr"
@@ -102,8 +111,8 @@ grep -qE '^Categories=.+' "$DESKTOP" \
 
 # The agent must use rustls only. A bundled or assumed OpenSSL is a frozen
 # TLS stack in the AppImage and an undeclared dependency in the deb.
-if objdump -p data/usr/bin/KlaayGuard | grep -q 'NEEDED.*libssl'; then
-  fail "binary links libssl; TLS must come from rustls"
+if objdump -p data/usr/bin/KlaayGuard | grep -qE 'NEEDED.*(libssl|libcrypto)'; then
+  fail "binary links OpenSSL; TLS must come from rustls"
 else
   pass "no OpenSSL link"
 fi

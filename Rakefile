@@ -211,17 +211,32 @@ OSQUERYI_LINUX_AARCH64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-aarch6
 OSQUERYI_WINDOWS_X64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-x86_64-pc-windows-msvc.exe")
 OSQUERYI_WINDOWS_AARCH64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-aarch64-pc-windows-msvc.exe")
 
+# Strip debug info (~180 MB per Linux sidecar). llvm-strip reads any ELF
+# architecture, so it strips the aarch64 binary on an x86_64 host too; the
+# native strip works only when the host arch matches. If neither can run,
+# WARN loudly rather than commit a fat binary silently.
+def strip_sidecar(path, elf_arch)
+    if system("command -v llvm-strip >/dev/null 2>&1")
+        sh "llvm-strip #{path}"
+    elsif RUBY_PLATFORM =~ /linux/ && `uname -m`.strip == elf_arch
+        sh "strip #{path}"
+    else
+        warn "WARNING: cannot strip #{File.basename(path)} on this host " \
+             "(need llvm-strip, or a Linux #{elf_arch} host). Committing it " \
+             "unstripped bloats every package. Install llvm to fix."
+    end
+end
+
 file OSQUERYI_LINUX_X64_PATH => [OSQUERYD_LINUX_PATH] do
     sh "mkdir -p #{DIR_SIDECAR}"
     sh "cp #{OSQUERYD_LINUX_PATH} #{OSQUERYI_LINUX_X64_PATH}"
-    # Debug info is ~180 MB of dead weight in every package. Strip needs a
-    # host toolchain that reads ELF, so only do it on a Linux host.
-    sh "strip #{OSQUERYI_LINUX_X64_PATH}" if RUBY_PLATFORM =~ /linux/ && `uname -m`.strip == "x86_64"
+    strip_sidecar(OSQUERYI_LINUX_X64_PATH, "x86_64")
 end
 
 file OSQUERYI_LINUX_AARCH64_PATH => [OSQUERYD_LINUX_AARCH64_PATH] do
     sh "mkdir -p #{DIR_SIDECAR}"
     sh "cp #{OSQUERYD_LINUX_AARCH64_PATH} #{OSQUERYI_LINUX_AARCH64_PATH}"
+    strip_sidecar(OSQUERYI_LINUX_AARCH64_PATH, "aarch64")
 end
 
 ## --- Windows binaries ---

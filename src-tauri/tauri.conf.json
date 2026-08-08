@@ -46,7 +46,8 @@
           "libayatana-appindicator3-1 | libappindicator3-1"
         ],
         "desktopTemplate": "./linux/klaayguard.desktop.hbs",
-        "postInstallScript": "./linux/postinst.sh"
+        "postInstallScript": "./linux/postinst.sh",
+        "postRemoveScript": "./linux/postrm.sh"
       },
       "rpm": {
         "depends": [
@@ -55,7 +56,8 @@
           "libayatana-appindicator-gtk3"
         ],
         "desktopTemplate": "./linux/klaayguard.desktop.hbs",
-        "postInstallScript": "./linux/postinst.sh"
+        "postInstallScript": "./linux/postinst.sh",
+        "postRemoveScript": "./linux/postrm.sh"
       }
     }
   },
