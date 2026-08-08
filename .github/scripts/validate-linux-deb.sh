@@ -93,8 +93,8 @@ grep -qE '^Categories=.+' "$DESKTOP" \
 
 # The agent must use rustls only. A bundled or assumed OpenSSL is a frozen
 # TLS stack in the AppImage and an undeclared dependency in the deb.
-if objdump -p data/usr/bin/KlaayGuard | grep -q 'NEEDED.*libssl'; then
-  fail "binary links libssl; TLS must come from rustls"
+if objdump -p data/usr/bin/KlaayGuard | grep -qE 'NEEDED.*(libssl|libcrypto)'; then
+  fail "binary links OpenSSL; TLS must come from rustls"
 else
   pass "no OpenSSL link"
 fi
