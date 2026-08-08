@@ -242,7 +242,10 @@ fn run_builtin_check(check: &str) -> Value {
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone)]
 struct FlatDev {
-    mountpoint: String,
+    // Every mountpoint of this device. A btrfs device is mounted at several
+    // subvolumes at once, and `/` may be only one of them, so we must keep the
+    // whole list — not just the first — or an encrypted root reads "unknown".
+    mountpoints: Vec<String>,
     kind: String,          // lsblk TYPE: part, crypt, lvm, disk, ...
     on_crypt: bool,        // this device or an ancestor is a dm-crypt mapper
     parent_fstype: String, // the parent's FSTYPE (crypto_LUKS marks LUKS)
@@ -259,23 +262,30 @@ fn parse_lsblk(json: &str) -> Vec<FlatDev> {
             .map(|s| s.to_string())
             .unwrap_or_default()
     }
-    fn mountpoint_of(v: &Value) -> String {
+    // All mountpoints: the singular `mountpoint` plus every entry of the
+    // `mountpoints` array (newer util-linux), de-duplicated, nulls dropped.
+    fn mountpoints_of(v: &Value) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
         if let Some(mp) = v.get("mountpoint").and_then(|x| x.as_str()) {
-            return mp.to_string();
+            if !mp.is_empty() {
+                out.push(mp.to_string());
+            }
         }
-        // newer util-linux: "mountpoints": [null] or ["/"]
-        v.get("mountpoints")
-            .and_then(|x| x.as_array())
-            .and_then(|a| a.iter().find_map(|m| m.as_str()))
-            .map(|s| s.to_string())
-            .unwrap_or_default()
+        if let Some(arr) = v.get("mountpoints").and_then(|x| x.as_array()) {
+            for m in arr.iter().filter_map(|m| m.as_str()) {
+                if !m.is_empty() && !out.iter().any(|x| x == m) {
+                    out.push(m.to_string());
+                }
+            }
+        }
+        out
     }
     fn walk(node: &Value, parent_on_crypt: bool, parent_fstype: &str, out: &mut Vec<FlatDev>) {
         let kind = field(node, "type");
         let fstype = field(node, "fstype");
         let on_crypt = parent_on_crypt || kind == "crypt";
         out.push(FlatDev {
-            mountpoint: mountpoint_of(node),
+            mountpoints: mountpoints_of(node),
             kind: kind.clone(),
             on_crypt,
             parent_fstype: parent_fstype.to_string(),
@@ -309,6 +319,28 @@ struct MountEntry {
 /// Parse /proc/mounts into (mountpoint, fstype) entries.
 #[cfg(any(target_os = "linux", test))]
 fn parse_proc_mounts(text: &str) -> Vec<MountEntry> {
+    // /proc/mounts octal-escapes spaces and a few other chars in the path
+    // (space = \040). Decode so a mountpoint with a space still matches.
+    fn unescape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                let oct: String = (0..3).filter_map(|_| chars.peek().copied()).collect();
+                if oct.len() == 3 && oct.chars().all(|d| ('0'..='7').contains(&d)) {
+                    if let Ok(code) = u8::from_str_radix(&oct, 8) {
+                        for _ in 0..3 {
+                            chars.next();
+                        }
+                        out.push(code as char);
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+        }
+        out
+    }
     text.lines()
         .filter_map(|line| {
             let mut f = line.split_whitespace();
@@ -316,7 +348,7 @@ fn parse_proc_mounts(text: &str) -> Vec<MountEntry> {
             let mountpoint = f.next()?;
             let fstype = f.next()?;
             Some(MountEntry {
-                mountpoint: mountpoint.to_string(),
+                mountpoint: unescape(mountpoint),
                 fstype: fstype.to_string(),
             })
         })
@@ -360,7 +392,7 @@ fn build_disk_encryption_rows(
         }
         rows.push(json!({
             "kind": "device", "mechanism": mechanism, "encrypted": "yes",
-            "mountpoint": d.mountpoint, "source": "lsblk",
+            "mountpoints": d.mountpoints, "source": "lsblk",
             "detail": format!("dm-crypt mapper (parent fstype {})", d.parent_fstype)
         }));
     }
@@ -395,7 +427,11 @@ fn build_disk_encryption_rows(
             return "unknown";
         }
         // dm-crypt/LUKS via lsblk: the device mounted at target sits on crypt.
-        match devs.iter().find(|d| d.mountpoint == target) {
+        // A btrfs device carries many mountpoints, so match any of them.
+        match devs
+            .iter()
+            .find(|d| d.mountpoints.iter().any(|m| m == target))
+        {
             Some(d) => {
                 if d.on_crypt {
                     "yes"
@@ -462,21 +498,14 @@ enum Desktop {
 #[cfg(any(target_os = "linux", test))]
 fn detect_desktop(xdg_current_desktop: Option<&str>) -> Desktop {
     let value = xdg_current_desktop.unwrap_or("").to_ascii_lowercase();
-    for seg in value.split(':') {
-        match seg.trim() {
-            "gnome" | "unity" | "ubuntu" => {
-                if seg.trim() != "ubuntu" {
-                    return Desktop::Gnome;
-                }
-            }
+    for seg in value.split(':').map(|s| s.trim()) {
+        match seg {
+            // "ubuntu:GNOME" is GNOME; a lone "ubuntu" is GNOME-based too.
+            "gnome" | "unity" | "ubuntu" => return Desktop::Gnome,
             "kde" => return Desktop::Kde,
             "hyprland" => return Desktop::Hyprland,
             _ => {}
         }
-    }
-    // "ubuntu:GNOME" contains GNOME; a lone "ubuntu" is still GNOME-based.
-    if value.split(':').any(|s| s.trim() == "gnome") || value.trim() == "ubuntu" {
-        return Desktop::Gnome;
     }
     Desktop::Unknown
 }
@@ -3204,17 +3233,24 @@ mod happy_path_tests {
 
     #[test]
     fn disk_encryption_detects_luks_root() {
+        // Realistic btrfs-on-LUKS layout (Arch/Omarchy, Fedora, openSUSE): the
+        // crypt device's singular `mountpoint` is a subvolume, and `/` appears
+        // only in the `mountpoints` array. A single-`/` fixture would hide the
+        // real bug where the root reads "unknown".
         let lsblk = r#"{"blockdevices":[
           {"name":"nvme0n1","type":"disk","fstype":null,"mountpoint":null,"children":[
-            {"name":"nvme0n1p1","type":"part","fstype":"vfat","mountpoint":"/boot"},
+            {"name":"nvme0n1p1","type":"part","fstype":"vfat","mountpoints":["/boot"]},
             {"name":"nvme0n1p2","type":"part","fstype":"crypto_LUKS","mountpoint":null,"children":[
-              {"name":"root","type":"crypt","fstype":"btrfs","mountpoint":"/"}
+              {"name":"root","type":"crypt","fstype":"btrfs","mountpoint":"/var/log",
+               "mountpoints":["/var/log","/home","/var/cache/pacman/pkg","/"]}
             ]}
           ]}
         ]}"#;
         let rows = build_disk_encryption_rows(Some(lsblk), "", Some("/home"));
         let s = summary(&rows);
         assert_eq!(s["root_encrypted"], "yes");
+        // Home is on the same crypt device, matched via its mountpoints list.
+        assert_eq!(s["home_encrypted"], "yes");
         assert_eq!(s["mechanisms"], json!(["luks"]));
     }
 
