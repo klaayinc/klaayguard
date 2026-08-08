@@ -245,7 +245,16 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
 
     match outcome {
         Some(true) => {
-            let _ = keychain::save_token(&tok);
+            // A failed save means the token lives in memory only and the user
+            // signs in again on every launch. Common on Linux without a
+            // Secret Service daemon — make it visible instead of silent.
+            if let Err(e) = keychain::save_token(&tok) {
+                log::error!("keychain: token save failed: {}", e);
+                sentry::capture_message(
+                    &format!("keychain_token_save_failed: {}", e),
+                    Level::Error,
+                );
+            }
             let _ = app.emit("auth:status", json!({ "authenticated": true }));
             add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
             sentry::capture_message("deep_link_token_saved", Level::Info);
@@ -383,15 +392,7 @@ async fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
     log::warn!("sign-in required; opening login page (debounced)");
     add_breadcrumb("ui", "signin_required_notification", Level::Info);
     open_sign_in(app);
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("osascript")
-            .args([
-                "-e",
-                "display notification \"Open KlaayGuard in the menu bar to sign in.\" with title \"KlaayGuard\"",
-            ])
-            .spawn();
-    }
+    notify_user("KlaayGuard", "Open KlaayGuard in the menu bar to sign in.");
 }
 
 async fn emit_error_and_focus(
@@ -494,6 +495,72 @@ fn decide_device_identity(
         return IdentityDecision::Adopt(hash_machine_id(&id));
     }
     IdentityDecision::Generate
+}
+
+/// Directory for the early boot and panic log, given the home directory.
+/// On Linux and Windows this matches where tauri-plugin-log writes, so all
+/// logs live in one place. macOS keeps the user Logs folder.
+pub fn early_log_dir(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Logs/com.klaay.app")
+    } else if cfg!(target_os = "linux") {
+        home.join(".local/share/com.klaay.app/logs")
+    } else {
+        home.join("AppData/Local/com.klaay.app/logs")
+    }
+}
+
+/// Append one line to the early boot log. Used before and outside the Tauri
+/// logger, for the panic hook and startup markers.
+pub fn append_early_log(line: &str) {
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let msg = format!("[{}]{}\n", ts, line);
+    let log_dir = dirs::home_dir()
+        .map(|h| early_log_dir(&h))
+        .unwrap_or_else(|| std::path::PathBuf::from("./"));
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("KlaayGuard.log");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
+}
+
+/// The native notification command for this platform, or None where the app
+/// has no notification path.
+fn notification_command(title: &str, body: &str) -> Option<(&'static str, Vec<String>)> {
+    if cfg!(target_os = "macos") {
+        Some((
+            "osascript",
+            vec![
+                "-e".to_string(),
+                format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    body.replace('"', ""),
+                    title.replace('"', "")
+                ),
+            ],
+        ))
+    } else if cfg!(target_os = "linux") {
+        Some((
+            "notify-send",
+            vec![
+                "--app-name=KlaayGuard".to_string(),
+                title.to_string(),
+                body.to_string(),
+            ],
+        ))
+    } else {
+        None
+    }
+}
+
+/// Show a native notification. Failure is fine; this is best-effort UX.
+fn notify_user(title: &str, body: &str) {
+    if let Some((program, args)) = notification_command(title, body) {
+        let _ = std::process::Command::new(program).args(args).spawn();
+    }
 }
 
 /// Read the systemd machine id. The dbus path serves older systems.
@@ -1765,13 +1832,24 @@ pub fn run() {
             }
             // Load any saved token; if absent, nudge the user to sign in via the tray.
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
-            let authed = if let Ok(Some(tok)) = keychain::load_token() {
-                tauri::async_runtime::block_on(async {
-                    *state_for_loop.auth_token.write().await = Some(tok);
-                });
-                true
-            } else {
-                false
+            let authed = match keychain::load_token() {
+                Ok(Some(tok)) => {
+                    tauri::async_runtime::block_on(async {
+                        *state_for_loop.auth_token.write().await = Some(tok);
+                    });
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    // A broken credential store looks like "not signed in" to
+                    // the user. Report it so support can tell the two apart.
+                    log::error!("keychain: token load failed: {}", e);
+                    sentry::capture_message(
+                        &format!("keychain_token_load_failed: {}", e),
+                        Level::Error,
+                    );
+                    false
+                }
             };
             if authed {
                 log::info!("KlaayGuard started - authenticated, collecting in background");
@@ -2187,5 +2265,36 @@ mod happy_path_tests {
     fn identity_treats_empty_stored_as_missing() {
         let d = decide_device_identity(Some(""), None, None);
         assert!(matches!(d, IdentityDecision::Generate));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn early_log_dir_matches_plugin_log_dir_on_linux() {
+        // The panic hook must write where tauri-plugin-log writes, so support
+        // finds one log location — not a stray ~/Library on Linux.
+        let dir = early_log_dir(std::path::Path::new("/home/u"));
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/home/u/.local/share/com.klaay.app/logs")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn early_log_dir_stays_in_library_logs_on_macos() {
+        let dir = early_log_dir(std::path::Path::new("/Users/u"));
+        assert_eq!(
+            dir,
+            std::path::PathBuf::from("/Users/u/Library/Logs/com.klaay.app")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sign_in_notification_uses_notify_send_on_linux() {
+        let (program, args) = notification_command("KlaayGuard", "Sign in now.").unwrap();
+        assert_eq!(program, "notify-send");
+        assert!(args.contains(&"KlaayGuard".to_string()));
+        assert!(args.contains(&"Sign in now.".to_string()));
     }
 }
