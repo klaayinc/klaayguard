@@ -38,11 +38,13 @@
     "linux": {
       "deb": {
         "desktopTemplate": "./linux/klaayguard.desktop.hbs",
-        "postInstallScript": "./linux/postinst.sh"
+        "postInstallScript": "./linux/postinst.sh",
+        "postRemoveScript": "./linux/postrm.sh"
       },
       "rpm": {
         "desktopTemplate": "./linux/klaayguard.desktop.hbs",
-        "postInstallScript": "./linux/postinst.sh"
+        "postInstallScript": "./linux/postinst.sh",
+        "postRemoveScript": "./linux/postrm.sh"
       }
     }
   },

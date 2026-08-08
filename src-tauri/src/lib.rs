@@ -514,9 +514,17 @@ fn generate_device_identity() -> Result<String, String> {
 /// in the keychain; every later run returns the stored value.
 async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, String> {
     // Fast path, and the rule the tests pin as IdentityDecision::Use.
-    if let Ok(Some(stored)) = keychain::load_device_identity() {
-        if !stored.is_empty() {
-            return Ok(stored);
+    match keychain::load_device_identity() {
+        Ok(Some(stored)) if !stored.is_empty() => return Ok(stored),
+        Ok(_) => {}
+        Err(e) => {
+            // A broken credential store forces re-derivation every cycle.
+            // Report it so a locked or absent Secret Service is visible.
+            log::error!("keychain: device identity load failed: {}", e);
+            sentry::capture_message(
+                &format!("keychain_identity_load_failed: {}", e),
+                Level::Error,
+            );
         }
     }
 
@@ -1673,14 +1681,8 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(state.clone())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .build(),
-        )
+        // Single-instance must init first, so a second launch exits before the
+        // other plugins spin up. Tauri documents this ordering.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Handle deep link if present in args (secondary launches)
             let st = app.state::<Arc<AppState>>().inner().clone();
@@ -1698,6 +1700,14 @@ pub fn run() {
             }
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .setup(|app| {
             // Tray-only background service: hide from dock, no window.
             #[cfg(target_os = "macos")]
