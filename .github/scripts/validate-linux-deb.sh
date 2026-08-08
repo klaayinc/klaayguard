@@ -37,9 +37,12 @@ else
   pass "no collision with the osquery package"
 fi
 
-# The Linux sidecar must be stripped; debug info is 263 MB of dead weight
-# in every package.
-if file data/usr/bin/klaayguard-osqueryi 2>/dev/null | grep -q "not stripped"; then
+# The Linux sidecar must be stripped; debug info is ~180 MB of dead weight
+# in every package. Requires the `file` tool — fail loudly if it is absent
+# rather than pass vacuously.
+if ! command -v file >/dev/null; then
+  fail "the 'file' tool is missing; cannot check the sidecar is stripped"
+elif file data/usr/bin/klaayguard-osqueryi | grep -q "not stripped"; then
   fail "sidecar ships unstripped with debug info"
 else
   pass "sidecar is stripped"
