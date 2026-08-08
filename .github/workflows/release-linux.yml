@@ -44,7 +44,7 @@ jobs:
       - name: (Ubuntu) install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.0-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
 
       - name: Setup osquery binaries (Linux)
         run: rake
@@ -83,36 +83,28 @@ jobs:
           uploaded=()
           BASE_DIR="src-tauri/target/release/bundle"
 
-          # AppImage
-          APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1 || true)
-          if [ -n "${APPIMAGE:-}" ]; then
-            RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
-            cp "$APPIMAGE" "$RENAMED_APPIMAGE"
-            uploaded+=("$RENAMED_APPIMAGE")
-            echo "Added to upload: $RENAMED_APPIMAGE"
-          fi
-          # deb
-          DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1 || true)
-          if [ -n "${DEB:-}" ]; then
-            RENAMED_DEB="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.deb"
-            cp "$DEB" "$RENAMED_DEB"
-            uploaded+=("$RENAMED_DEB")
-            echo "Added to upload: $RENAMED_DEB"
-          fi
-          # rpm
-          RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1 || true)
-          if [ -n "${RPM:-}" ]; then
-            RENAMED_RPM="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.rpm"
-            cp "$RPM" "$RENAMED_RPM"
-            uploaded+=("$RENAMED_RPM")
-            echo "Added to upload: $RENAMED_RPM"
-          fi
+          # Every format must exist. A missing artifact must fail the job:
+          # a partial upload becomes a published release that customers see.
+          APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1)
+          test -n "$APPIMAGE" || { echo "AppImage missing" >&2; exit 1; }
+          DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1)
+          test -n "$DEB" || { echo "deb missing" >&2; exit 1; }
+          RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1)
+          test -n "$RPM" || { echo "rpm missing" >&2; exit 1; }
 
-          if [ ${#uploaded[@]} -gt 0 ]; then
-            echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
-            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            echo "No artifacts found to upload for Linux x86_64 ${{ matrix.build }}"
-          fi
+          ./.github/scripts/validate-linux-deb.sh "$DEB"
+
+          RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
+          cp "$APPIMAGE" "$RENAMED_APPIMAGE"
+          uploaded+=("$RENAMED_APPIMAGE")
+          RENAMED_DEB="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.deb"
+          cp "$DEB" "$RENAMED_DEB"
+          uploaded+=("$RENAMED_DEB")
+          RENAMED_RPM="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.rpm"
+          cp "$RPM" "$RENAMED_RPM"
+          uploaded+=("$RENAMED_RPM")
+
+          echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
+          gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
 
   # Linux arm64 builds removed (disabled)
