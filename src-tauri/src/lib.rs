@@ -2176,8 +2176,8 @@ pub fn run() {
         // This is a tray-only background agent. Closing the Linux fallback
         // window destroys the last window, which would otherwise exit the
         // whole app and stop collection. A window-triggered exit carries
-        // code None; veto it. An explicit app.exit(code) carries Some and is
-        // allowed through (the self-updater relaunch relies on it).
+        // code None; veto only that. A deliberate app.exit(code) carries
+        // Some and still exits normally.
         tauri::RunEvent::ExitRequested { code, api, .. } if code.is_none() => {
             log::info!("exit requested by window close; keeping the agent running");
             api.prevent_exit();
