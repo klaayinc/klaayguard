@@ -95,7 +95,8 @@ distribution). A Windows build is planned but not yet available.
 
 Platform differences on Linux:
 
-- The app does not update itself yet. Install each new version.
+- The AppImage updates itself. The .deb and .rpm installs do not; install
+  each new version through the package manager.
 - The Linux packages are not signed yet.
 - On GNOME desktops the tray icon needs the "AppIndicator Support"
   extension.

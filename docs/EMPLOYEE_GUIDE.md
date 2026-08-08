@@ -51,8 +51,9 @@ Almost nothing:
   well. A red dot means you need to sign in. On a GNOME desktop, enable the
   "AppIndicator Support" extension to see the icon.
 - One sign-in in your browser after you install it.
-- Nothing else. It has no window and uses almost no battery. On macOS it
-  updates itself. On Linux, install new versions when your IT team asks.
+- Nothing else. It has no window and uses almost no battery. On macOS and on the
+  Linux AppImage it updates itself. For .deb or .rpm installs, install new
+  versions when your IT team asks.
 
 ## How do I install it on Linux?
 
