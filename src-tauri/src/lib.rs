@@ -845,7 +845,13 @@ struct SelectedUpdate {
 }
 
 /// macOS artifact tags for the current host: (filename infix, friendly-name infix).
+/// Returns None on other systems: the installer below mounts a DMG, so a
+/// non-macOS host must not download one. Without this gate a Linux or Windows
+/// x86_64 host selects the Intel DMG, downloads it, and fails at mount time.
 fn host_arch_tags() -> Option<(&'static str, &'static str)> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
     match std::env::consts::ARCH {
         "aarch64" => Some(("macOS_arm64", "Apple silicon")),
         "x86_64" => Some(("macOS_x64", "Intel")),
@@ -1116,8 +1122,9 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         // artifact filename) against THIS host's architecture. Picking the wrong
         // arch would install an app the arch-mismatch gate then refuses to launch.
         let Some((arch_tag, arch_label)) = host_arch_tags() else {
-            log::warn!(
-                "⚠️  No macOS update artifact for architecture: {}",
+            log::info!(
+                "ℹ️  Auto-update supports macOS only; skipping on {} {}",
+                std::env::consts::OS,
                 std::env::consts::ARCH
             );
             return Ok(None);
