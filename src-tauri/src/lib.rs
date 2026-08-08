@@ -137,12 +137,22 @@ fn platform_matches(tag: Option<&str>, os: &str) -> bool {
     }
 }
 
-/// Turn the /klaayguard/config payload into (logical_id, sql) pairs for `os`. An
-/// item with an explicit `sql` uses it; otherwise it defaults to
-/// `SELECT * FROM <id>`. Items whose `platform` tag does not match `os` are
-/// skipped; statements that aren't a single read-only query are dropped (see
-/// `is_read_only_query`).
-fn parse_config_queries(cfg: &Value, os: &str) -> Vec<(String, String)> {
+/// One resolved collection item from /klaayguard/config, after platform filter.
+#[derive(Debug, PartialEq)]
+enum CollectionItem {
+    /// Default: run this read-only SQL through the osquery sidecar.
+    Osquery { id: String, sql: String },
+    /// Native: resolve `check` with in-process Rust, no osquery. Used for facts
+    /// osquery cannot supply unprivileged (Linux disk encryption, screen lock).
+    Builtin { id: String, check: String },
+}
+
+/// Turn the /klaayguard/config payload into collection items for `os`. Items
+/// whose `platform` tag does not match `os` are skipped. An item with
+/// `source: "builtin"` (and a `check` name) resolves natively; otherwise it is
+/// an osquery item — explicit `sql` or a default `SELECT * FROM <id>`, dropped
+/// if it is not a single read-only query (see `is_read_only_query`).
+fn parse_config_items(cfg: &Value, os: &str) -> Vec<CollectionItem> {
     cfg.get("data")
         .and_then(|d| d.as_array())
         .map(|arr| {
@@ -152,6 +162,27 @@ fn parse_config_queries(cfg: &Value, os: &str) -> Vec<(String, String)> {
                     let platform = item.get("platform").and_then(|v| v.as_str());
                     if !platform_matches(platform, os) {
                         return None;
+                    }
+                    let source = item
+                        .get("source")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("osquery");
+                    if source == "builtin" {
+                        return match item.get("check").and_then(|v| v.as_str()) {
+                            Some(check) => Some(CollectionItem::Builtin {
+                                id: id.to_string(),
+                                check: check.to_string(),
+                            }),
+                            None => {
+                                log::warn!("builtin config item missing 'check' id={}", id);
+                                add_breadcrumb(
+                                    "collection",
+                                    &format!("builtin_check_missing id={}", id),
+                                    Level::Warning,
+                                );
+                                None
+                            }
+                        };
                     }
                     let sql = item
                         .get("sql")
@@ -167,11 +198,524 @@ fn parse_config_queries(cfg: &Value, os: &str) -> Vec<(String, String)> {
                         );
                         return None;
                     }
-                    Some((id.to_string(), sql))
+                    Some(CollectionItem::Osquery {
+                        id: id.to_string(),
+                        sql,
+                    })
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Resolve a native (non-osquery) check by name, returning a JSON array of row
+/// objects in the same shape osquery emits, so `build_payload_items` treats
+/// native and osquery rows identically. An unknown or unsupported check yields
+/// an empty array — an honest "no rows", never an error that aborts the cycle.
+fn run_builtin_check(check: &str) -> Value {
+    match check {
+        #[cfg(target_os = "linux")]
+        "disk_encryption" => collect_disk_encryption(),
+        #[cfg(target_os = "linux")]
+        "screenlock" => collect_screenlock(),
+        other => {
+            log::warn!("unknown or unsupported builtin check '{}'", other);
+            add_breadcrumb(
+                "collection",
+                &format!("builtin_check_unsupported '{}'", other),
+                Level::Warning,
+            );
+            json!([])
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native Linux posture collectors (disk encryption, screen lock). osquery
+// cannot supply these unprivileged: disk_encryption needs root and mis-reports
+// LUKS, and there is no Linux screenlock table. Pure parsers are unit-tested;
+// thin IO wrappers are not. Every path degrades to "unknown", never a false
+// "no", when a mechanism cannot be seen without root.
+// ---------------------------------------------------------------------------
+
+/// One block device flattened from `lsblk -J`, with encryption context.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone)]
+struct FlatDev {
+    mountpoint: String,
+    kind: String,          // lsblk TYPE: part, crypt, lvm, disk, ...
+    on_crypt: bool,        // this device or an ancestor is a dm-crypt mapper
+    parent_fstype: String, // the parent's FSTYPE (crypto_LUKS marks LUKS)
+}
+
+/// Flatten the `lsblk -J` block-device tree, propagating a dm-crypt ancestor
+/// flag and each node's parent fstype down the children.
+#[cfg(any(target_os = "linux", test))]
+fn parse_lsblk(json: &str) -> Vec<FlatDev> {
+    fn field(v: &Value, k: &str) -> String {
+        // lsblk emits null for empty fields, and mountpoint may be `mountpoints`.
+        v.get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+    fn mountpoint_of(v: &Value) -> String {
+        if let Some(mp) = v.get("mountpoint").and_then(|x| x.as_str()) {
+            return mp.to_string();
+        }
+        // newer util-linux: "mountpoints": [null] or ["/"]
+        v.get("mountpoints")
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.iter().find_map(|m| m.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+    fn walk(node: &Value, parent_on_crypt: bool, parent_fstype: &str, out: &mut Vec<FlatDev>) {
+        let kind = field(node, "type");
+        let fstype = field(node, "fstype");
+        let on_crypt = parent_on_crypt || kind == "crypt";
+        out.push(FlatDev {
+            mountpoint: mountpoint_of(node),
+            kind: kind.clone(),
+            on_crypt,
+            parent_fstype: parent_fstype.to_string(),
+        });
+        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+            for child in children {
+                walk(child, on_crypt, &fstype, out);
+            }
+        }
+    }
+    let parsed: Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    if let Some(devs) = parsed.get("blockdevices").and_then(|d| d.as_array()) {
+        for dev in devs {
+            walk(dev, false, "", &mut out);
+        }
+    }
+    out
+}
+
+/// One /proc/mounts entry.
+#[cfg(any(target_os = "linux", test))]
+struct MountEntry {
+    mountpoint: String,
+    fstype: String,
+}
+
+/// Parse /proc/mounts into (mountpoint, fstype) entries.
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_mounts(text: &str) -> Vec<MountEntry> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split_whitespace();
+            let _device = f.next()?;
+            let mountpoint = f.next()?;
+            let fstype = f.next()?;
+            Some(MountEntry {
+                mountpoint: mountpoint.to_string(),
+                fstype: fstype.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Whether the filesystem type at `mount` names a built-in encryption layer.
+#[cfg(any(target_os = "linux", test))]
+fn encrypted_mount_mechanism(fstype: &str) -> Option<&'static str> {
+    match fstype {
+        "ecryptfs" => Some("ecryptfs"),
+        _ => None,
+    }
+}
+
+/// Build the `disk_encryption` rows for `/` (and, best effort, home) from lsblk
+/// topology and /proc/mounts. Emits one evidence row per encrypted device or
+/// mount, plus a `summary` row with tri-state root/home determinations. A
+/// mechanism that cannot be confirmed unprivileged reports "unknown", never
+/// "no".
+#[cfg(any(target_os = "linux", test))]
+fn build_disk_encryption_rows(
+    lsblk_json: Option<&str>,
+    proc_mounts: &str,
+    home: Option<&str>,
+) -> Value {
+    let devs = lsblk_json.map(parse_lsblk).unwrap_or_default();
+    let mounts = parse_proc_mounts(proc_mounts);
+    let mut rows: Vec<Value> = Vec::new();
+    let mut mechanisms: Vec<String> = Vec::new();
+
+    // Evidence: dm-crypt mappers from lsblk.
+    for d in devs.iter().filter(|d| d.kind == "crypt") {
+        let mechanism = if d.parent_fstype == "crypto_LUKS" {
+            "luks"
+        } else {
+            "dm-crypt"
+        };
+        if !mechanisms.iter().any(|m| m == mechanism) {
+            mechanisms.push(mechanism.to_string());
+        }
+        rows.push(json!({
+            "kind": "device", "mechanism": mechanism, "encrypted": "yes",
+            "mountpoint": d.mountpoint, "source": "lsblk",
+            "detail": format!("dm-crypt mapper (parent fstype {})", d.parent_fstype)
+        }));
+    }
+    // Evidence: encryption-bearing mount types (ecryptfs) from /proc/mounts.
+    for m in &mounts {
+        if let Some(mechanism) = encrypted_mount_mechanism(&m.fstype) {
+            if !mechanisms.iter().any(|x| x == mechanism) {
+                mechanisms.push(mechanism.to_string());
+            }
+            rows.push(json!({
+                "kind": "device", "mechanism": mechanism, "encrypted": "yes",
+                "mountpoint": m.mountpoint, "source": "/proc/mounts",
+                "detail": format!("{} mount", mechanism)
+            }));
+        }
+    }
+
+    // Determine whether a given mountpoint is on encrypted storage.
+    let determine = |target: &str| -> &'static str {
+        // ecryptfs / other encrypted mount types.
+        if mounts
+            .iter()
+            .any(|m| m.mountpoint == target && encrypted_mount_mechanism(&m.fstype).is_some())
+        {
+            return "yes";
+        }
+        // ZFS: encryption is a dataset property we cannot read unprivileged.
+        if mounts
+            .iter()
+            .any(|m| m.mountpoint == target && m.fstype == "zfs")
+        {
+            return "unknown";
+        }
+        // dm-crypt/LUKS via lsblk: the device mounted at target sits on crypt.
+        match devs.iter().find(|d| d.mountpoint == target) {
+            Some(d) => {
+                if d.on_crypt {
+                    "yes"
+                } else {
+                    "no"
+                }
+            }
+            // The mount was not resolvable from lsblk (e.g. lsblk missing or
+            // fscrypt on a plain fs): do not claim "no".
+            None => "unknown",
+        }
+    };
+
+    let root_encrypted = determine("/");
+    let home_encrypted = match home {
+        Some(h) if !h.is_empty() && h != "/" => determine(h),
+        // Home on the root filesystem shares its determination.
+        Some(_) => root_encrypted,
+        None => "unknown",
+    };
+
+    rows.push(json!({
+        "kind": "summary",
+        "root_encrypted": root_encrypted,
+        "home_encrypted": home_encrypted,
+        "mechanisms": mechanisms,
+        "source": "aggregate"
+    }));
+    Value::Array(rows)
+}
+
+/// Collect Linux disk-encryption posture (unprivileged). Runs `lsblk -J` and
+/// reads /proc/mounts, then builds the rows. Falls back to sysfs-free /proc if
+/// lsblk is unavailable (root determination then degrades to "unknown").
+#[cfg(target_os = "linux")]
+fn collect_disk_encryption() -> Value {
+    let lsblk = std::process::Command::new("lsblk")
+        .args([
+            "-J",
+            "-o",
+            "NAME,KNAME,TYPE,FSTYPE,MOUNTPOINT,MOUNTPOINTS,PKNAME",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+    let proc_mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+    let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+    build_disk_encryption_rows(lsblk.as_deref(), &proc_mounts, home.as_deref())
+}
+
+/// The desktop environments whose screen-lock policy we can read.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq)]
+enum Desktop {
+    Gnome,
+    Kde,
+    Hyprland,
+    Unknown,
+}
+
+/// Classify `XDG_CURRENT_DESKTOP` (colon-separated, case-insensitive; handles
+/// values like "ubuntu:GNOME").
+#[cfg(any(target_os = "linux", test))]
+fn detect_desktop(xdg_current_desktop: Option<&str>) -> Desktop {
+    let value = xdg_current_desktop.unwrap_or("").to_ascii_lowercase();
+    for seg in value.split(':') {
+        match seg.trim() {
+            "gnome" | "unity" | "ubuntu" => {
+                if seg.trim() != "ubuntu" {
+                    return Desktop::Gnome;
+                }
+            }
+            "kde" => return Desktop::Kde,
+            "hyprland" => return Desktop::Hyprland,
+            _ => {}
+        }
+    }
+    // "ubuntu:GNOME" contains GNOME; a lone "ubuntu" is still GNOME-based.
+    if value.split(':').any(|s| s.trim() == "gnome") || value.trim() == "ubuntu" {
+        return Desktop::Gnome;
+    }
+    Desktop::Unknown
+}
+
+/// Parse a `gsettings get ... <bool>` result ("true"/"false" with a newline).
+#[cfg(any(target_os = "linux", test))]
+fn parse_gsettings_bool(out: &str) -> Option<bool> {
+    match out.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a `gsettings get ... <uint>` result (e.g. "uint32 300").
+#[cfg(any(target_os = "linux", test))]
+fn parse_gsettings_uint(out: &str) -> Option<u64> {
+    out.trim()
+        .rsplit(|c: char| c.is_whitespace())
+        .next()
+        .and_then(|n| n.parse::<u64>().ok())
+}
+
+/// Parse the `[Daemon]` section of kscreenlockerrc: (autolock, timeout minutes).
+#[cfg(any(target_os = "linux", test))]
+fn parse_kscreenlockerrc(text: &str) -> (Option<bool>, Option<u64>) {
+    let mut in_daemon = false;
+    let mut autolock = None;
+    let mut timeout_min = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_daemon = line.eq_ignore_ascii_case("[daemon]");
+            continue;
+        }
+        if !in_daemon {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            match k.trim().to_ascii_lowercase().as_str() {
+                "autolock" => autolock = parse_gsettings_bool(&v.trim().to_ascii_lowercase()),
+                "timeout" => timeout_min = v.trim().parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+    }
+    (autolock, timeout_min)
+}
+
+/// Parse a hypridle config for the first lock listener's timeout (seconds). A
+/// listener counts as a lock if its `on-timeout` runs hyprlock or
+/// `loginctl lock-session`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_hypridle_config(text: &str) -> Option<u64> {
+    let mut depth = 0i32;
+    let mut in_listener = false;
+    let mut timeout: Option<u64> = None;
+    let mut locks = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.contains("listener") && line.contains('{') {
+            in_listener = true;
+            depth = 1;
+            timeout = None;
+            locks = false;
+            continue;
+        }
+        if in_listener {
+            depth += line.matches('{').count() as i32;
+            depth -= line.matches('}').count() as i32;
+            if let Some((k, v)) = line.split_once('=') {
+                match k.trim() {
+                    "timeout" => timeout = v.trim().parse::<u64>().ok(),
+                    "on-timeout" => {
+                        // Any lock command counts: hyprlock, loginctl
+                        // lock-session, or a custom wrapper like
+                        // omarchy-system-lock. Exclude "unlock".
+                        let v = v.to_ascii_lowercase();
+                        if v.contains("lock") && !v.contains("unlock") {
+                            locks = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if depth <= 0 {
+                in_listener = false;
+                if locks {
+                    if let Some(t) = timeout {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Assemble the single screenlock row.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row(
+    de: &str,
+    enabled: &str,
+    delay_seconds: Option<u64>,
+    source: &str,
+    detail: &str,
+) -> Value {
+    json!([{
+        "desktop_environment": de,
+        "enabled": enabled,
+        "delay_seconds": delay_seconds,
+        "source": source,
+        "detail": detail,
+    }])
+}
+
+/// GNOME screenlock row from the two gsettings values. Lock engages only when
+/// it is enabled AND the idle delay is non-zero (delay 0 = never triggers).
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_gnome(lock_enabled: Option<bool>, idle_delay: Option<u64>) -> Value {
+    match (lock_enabled, idle_delay) {
+        (Some(true), Some(d)) if d > 0 => screenlock_row(
+            "gnome",
+            "yes",
+            Some(d),
+            "gsettings",
+            &format!("lock-enabled=true, idle-delay={}", d),
+        ),
+        (Some(true), Some(0)) => screenlock_row(
+            "gnome",
+            "no",
+            Some(0),
+            "gsettings",
+            "lock enabled but idle-delay=0, so it never triggers",
+        ),
+        (Some(false), _) => {
+            screenlock_row("gnome", "no", idle_delay, "gsettings", "lock-enabled=false")
+        }
+        _ => screenlock_row(
+            "gnome",
+            "unknown",
+            idle_delay,
+            "gsettings",
+            "gsettings unavailable",
+        ),
+    }
+}
+
+/// KDE screenlock row from kscreenlockerrc. An absent file/key is unknown.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_kde(autolock: Option<bool>, timeout_min: Option<u64>) -> Value {
+    match autolock {
+        Some(true) => screenlock_row(
+            "kde",
+            "yes",
+            timeout_min.map(|m| m * 60),
+            "kscreenlockerrc",
+            "Autolock=true",
+        ),
+        Some(false) => screenlock_row(
+            "kde",
+            "no",
+            timeout_min.map(|m| m * 60),
+            "kscreenlockerrc",
+            "Autolock=false",
+        ),
+        None => screenlock_row(
+            "kde",
+            "unknown",
+            None,
+            "kscreenlockerrc",
+            "no kscreenlockerrc Autolock key",
+        ),
+    }
+}
+
+/// Hyprland screenlock row from a hypridle timeout (seconds), or unknown.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_hyprland(lock_timeout: Option<u64>) -> Value {
+    match lock_timeout {
+        Some(t) => screenlock_row(
+            "hyprland",
+            "yes",
+            Some(t),
+            "hypridle",
+            "lock listener present",
+        ),
+        None => screenlock_row(
+            "hyprland",
+            "unknown",
+            None,
+            "hypridle",
+            "no hypridle lock listener found",
+        ),
+    }
+}
+
+/// Collect Linux screen-lock posture (unprivileged) for the current desktop.
+#[cfg(target_os = "linux")]
+fn collect_screenlock() -> Value {
+    match detect_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref()) {
+        Desktop::Gnome => {
+            let lock = std::process::Command::new("gsettings")
+                .args(["get", "org.gnome.desktop.screensaver", "lock-enabled"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| parse_gsettings_bool(&s));
+            let delay = std::process::Command::new("gsettings")
+                .args(["get", "org.gnome.desktop.session", "idle-delay"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| parse_gsettings_uint(&s));
+            screenlock_row_gnome(lock, delay)
+        }
+        Desktop::Kde => {
+            let text = dirs::config_dir()
+                .map(|c| c.join("kscreenlockerrc"))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
+            let (autolock, timeout_min) = parse_kscreenlockerrc(&text);
+            screenlock_row_kde(autolock, timeout_min)
+        }
+        Desktop::Hyprland => {
+            let text = dirs::config_dir()
+                .map(|c| c.join("hypr/hypridle.conf"))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
+            screenlock_row_hyprland(parse_hypridle_config(&text))
+        }
+        Desktop::Unknown => screenlock_row(
+            "unknown",
+            "unknown",
+            None,
+            "none",
+            "no recognized XDG_CURRENT_DESKTOP",
+        ),
+    }
 }
 
 /// Flatten osquery results into JSON:API resources, stamping each row with collected_at.
@@ -916,9 +1460,9 @@ async fn run_cycle(
     }
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
-    let queries = parse_config_queries(&cfg_json, std::env::consts::OS);
+    let items = parse_config_items(&cfg_json, std::env::consts::OS);
 
-    if queries.is_empty() {
+    if items.is_empty() {
         emit_error_and_focus(
             app,
             state,
@@ -929,10 +1473,30 @@ async fn run_cycle(
         return Ok(());
     }
 
+    // Split osquery items from native (builtin) ones. osquery runs through the
+    // sidecar as before; builtin checks resolve in-process. Both fill the same
+    // results map keyed by logical id, so the payload builder is unchanged.
+    let mut osquery_queries: Vec<(String, String)> = Vec::new();
+    let mut builtin_checks: Vec<(String, String)> = Vec::new();
+    for item in items {
+        match item {
+            CollectionItem::Osquery { id, sql } => osquery_queries.push((id, sql)),
+            CollectionItem::Builtin { id, check } => builtin_checks.push((id, check)),
+        }
+    }
+
     // 2) osquery
     add_breadcrumb("collection", "osquery_start", Level::Info);
     sentry::capture_message("collection_osquery_start", Level::Info);
-    let results = execute_sql_batch(app.clone(), queries).await?;
+    let mut results = if osquery_queries.is_empty() {
+        HashMap::new()
+    } else {
+        execute_sql_batch(app.clone(), osquery_queries).await?
+    };
+    // 2b) native checks (Linux disk encryption, screen lock).
+    for (id, check) in builtin_checks {
+        results.insert(id, run_builtin_check(&check));
+    }
     *state.last_run_at.write().await = Some(std::time::Instant::now());
 
     // 3) Build the JSON:API payload from the freshly collected rows
@@ -2567,13 +3131,24 @@ mod happy_path_tests {
         assert!(escaped.contains("&lt;/string&gt;"));
     }
 
+    /// Test helper: the (id, sql) pairs of the osquery items only.
+    fn osquery_pairs(items: &[CollectionItem]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                CollectionItem::Osquery { id, sql } => Some((id.clone(), sql.clone())),
+                CollectionItem::Builtin { .. } => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn config_queries_use_explicit_sql_or_default_select() {
         let cfg = json!({"data": [
             {"type": "osquery-table", "id": "system_info"},
             {"type": "osquery-table", "id": "users", "sql": "SELECT username FROM users"}
         ]});
-        let q = parse_config_queries(&cfg, "linux");
+        let q = osquery_pairs(&parse_config_items(&cfg, "linux"));
         assert_eq!(q.len(), 2);
         assert!(q.contains(&(
             "system_info".to_string(),
@@ -2587,8 +3162,172 @@ mod happy_path_tests {
 
     #[test]
     fn config_queries_empty_when_no_data() {
-        assert!(parse_config_queries(&json!({}), "linux").is_empty());
-        assert!(parse_config_queries(&json!({"data": []}), "linux").is_empty());
+        assert!(parse_config_items(&json!({}), "linux").is_empty());
+        assert!(parse_config_items(&json!({"data": []}), "linux").is_empty());
+    }
+
+    #[test]
+    fn config_items_dispatch_builtin_source() {
+        let cfg = json!({"data": [
+            {"id": "disk_encryption", "platform": "linux", "source": "builtin", "check": "disk_encryption"},
+            {"id": "broken", "source": "builtin"},
+            {"id": "os_version", "sql": "SELECT name FROM os_version"}
+        ]});
+        let items = parse_config_items(&cfg, "linux");
+        // The builtin with a check resolves; the one missing `check` is dropped;
+        // the osquery item stays osquery.
+        assert!(items.contains(&CollectionItem::Builtin {
+            id: "disk_encryption".to_string(),
+            check: "disk_encryption".to_string(),
+        }));
+        assert!(!items
+            .iter()
+            .any(|i| matches!(i, CollectionItem::Builtin { id, .. } if id == "broken")));
+        assert_eq!(osquery_pairs(&items).len(), 1);
+    }
+
+    #[test]
+    fn builtin_check_unknown_is_empty() {
+        assert_eq!(run_builtin_check("nope"), json!([]));
+    }
+
+    // ----- disk encryption -----
+
+    fn summary(rows: &Value) -> Value {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "summary")
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn disk_encryption_detects_luks_root() {
+        let lsblk = r#"{"blockdevices":[
+          {"name":"nvme0n1","type":"disk","fstype":null,"mountpoint":null,"children":[
+            {"name":"nvme0n1p1","type":"part","fstype":"vfat","mountpoint":"/boot"},
+            {"name":"nvme0n1p2","type":"part","fstype":"crypto_LUKS","mountpoint":null,"children":[
+              {"name":"root","type":"crypt","fstype":"btrfs","mountpoint":"/"}
+            ]}
+          ]}
+        ]}"#;
+        let rows = build_disk_encryption_rows(Some(lsblk), "", Some("/home"));
+        let s = summary(&rows);
+        assert_eq!(s["root_encrypted"], "yes");
+        assert_eq!(s["mechanisms"], json!(["luks"]));
+    }
+
+    #[test]
+    fn disk_encryption_reports_no_for_plain_root() {
+        let lsblk = r#"{"blockdevices":[
+          {"name":"sda","type":"disk","children":[
+            {"name":"sda1","type":"part","fstype":"ext4","mountpoint":"/"}
+          ]}
+        ]}"#;
+        let rows = build_disk_encryption_rows(Some(lsblk), "", None);
+        assert_eq!(summary(&rows)["root_encrypted"], "no");
+    }
+
+    #[test]
+    fn disk_encryption_unknown_when_root_unresolved() {
+        // No lsblk and /proc/mounts has no "/" entry: must not claim "no".
+        let rows = build_disk_encryption_rows(None, "tmpfs /run tmpfs rw 0 0\n", None);
+        assert_eq!(summary(&rows)["root_encrypted"], "unknown");
+    }
+
+    #[test]
+    fn disk_encryption_detects_ecryptfs_and_zfs() {
+        let mounts = "\
+/home/.ecryptfs/u/.Private /home/u ecryptfs rw 0 0
+zroot/ROOT/default / zfs rw 0 0
+";
+        let rows = build_disk_encryption_rows(None, mounts, Some("/home/u"));
+        let s = summary(&rows);
+        // Root is ZFS: encryption is a dataset property we cannot read -> unknown.
+        assert_eq!(s["root_encrypted"], "unknown");
+        // Home is ecryptfs -> yes, and the mechanism is recorded.
+        assert_eq!(s["home_encrypted"], "yes");
+        assert!(s["mechanisms"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("ecryptfs")));
+    }
+
+    // ----- screen lock -----
+
+    #[test]
+    fn detect_desktop_classifies_the_common_environments() {
+        assert_eq!(detect_desktop(Some("ubuntu:GNOME")), Desktop::Gnome);
+        assert_eq!(detect_desktop(Some("GNOME")), Desktop::Gnome);
+        assert_eq!(detect_desktop(Some("KDE")), Desktop::Kde);
+        assert_eq!(detect_desktop(Some("Hyprland")), Desktop::Hyprland);
+        assert_eq!(detect_desktop(Some("XFCE")), Desktop::Unknown);
+        assert_eq!(detect_desktop(None), Desktop::Unknown);
+    }
+
+    #[test]
+    fn gsettings_parsers_read_bool_and_uint() {
+        assert_eq!(parse_gsettings_bool("true\n"), Some(true));
+        assert_eq!(parse_gsettings_bool("false\n"), Some(false));
+        assert_eq!(parse_gsettings_bool("garbage"), None);
+        assert_eq!(parse_gsettings_uint("uint32 300\n"), Some(300));
+        assert_eq!(parse_gsettings_uint("900"), Some(900));
+    }
+
+    #[test]
+    fn gnome_lock_needs_enabled_and_nonzero_delay() {
+        assert_eq!(
+            screenlock_row_gnome(Some(true), Some(300))[0]["enabled"],
+            "yes"
+        );
+        // Enabled but idle-delay 0 never triggers.
+        assert_eq!(
+            screenlock_row_gnome(Some(true), Some(0))[0]["enabled"],
+            "no"
+        );
+        assert_eq!(
+            screenlock_row_gnome(Some(false), Some(300))[0]["enabled"],
+            "no"
+        );
+        // Missing gsettings -> unknown, never a false "no".
+        assert_eq!(screenlock_row_gnome(None, None)[0]["enabled"], "unknown");
+    }
+
+    #[test]
+    fn kscreenlockerrc_parses_daemon_section() {
+        let text = "[Daemon]\nAutolock=false\nTimeout=5\n[Greeter]\nAutolock=true\n";
+        let (autolock, timeout) = parse_kscreenlockerrc(text);
+        assert_eq!(autolock, Some(false));
+        assert_eq!(timeout, Some(5));
+        // Missing file/keys -> unknown enabled.
+        assert_eq!(screenlock_row_kde(None, None)[0]["enabled"], "unknown");
+        assert_eq!(
+            screenlock_row_kde(Some(true), Some(5))[0]["delay_seconds"],
+            300
+        );
+    }
+
+    #[test]
+    fn hypridle_lock_listener_yields_timeout() {
+        let cfg = "\
+listener {
+    timeout = 150
+    on-timeout = brightnessctl -s set 10
+}
+listener {
+    timeout = 300
+    on-timeout = loginctl lock-session
+}
+";
+        assert_eq!(parse_hypridle_config(cfg), Some(300));
+        // A custom lock wrapper (no "hyprlock"/"lock-session") still counts.
+        let custom = "listener {\n timeout = 152\n on-timeout = omarchy-system-lock\n}\n";
+        assert_eq!(parse_hypridle_config(custom), Some(152));
+        // A config with only a non-lock listener -> None -> unknown.
+        let dpms = "listener {\n timeout = 600\n on-timeout = hyprctl dispatch dpms off\n}\n";
+        assert_eq!(parse_hypridle_config(dpms), None);
+        assert_eq!(screenlock_row_hyprland(None)[0]["enabled"], "unknown");
     }
 
     #[test]
@@ -2618,13 +3357,13 @@ mod happy_path_tests {
             {"id": "users", "platform": "linux", "sql": "SELECT username FROM users"}
         ]});
         // On Linux: the untagged item and the linux item run; the darwin item is skipped.
-        let linux = parse_config_queries(&cfg, "linux");
+        let linux = osquery_pairs(&parse_config_items(&cfg, "linux"));
         let linux_ids: Vec<&String> = linux.iter().map(|(id, _)| id).collect();
         assert!(linux_ids.contains(&&"system_info".to_string()));
         assert!(linux_ids.contains(&&"users".to_string()));
         assert!(!linux_ids.contains(&&"screenlock".to_string()));
         // On macOS: the untagged item and the darwin item run; the linux item is skipped.
-        let mac = parse_config_queries(&cfg, "macos");
+        let mac = osquery_pairs(&parse_config_items(&cfg, "macos"));
         let mac_ids: Vec<&String> = mac.iter().map(|(id, _)| id).collect();
         assert!(mac_ids.contains(&&"system_info".to_string()));
         assert!(mac_ids.contains(&&"screenlock".to_string()));
@@ -2649,7 +3388,7 @@ mod happy_path_tests {
             {"id": "system_info"},
             {"id": "evil", "sql": "SELECT 1; ATTACH DATABASE 'x' AS y"}
         ]});
-        let q = parse_config_queries(&cfg, "linux");
+        let q = osquery_pairs(&parse_config_items(&cfg, "linux"));
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].0, "system_info");
     }
