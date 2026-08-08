@@ -42,13 +42,19 @@ if test -f "$DESKTOP"; then
   if command -v desktop-file-validate >/dev/null; then
     desktop-file-validate "$DESKTOP" && pass "desktop-file-validate" \
       || fail "desktop-file-validate rejected the entry"
+  else
+    echo "  WARN: desktop-file-validate not installed; skipping that check" >&2
   fi
 else
   fail "desktop entry $DESKTOP is missing"
 fi
 
 # A stray copy outside /usr means a files-mapping path bug.
-if find data -name "*.desktop" -not -path "data/usr/*" | grep -q .; then
+# Capture into a variable rather than `find | grep -q`: grep -q exits on the
+# first match, find then dies with SIGPIPE, and pipefail would flip this check
+# to a false pass — the exact bug class this script exists to catch.
+STRAY_DESKTOP="$(find data -name "*.desktop" -not -path "data/usr/*")"
+if [ -n "$STRAY_DESKTOP" ]; then
   fail "a desktop file is installed outside /usr — files mapping path bug"
 else
   pass "no desktop file outside /usr"
