@@ -2365,11 +2365,16 @@ pub fn run() {
                 }
             }
         }
-        // This is a tray-only background agent. Closing the Linux fallback
-        // window destroys the last window, which would otherwise exit the
-        // whole app and stop collection. A window-triggered exit carries
-        // code None; veto only that. A deliberate app.exit(code) carries
-        // Some and still exits normally.
+        // Linux only. Closing the Linux fallback window destroys the last
+        // window, which would otherwise exit the whole app and stop
+        // collection; veto that window-triggered exit (code None). A
+        // deliberate app.exit(code) carries Some and still exits.
+        //
+        // Not compiled on macOS: the agent has no windows there, so this
+        // event only ever comes from an OS quit (Cmd+Q, logout, shutdown).
+        // Vetoing those would cancel a user logout — the wrong behavior and
+        // not needed, since there is no window to protect.
+        #[cfg(target_os = "linux")]
         tauri::RunEvent::ExitRequested { code, api, .. } if code.is_none() => {
             log::info!("exit requested by window close; keeping the agent running");
             api.prevent_exit();
