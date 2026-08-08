@@ -577,6 +577,7 @@ fn generate_device_identity() -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// Content of the Linux autostart entry.
 fn autostart_entry(exec: &str) -> String {
     format!(
@@ -593,6 +594,7 @@ fn autostart_entry(exec: &str) -> String {
 
 /// The executable to autostart. Inside an AppImage, current_exe points at a
 /// temporary mount that is gone after exit; the APPIMAGE variable holds the
+#[cfg(any(target_os = "linux", test))]
 /// real file.
 fn autostart_exec(appimage_env: Option<&str>, current_exe: &str) -> String {
     appimage_env
@@ -601,6 +603,7 @@ fn autostart_exec(appimage_env: Option<&str>, current_exe: &str) -> String {
         .to_string()
 }
 
+#[cfg(any(target_os = "linux", test))]
 /// Location of the XDG autostart entry for this user.
 fn autostart_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".config/autostart/klaayguard.desktop")
