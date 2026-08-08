@@ -1663,7 +1663,11 @@ async fn download_and_install_update_internal(
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    Err("auto-update is not supported on this platform".to_string())
+    {
+        // app is consumed only by the linux and macOS install arms.
+        let _ = app;
+        Err("auto-update is not supported on this platform".to_string())
+    }
 }
 
 /// Replace the running AppImage with the downloaded one and relaunch.
@@ -1824,7 +1828,8 @@ fn verify_klaay_signature(app_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+// Called only from the macOS update arm; dead on Linux and Windows.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 async fn replace_application(
     dmg_path: &std::path::Path,
     app: &tauri::AppHandle,
