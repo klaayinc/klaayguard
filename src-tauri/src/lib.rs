@@ -514,9 +514,17 @@ fn generate_device_identity() -> Result<String, String> {
 /// in the keychain; every later run returns the stored value.
 async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, String> {
     // Fast path, and the rule the tests pin as IdentityDecision::Use.
-    if let Ok(Some(stored)) = keychain::load_device_identity() {
-        if !stored.is_empty() {
-            return Ok(stored);
+    match keychain::load_device_identity() {
+        Ok(Some(stored)) if !stored.is_empty() => return Ok(stored),
+        Ok(_) => {}
+        Err(e) => {
+            // A broken credential store forces re-derivation every cycle.
+            // Report it so a locked or absent Secret Service is visible.
+            log::error!("keychain: device identity load failed: {}", e);
+            sentry::capture_message(
+                &format!("keychain_identity_load_failed: {}", e),
+                Level::Error,
+            );
         }
     }
 
