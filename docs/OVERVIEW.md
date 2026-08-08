@@ -89,8 +89,16 @@ the OS permissions that the agent does not request.
 
 Klaay distributes signed installers from the
 [GitHub releases page](https://github.com/klaayinc/klaayguard/releases).
-macOS installs use a `.pkg` or `.dmg` file. Linux installs use a `.deb`,
-`.rpm`, or `.AppImage` file. A Windows build is planned but not yet available.
+macOS installs use a `.pkg` or `.dmg` file. Linux installs use a `.deb`
+(Ubuntu, Debian), an `.rpm` (Fedora, RHEL), or an `.AppImage` (any
+distribution). A Windows build is planned but not yet available.
+
+Platform differences on Linux:
+
+- The app does not update itself yet. Install each new version.
+- The Linux packages are not signed yet.
+- On GNOME desktops the tray icon needs the "AppIndicator Support"
+  extension.
 
 ## 6. Questions
 

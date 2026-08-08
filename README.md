@@ -240,7 +240,8 @@ so Sentry is off in production — see the note in
 
 ## Logs
 
-- App log: `~/Library/Logs/com.klaay.app/KlaayGuard.log`
+- App log (macOS): `~/Library/Logs/com.klaay.app/KlaayGuard.log`
+- App log (Linux): `~/.local/share/com.klaay.app/logs/KlaayGuard.log`
 - launchd stdout/stderr: `~/Library/Logs/KlaayGuard/klaayguard.log` and
   `klaayguard.error.log`
 

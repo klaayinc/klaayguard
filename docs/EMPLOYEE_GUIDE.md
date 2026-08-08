@@ -5,7 +5,7 @@ it is, what it can see, and what it cannot see.
 
 ## What is KlaayGuard?
 
-KlaayGuard is a small app that lives in your menu bar. It checks that your
+KlaayGuard is a small app that lives in your menu bar (on Linux: your system tray). It checks that your
 computer meets the company's security rules, and reports the result to Klaay.
 That is all it does.
 
@@ -47,10 +47,23 @@ turn that on remotely without telling your company first.
 
 Almost nothing:
 
-- A small icon in your menu bar. A green dot means all is well. A red dot
-  means you need to sign in.
+- A small icon in your menu bar or system tray. A green dot means all is
+  well. A red dot means you need to sign in. On a GNOME desktop, enable the
+  "AppIndicator Support" extension to see the icon.
 - One sign-in in your browser after you install it.
-- Nothing else. It has no window, uses almost no battery, and updates itself.
+- Nothing else. It has no window and uses almost no battery. On macOS it
+  updates itself. On Linux, install new versions when your IT team asks.
+
+## How do I install it on Linux?
+
+Pick the file for your system from the link your IT team sends:
+
+- Ubuntu or Debian: the `.deb` file.
+- Fedora or RHEL: the `.rpm` file.
+- Arch or another distribution: the `.AppImage` file. Make it executable,
+  then run it.
+
+The app registers itself to start at login and to receive the sign-in link.
 
 ## What do I need to do?
 
