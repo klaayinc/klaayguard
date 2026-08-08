@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "fallback-window",
+  "description": "The Linux fallback window needs the core APIs to invoke sign-in",
+  "windows": ["fallback"],
+  "permissions": [
+    "core:default"
+  ]
+}

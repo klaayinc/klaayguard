@@ -578,6 +578,40 @@ fn generate_device_identity() -> Result<String, String> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+/// A fallback window is needed when the tray cannot serve as the UI: the
+/// tray failed to build, or no StatusNotifier host is on the bus to show it
+/// (stock GNOME without the AppIndicator extension).
+#[cfg(any(target_os = "linux", test))]
+fn fallback_window_needed(tray_built: bool, watcher_present: bool) -> bool {
+    !tray_built || !watcher_present
+}
+
+/// Whether a StatusNotifier host listens on the session bus. Errors count
+/// as absent: when D-Bus is broken the tray cannot show either, so the
+/// window is the only UI left.
+#[cfg(target_os = "linux")]
+fn status_notifier_watcher_present() -> bool {
+    fn probe() -> zbus::Result<bool> {
+        let conn = zbus::blocking::Connection::session()?;
+        let proxy = zbus::blocking::fdo::DBusProxy::new(&conn)?;
+        let name = zbus::names::BusName::try_from("org.kde.StatusNotifierWatcher")?;
+        Ok(proxy.name_has_owner(name)?)
+    }
+    probe().unwrap_or(false)
+}
+
+/// Open the sign-in page from the fallback window.
+#[tauri::command]
+fn fallback_sign_in(app: tauri::AppHandle) {
+    open_sign_in(&app);
+}
+
+/// Open the employee hub from the fallback window.
+#[tauri::command]
+fn fallback_employee_hub(app: tauri::AppHandle) {
+    open_earthenware(&app, "/employee-hub");
+}
+
 /// Content of the Linux autostart entry.
 fn autostart_entry(exec: &str) -> String {
     format!(
@@ -1793,6 +1827,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
+        .invoke_handler(tauri::generate_handler![
+            fallback_sign_in,
+            fallback_employee_hub
+        ])
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -1959,31 +1997,71 @@ pub fn run() {
                     &version_i,
                 ],
             )?;
-            // Status-dot icons: green when signed in, red when not.
-            let (green, red) = {
-                let base = app.default_window_icon().expect("default window icon");
-                (
+            // Status-dot icons: green when signed in, red when not. A tray
+            // failure must not kill the agent: collection works without a
+            // tray, and Linux gets a fallback window below.
+            let tray_built = (|| -> Result<(), Box<dyn std::error::Error>> {
+                let base = app
+                    .default_window_icon()
+                    .ok_or("no default window icon")?;
+                let (green, red) = (
                     icon_with_dot(base, [46, 204, 113, 255]),
                     icon_with_dot(base, [231, 76, 60, 255]),
-                )
-            };
-            let tray = tauri::tray::TrayIconBuilder::new()
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "auth_action" => open_sign_in(app),
-                    "employee_hub" => open_earthenware(app, "/employee-hub"),
-                    _ => {}
-                })
-                .icon(if authed { green.clone() } else { red.clone() })
-                .tooltip("KlaayGuard")
-                .menu(&menu)
-                .build(app)?;
-            app.manage(TrayMenu {
-                item: item.clone(),
-                tray,
-                green,
-                red,
-                last_signed_in: std::sync::atomic::AtomicBool::new(authed),
-            });
+                );
+                let tray = tauri::tray::TrayIconBuilder::new()
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "auth_action" => open_sign_in(app),
+                        "employee_hub" => open_earthenware(app, "/employee-hub"),
+                        _ => {}
+                    })
+                    .icon(if authed { green.clone() } else { red.clone() })
+                    .tooltip("KlaayGuard")
+                    .menu(&menu)
+                    .build(app)?;
+                app.manage(TrayMenu {
+                    item: item.clone(),
+                    tray,
+                    green,
+                    red,
+                    last_signed_in: std::sync::atomic::AtomicBool::new(authed),
+                });
+                Ok(())
+            })();
+            if let Err(e) = &tray_built {
+                log::error!("tray build failed; continuing without tray: {}", e);
+                sentry::capture_message(&format!("tray_build_failed: {}", e), Level::Error);
+            }
+
+            // Stock GNOME shows no AppIndicator tray. When the tray cannot
+            // be the UI, open a small window so the user can still sign in.
+            #[cfg(target_os = "linux")]
+            {
+                let watcher = status_notifier_watcher_present();
+                if fallback_window_needed(tray_built.is_ok(), watcher) {
+                    log::warn!(
+                        "tray unusable (built={}, watcher={}); opening fallback window",
+                        tray_built.is_ok(),
+                        watcher
+                    );
+                    if let Err(e) = tauri::WebviewWindowBuilder::new(
+                        app,
+                        "fallback",
+                        tauri::WebviewUrl::App("fallback.html".into()),
+                    )
+                    .title("KlaayGuard")
+                    .inner_size(440.0, 340.0)
+                    .build()
+                    {
+                        log::error!("fallback window failed: {}", e);
+                        sentry::capture_message(
+                            &format!("fallback_window_failed: {}", e),
+                            Level::Error,
+                        );
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            drop(tray_built);
             // Spawn the single collect-and-send loop + the tray countdown clock.
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
@@ -2348,6 +2426,17 @@ mod happy_path_tests {
             dir,
             std::path::PathBuf::from("/Users/u/Library/Logs/com.klaay.app")
         );
+    }
+
+    #[test]
+    fn fallback_window_shown_only_when_tray_unusable() {
+        // Tray built and a StatusNotifier host answers: no window.
+        assert!(!fallback_window_needed(true, true));
+        // Tray failed to build: window.
+        assert!(fallback_window_needed(false, true));
+        // Tray built but nothing shows it (stock GNOME): window.
+        assert!(fallback_window_needed(true, false));
+        assert!(fallback_window_needed(false, false));
     }
 
     #[test]
