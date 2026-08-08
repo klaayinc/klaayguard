@@ -577,6 +577,53 @@ fn generate_device_identity() -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
+/// Content of the Linux autostart entry.
+fn autostart_entry(exec: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=KlaayGuard\n\
+         Comment=KlaayGuard security agent\n\
+         Exec={}\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-enabled=true\n",
+        exec
+    )
+}
+
+/// The executable to autostart. Inside an AppImage, current_exe points at a
+/// temporary mount that is gone after exit; the APPIMAGE variable holds the
+/// real file.
+fn autostart_exec(appimage_env: Option<&str>, current_exe: &str) -> String {
+    appimage_env
+        .filter(|s| !s.is_empty())
+        .unwrap_or(current_exe)
+        .to_string()
+}
+
+/// Location of the XDG autostart entry for this user.
+fn autostart_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config/autostart/klaayguard.desktop")
+}
+
+/// Install or refresh the autostart entry so the agent starts at login,
+/// matching the macOS LaunchAgent behavior. Idempotent.
+#[cfg(target_os = "linux")]
+fn install_autostart_entry() -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("no home directory")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let appimage = std::env::var("APPIMAGE").ok();
+    let entry = autostart_entry(&autostart_exec(appimage.as_deref(), &exe.to_string_lossy()));
+    let path = autostart_path(&home);
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(entry.as_str()) {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, entry).map_err(|e| e.to_string())
+}
+
 /// Resolve the stable device identity. The first run decides it and stores it
 /// in the keychain; every later run returns the stored value.
 async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, String> {
@@ -1787,6 +1834,17 @@ pub fn run() {
                         Level::Error,
                     );
                 }
+
+                // Start at login, like the macOS LaunchAgent. An agent that
+                // only runs when a human remembers to launch it leaves gaps
+                // the fleet dashboard cannot tell from an offline machine.
+                if let Err(e) = install_autostart_entry() {
+                    log::error!("autostart install failed: {}", e);
+                    sentry::capture_message(
+                        &format!("autostart_install_failed: {}", e),
+                        Level::Error,
+                    );
+                }
             }
 
             // Architecture mismatch: warn the user natively and do NOT start the
@@ -2286,6 +2344,39 @@ mod happy_path_tests {
         assert_eq!(
             dir,
             std::path::PathBuf::from("/Users/u/Library/Logs/com.klaay.app")
+        );
+    }
+
+    #[test]
+    fn autostart_entry_launches_the_running_executable() {
+        let entry = autostart_entry("/opt/KlaayGuard.AppImage");
+        assert!(entry.contains("Exec=/opt/KlaayGuard.AppImage"));
+        assert!(entry.contains("Type=Application"));
+        assert!(entry.contains("Name=KlaayGuard"));
+    }
+
+    #[test]
+    fn autostart_exec_prefers_the_appimage_path() {
+        // Inside an AppImage, current_exe points at the temporary mount; the
+        // APPIMAGE variable holds the real file the user keeps.
+        assert_eq!(
+            autostart_exec(
+                Some("/home/u/Apps/KlaayGuard.AppImage"),
+                "/tmp/.mount_x/usr/bin/KlaayGuard"
+            ),
+            "/home/u/Apps/KlaayGuard.AppImage"
+        );
+        assert_eq!(
+            autostart_exec(None, "/usr/bin/KlaayGuard"),
+            "/usr/bin/KlaayGuard"
+        );
+    }
+
+    #[test]
+    fn autostart_path_is_the_xdg_autostart_entry() {
+        assert_eq!(
+            autostart_path(std::path::Path::new("/home/u")),
+            std::path::PathBuf::from("/home/u/.config/autostart/klaayguard.desktop")
         );
     }
 
