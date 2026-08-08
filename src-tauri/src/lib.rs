@@ -1675,6 +1675,7 @@ pub fn run() {
         .manage(state.clone())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -1703,6 +1704,22 @@ pub fn run() {
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
                 log::info!("KlaayGuard configured as background service - tray only, hidden from dock");
+            }
+
+            // Register the klaayguard:// handler for this user at run time.
+            // Package installs also register it system-wide through the
+            // bundler's desktop entry; the AppImage has only this path, since
+            // nothing installs its desktop entry for it.
+            #[cfg(target_os = "linux")]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    log::error!("deep_link register_all failed: {}", e);
+                    sentry::capture_message(
+                        &format!("deep_link_register_failed: {}", e),
+                        Level::Error,
+                    );
+                }
             }
 
             // Architecture mismatch: warn the user natively and do NOT start the
