@@ -156,7 +156,7 @@ jobs:
       - name: Install tauri-cli
         uses: taiki-e/install-action@v2
         with:
-          tool: tauri-cli@2
+          tool: tauri-cli@2.11.4
 
       - name: Build deb
         working-directory: src-tauri
