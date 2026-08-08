@@ -87,8 +87,10 @@ the OS permissions that the agent does not request.
 
 ## 5. Installation
 
-Klaay distributes signed installers from the
+Klaay distributes installers from the
 [GitHub releases page](https://github.com/klaayinc/klaayguard/releases).
+The macOS installers are signed and notarized. The Linux packages are
+not signed yet.
 macOS installs use a `.pkg` or `.dmg` file. Linux installs use a `.deb`
 (Ubuntu, Debian), an `.rpm` (Fedora, RHEL), or an `.AppImage` (any
 distribution). A Windows build is planned but not yet available.
@@ -96,9 +98,8 @@ distribution). A Windows build is planned but not yet available.
 Platform differences on Linux:
 
 - The app does not update itself yet. Install each new version.
-- The Linux packages are not signed yet.
-- On GNOME desktops the tray icon needs the "AppIndicator Support"
-  extension.
+- On a plain GNOME desktop the tray icon needs the "AppIndicator and
+  KStatusNotifierItem Support" extension. Ubuntu includes it.
 
 ## 6. Questions
 
