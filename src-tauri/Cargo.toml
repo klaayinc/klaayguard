@@ -19,9 +19,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# default-features off drops native-tls (OpenSSL). Use rustls with the OS
+# trust store, not the compiled-in webpki roots: employee machines behind a
+# TLS-inspecting proxy (Zscaler, Netskope) trust a corporate root that only
+# the OS store holds. Keep the non-TLS defaults the agent relies on: http2,
+# charset, and macOS system-proxy detection.
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
-    "rustls-tls",
+    "rustls-tls-native-roots",
+    "charset",
+    "http2",
+    "macos-system-configuration",
 ] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
@@ -35,12 +43,16 @@ log = "0.4.27"
 dirs = "5.0"
 tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
-# default-features off: the default transport links OpenSSL. rustls keeps the
-# TLS stack in the binary current with releases instead of frozen in packages.
+# default-features off drops the OpenSSL transport. Use rustls with native
+# roots (see reqwest above). Re-add the defaults we depend on: debug-images
+# for symbolication of stripped release binaries, and release-health for
+# session tracking. Both are lost when default features go off.
 sentry = { version = "0.42.0", default-features = false, features = [
     "backtrace",
     "contexts",
     "panic",
+    "debug-images",
+    "release-health",
     "reqwest",
     "rustls",
 ] }

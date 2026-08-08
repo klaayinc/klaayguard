@@ -497,16 +497,18 @@ fn decide_device_identity(
     IdentityDecision::Generate
 }
 
-/// Directory for the early boot and panic log, given the home directory.
-/// On Linux and Windows this matches where tauri-plugin-log writes, so all
-/// logs live in one place. macOS keeps the user Logs folder.
-pub fn early_log_dir(home: &std::path::Path) -> std::path::PathBuf {
+/// Directory for the early boot and panic log. On Linux and Windows this
+/// follows `data_local` (tauri-plugin-log resolves through the same
+/// `dirs::data_local_dir()`, honoring XDG_DATA_HOME / LOCALAPPDATA). macOS
+/// keeps the user Logs folder, which is not the data-local dir.
+pub(crate) fn early_log_dir(
+    home: &std::path::Path,
+    data_local: &std::path::Path,
+) -> std::path::PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library/Logs/com.klaay.app")
-    } else if cfg!(target_os = "linux") {
-        home.join(".local/share/com.klaay.app/logs")
     } else {
-        home.join("AppData/Local/com.klaay.app/logs")
+        data_local.join("com.klaay.app/logs")
     }
 }
 
@@ -515,9 +517,10 @@ pub fn early_log_dir(home: &std::path::Path) -> std::path::PathBuf {
 pub fn append_early_log(line: &str) {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
     let msg = format!("[{}]{}\n", ts, line);
-    let log_dir = dirs::home_dir()
-        .map(|h| early_log_dir(&h))
-        .unwrap_or_else(|| std::path::PathBuf::from("./"));
+    let log_dir = match (dirs::home_dir(), dirs::data_local_dir()) {
+        (Some(h), Some(d)) => early_log_dir(&h, &d),
+        _ => std::path::PathBuf::from("./"),
+    };
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join("KlaayGuard.log");
     let _ = std::fs::OpenOptions::new()
@@ -531,22 +534,29 @@ pub fn append_early_log(line: &str) {
 /// has no notification path.
 fn notification_command(title: &str, body: &str) -> Option<(&'static str, Vec<String>)> {
     if cfg!(target_os = "macos") {
+        // Pass text through argv, so a quote or backslash in the message
+        // cannot break out of the AppleScript literal.
         Some((
             "osascript",
             vec![
                 "-e".to_string(),
-                format!(
-                    "display notification \"{}\" with title \"{}\"",
-                    body.replace('"', ""),
-                    title.replace('"', "")
-                ),
+                "on run argv".to_string(),
+                "-e".to_string(),
+                "display notification (item 1 of argv) with title (item 2 of argv)".to_string(),
+                "-e".to_string(),
+                "end run".to_string(),
+                body.to_string(),
+                title.to_string(),
             ],
         ))
     } else if cfg!(target_os = "linux") {
+        // `--` stops option parsing, so a title or body that starts with `-`
+        // is treated as text, not a notify-send flag.
         Some((
             "notify-send",
             vec![
                 "--app-name=KlaayGuard".to_string(),
+                "--".to_string(),
                 title.to_string(),
                 body.to_string(),
             ],
@@ -577,8 +587,30 @@ fn generate_device_identity() -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
+/// Quote and escape a path for the Desktop Entry `Exec` field. The entry is
+/// always double-quoted, so a path with spaces stays one argument; the
+/// reserved characters `"`, `` ` ``, `$`, `\` are backslash-escaped, and a
+/// literal `%` is doubled so it is not read as a field code.
 #[cfg(any(target_os = "linux", test))]
+fn desktop_exec_field(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Content of the Linux autostart entry.
+#[cfg(any(target_os = "linux", test))]
 fn autostart_entry(exec: &str) -> String {
     format!(
         "[Desktop Entry]\n\
@@ -588,14 +620,14 @@ fn autostart_entry(exec: &str) -> String {
          Exec={}\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
-        exec
+        desktop_exec_field(exec)
     )
 }
 
 /// The executable to autostart. Inside an AppImage, current_exe points at a
 /// temporary mount that is gone after exit; the APPIMAGE variable holds the
-#[cfg(any(target_os = "linux", test))]
 /// real file.
+#[cfg(any(target_os = "linux", test))]
 fn autostart_exec(appimage_env: Option<&str>, current_exe: &str) -> String {
     appimage_env
         .filter(|s| !s.is_empty())
@@ -603,37 +635,76 @@ fn autostart_exec(appimage_env: Option<&str>, current_exe: &str) -> String {
         .to_string()
 }
 
-#[cfg(any(target_os = "linux", test))]
 /// Location of the XDG autostart entry for this user.
+#[cfg(any(target_os = "linux", test))]
 fn autostart_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join(".config/autostart/klaayguard.desktop")
 }
 
+/// Whether the user disabled autostart. The GNOME toggle writes
+/// `X-GNOME-Autostart-enabled=false`; `Hidden=true` is the generic disable.
+/// Honor either, so a rewrite does not turn autostart back on.
+#[cfg(any(target_os = "linux", test))]
+fn autostart_is_user_disabled(contents: &str) -> bool {
+    contents.lines().any(|l| {
+        let l = l.trim().replace(' ', "").to_ascii_lowercase();
+        l == "x-gnome-autostart-enabled=false" || l == "hidden=true"
+    })
+}
+
 /// Install or refresh the autostart entry so the agent starts at login,
-/// matching the macOS LaunchAgent behavior. Idempotent.
+/// matching the macOS LaunchAgent behavior. Idempotent, honors a user
+/// disable, and writes atomically.
 #[cfg(target_os = "linux")]
 fn install_autostart_entry() -> Result<(), String> {
     let home = dirs::home_dir().ok_or("no home directory")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let appimage = std::env::var("APPIMAGE").ok();
+
+    // Trust the APPIMAGE path only if it is absolute and present; otherwise a
+    // stray value would persist an attacker-chosen Exec under our name.
+    let appimage = std::env::var("APPIMAGE").ok().filter(|p| {
+        let p = std::path::Path::new(p);
+        p.is_absolute() && p.exists()
+    });
     let entry = autostart_entry(&autostart_exec(appimage.as_deref(), &exe.to_string_lossy()));
     let path = autostart_path(&home);
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(entry.as_str()) {
-        return Ok(());
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if autostart_is_user_disabled(&existing) {
+            log::info!("autostart: user disabled the entry; leaving it");
+            return Ok(());
+        }
+        if existing == entry {
+            return Ok(());
+        }
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, entry).map_err(|e| e.to_string())
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| "autostart path has no parent".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Write to a temp file in the same dir, then rename, so a crash mid-write
+    // never leaves a truncated entry.
+    let tmp = path.with_extension("desktop.tmp");
+    std::fs::write(&tmp, &entry).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
 /// Resolve the stable device identity. The first run decides it and stores it
 /// in the keychain; every later run returns the stored value.
 async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, String> {
     // Fast path, and the rule the tests pin as IdentityDecision::Use.
-    if let Ok(Some(stored)) = keychain::load_device_identity() {
-        if !stored.is_empty() {
-            return Ok(stored);
+    match keychain::load_device_identity() {
+        Ok(Some(stored)) if !stored.is_empty() => return Ok(stored),
+        Ok(_) => {}
+        Err(e) => {
+            // A broken credential store forces re-derivation every cycle.
+            // Report it so a locked or absent Secret Service is visible.
+            log::error!("keychain: device identity load failed: {}", e);
+            sentry::capture_message(
+                &format!("keychain_identity_load_failed: {}", e),
+                Level::Error,
+            );
         }
     }
 
@@ -1790,14 +1861,8 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(state.clone())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .build(),
-        )
+        // Single-instance must init first, so a second launch exits before the
+        // other plugins spin up. Tauri documents this ordering.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Handle deep link if present in args (secondary launches)
             let st = app.state::<Arc<AppState>>().inner().clone();
@@ -1815,6 +1880,14 @@ pub fn run() {
             }
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .setup(|app| {
             // Tray-only background service: hide from dock, no window.
             #[cfg(target_os = "macos")]
@@ -2330,20 +2403,29 @@ mod happy_path_tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn early_log_dir_matches_plugin_log_dir_on_linux() {
-        // The panic hook must write where tauri-plugin-log writes, so support
-        // finds one log location — not a stray ~/Library on Linux.
-        let dir = early_log_dir(std::path::Path::new("/home/u"));
+    fn early_log_dir_follows_the_data_local_dir_on_linux() {
+        // The panic hook must write where tauri-plugin-log writes, which
+        // resolves through XDG_DATA_HOME, not a fixed ~/.local/share. A user
+        // who sets XDG_DATA_HOME must not get split logs.
+        let dir = early_log_dir(
+            std::path::Path::new("/home/u"),
+            std::path::Path::new("/data/xdg"),
+        );
         assert_eq!(
             dir,
-            std::path::PathBuf::from("/home/u/.local/share/com.klaay.app/logs")
+            std::path::PathBuf::from("/data/xdg/com.klaay.app/logs")
         );
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn early_log_dir_stays_in_library_logs_on_macos() {
-        let dir = early_log_dir(std::path::Path::new("/Users/u"));
+        // macOS logs live under ~/Library/Logs, not the data-local dir
+        // (which would be Application Support).
+        let dir = early_log_dir(
+            std::path::Path::new("/Users/u"),
+            std::path::Path::new("/Users/u/Library/Application Support"),
+        );
         assert_eq!(
             dir,
             std::path::PathBuf::from("/Users/u/Library/Logs/com.klaay.app")
@@ -2353,9 +2435,39 @@ mod happy_path_tests {
     #[test]
     fn autostart_entry_launches_the_running_executable() {
         let entry = autostart_entry("/opt/KlaayGuard.AppImage");
-        assert!(entry.contains("Exec=/opt/KlaayGuard.AppImage"));
+        assert!(entry.contains("Exec=\"/opt/KlaayGuard.AppImage\""));
         assert!(entry.contains("Type=Application"));
         assert!(entry.contains("Name=KlaayGuard"));
+    }
+
+    #[test]
+    fn autostart_exec_field_quotes_and_escapes() {
+        // A plain path is still quoted (valid, and simplest).
+        assert_eq!(desktop_exec_field("/opt/K.AppImage"), "\"/opt/K.AppImage\"");
+        // Spaces stay inside the quotes.
+        assert_eq!(
+            desktop_exec_field("/home/u/My Apps/K.AppImage"),
+            "\"/home/u/My Apps/K.AppImage\""
+        );
+        // Reserved characters are backslash-escaped inside the quotes.
+        assert_eq!(
+            desktop_exec_field("/a/$x`y\"z\\w"),
+            "\"/a/\\$x\\`y\\\"z\\\\w\""
+        );
+        // A literal percent must be doubled so it is not read as a field code.
+        assert_eq!(desktop_exec_field("/a/50%off"), "\"/a/50%%off\"");
+    }
+
+    #[test]
+    fn autostart_respects_a_user_disable() {
+        assert!(autostart_is_user_disabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=false\n"
+        ));
+        assert!(autostart_is_user_disabled("[Desktop Entry]\nHidden=true\n"));
+        assert!(!autostart_is_user_disabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=true\n"
+        ));
+        assert!(!autostart_is_user_disabled("[Desktop Entry]\n"));
     }
 
     #[test]
