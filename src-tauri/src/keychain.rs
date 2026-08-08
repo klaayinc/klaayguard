@@ -5,8 +5,7 @@ const KEYCHAIN_ACCOUNT: &str = "auth_token";
 const DEVICE_ID_ACCOUNT: &str = "device_identity";
 
 fn entry_for(account: &str) -> Result<Entry, String> {
-    Entry::new(KEYCHAIN_SERVICE, account)
-        .map_err(|e| format!("keychain new entry error: {}", e))
+    Entry::new(KEYCHAIN_SERVICE, account).map_err(|e| format!("keychain new entry error: {}", e))
 }
 
 pub fn save_token(token: &str) -> Result<(), String> {

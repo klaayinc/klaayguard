@@ -458,8 +458,7 @@ enum IdentityDecision {
 /// A valid machine id is 32 hex characters, with optional whitespace around it.
 fn normalize_machine_id(raw: &str) -> Option<String> {
     let t = raw.trim();
-    (t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit()))
-        .then(|| t.to_ascii_lowercase())
+    (t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t.to_ascii_lowercase())
 }
 
 /// App-scoped hash of the systemd machine id. The systemd manual says to not
@@ -551,10 +550,7 @@ async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, 
         // Report but still return the identity: one collection with an
         // unstored identity beats none.
         log::error!("identity: keychain save failed: {}", e);
-        sentry::capture_message(
-            &format!("device_identity_save_failed: {}", e),
-            Level::Error,
-        );
+        sentry::capture_message(&format!("device_identity_save_failed: {}", e), Level::Error);
     }
     log::info!("identity: adopted new device identity");
     Ok(identity)
@@ -2125,18 +2121,29 @@ mod happy_path_tests {
         );
         assert_eq!(normalize_machine_id(""), None);
         assert_eq!(normalize_machine_id("uninitialized\n"), None);
-        assert_eq!(normalize_machine_id("zz3262c33af9461e9ed5ce8bed32dcbz"), None);
+        assert_eq!(
+            normalize_machine_id("zz3262c33af9461e9ed5ce8bed32dcbz"),
+            None
+        );
     }
 
     #[test]
     fn identity_prefers_stored_value() {
-        let d = decide_device_identity(Some("stored-id"), Some("G97L3X4KYV"), Some("0123456789abcdef0123456789abcdef"));
+        let d = decide_device_identity(
+            Some("stored-id"),
+            Some("G97L3X4KYV"),
+            Some("0123456789abcdef0123456789abcdef"),
+        );
         assert!(matches!(d, IdentityDecision::Use(v) if v == "stored-id"));
     }
 
     #[test]
     fn identity_adopts_hardware_serial_when_nothing_stored() {
-        let d = decide_device_identity(None, Some("G97L3X4KYV"), Some("0123456789abcdef0123456789abcdef"));
+        let d = decide_device_identity(
+            None,
+            Some("G97L3X4KYV"),
+            Some("0123456789abcdef0123456789abcdef"),
+        );
         assert!(matches!(d, IdentityDecision::Adopt(v) if v == "G97L3X4KYV"));
     }
 
