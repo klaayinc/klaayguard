@@ -51,8 +51,9 @@ Key properties:
 - **Retries:** on `429`, `5xx`, or network errors the agent retries after
   60 s, then 120 s. A `401`/`403` clears the in-memory token and prompts
   sign-in instead.
-- **osquery is bundled.** `osqueryi` ships as a Tauri sidecar. The agent never
-  installs osquery on the machine and needs no admin rights to run.
+- **osquery is bundled.** It ships as a Tauri sidecar named
+  `klaayguard-osqueryi`, so it never collides with a system osquery install.
+  The agent needs no admin rights to run.
 - **Tray only.** The menu shows sign-in state (green/red dot), a countdown to
   the next fetch, and an Employee Hub link. There is no Quit and no Sign-out
   item, by design.
@@ -242,7 +243,7 @@ so Sentry is off in production — see the note in
 
 - App log (macOS): `~/Library/Logs/com.klaay.app/KlaayGuard.log`
 - App log (Linux): `~/.local/share/com.klaay.app/logs/KlaayGuard.log`
-- launchd stdout/stderr: `~/Library/Logs/KlaayGuard/klaayguard.log` and
+- launchd stdout/stderr (macOS): `~/Library/Logs/KlaayGuard/klaayguard.log` and
   `klaayguard.error.log`
 
 ## Contributing
