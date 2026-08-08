@@ -61,8 +61,12 @@ Pick the file for your system from the link your IT team sends:
 
 - Ubuntu or Debian: the `.deb` file.
 - Fedora or RHEL: the `.rpm` file.
-- Arch or another distribution: the `.AppImage` file. Make it executable,
-  then run it.
+- Arch or another distribution: the `.AppImage` file.
+
+To run the `.AppImage` file, do these two steps:
+
+1. Make the file executable.
+2. Run the file.
 
 Open the app once after you install it. On that first run the app
 registers itself to start at login and to receive the sign-in link.
