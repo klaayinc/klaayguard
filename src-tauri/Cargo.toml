@@ -1,8 +1,8 @@
 [package]
 name = "KlaayGuard"
 version = "0.1.12"
-description = "A Tauri App"
-authors = ["you"]
+description = "KlaayGuard security agent. Reports device posture to Klaay."
+authors = ["Klaay <support@klaay.com>"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -19,7 +19,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
@@ -32,7 +35,15 @@ log = "0.4.27"
 dirs = "5.0"
 tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
-sentry = "0.42.0"
+# default-features off: the default transport links OpenSSL. rustls keeps the
+# TLS stack in the binary current with releases instead of frozen in packages.
+sentry = { version = "0.42.0", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "reqwest",
+    "rustls",
+] }
 keyring = "2"
 semver = "1.0"
 sha2 = "0.10"

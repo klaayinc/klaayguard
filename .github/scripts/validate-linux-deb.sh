@@ -67,6 +67,32 @@ fi
 grep -q '^Depends: ..*' control/control && pass "Depends declared" \
   || fail "control file declares no Depends"
 
+# The tray library is dlopen'd, not linked, so ldd cannot police it. The
+# package must pull it in, and must accept the ayatana successor that
+# Ubuntu 24.04 ships instead of libappindicator3-1.
+grep -q 'libayatana-appindicator3-1' control/control \
+  && pass "Depends covers libayatana-appindicator" \
+  || fail "Depends does not cover libayatana-appindicator3-1; the tray (the only UI) dies on Ubuntu 24.04"
+
+# Customer-visible metadata must not be template placeholders.
+grep -q '^Maintainer: you$' control/control \
+  && fail "Maintainer is the template placeholder 'you'" \
+  || pass "Maintainer is set"
+grep -q '^Description: A Tauri App$' control/control \
+  && fail "Description is the template placeholder 'A Tauri App'" \
+  || pass "Description is set"
+grep -qE '^Categories=.+' "$DESKTOP" \
+  && pass "desktop Categories set" \
+  || fail "desktop entry has empty Categories"
+
+# The agent must use rustls only. A bundled or assumed OpenSSL is a frozen
+# TLS stack in the AppImage and an undeclared dependency in the deb.
+if objdump -p data/usr/bin/KlaayGuard | grep -q 'NEEDED.*libssl'; then
+  fail "binary links libssl; TLS must come from rustls"
+else
+  pass "no OpenSSL link"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2
   exit 1
