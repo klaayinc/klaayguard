@@ -1681,14 +1681,8 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(state.clone())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(
-            tauri_plugin_log::Builder::new()
-                .level(log::LevelFilter::Info)
-                .build(),
-        )
+        // Single-instance must init first, so a second launch exits before the
+        // other plugins spin up. Tauri documents this ordering.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Handle deep link if present in args (secondary launches)
             let st = app.state::<Arc<AppState>>().inner().clone();
@@ -1706,6 +1700,14 @@ pub fn run() {
             }
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
         .setup(|app| {
             // Tray-only background service: hide from dock, no window.
             #[cfg(target_os = "macos")]
