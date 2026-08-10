@@ -98,7 +98,7 @@ jobs:
           KLAAY_ENV: ${{ matrix.build }}
           VITE_API_BASE_URL: ${{ matrix.api_url }}
           VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
-          VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
