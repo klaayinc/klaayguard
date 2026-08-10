@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 fn main() {
     // Re-run this script when any env that feeds the compiled-in defaults changes.
     // Without these, cargo caches build.rs output and a later build with a different

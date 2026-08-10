@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! KlaayGuard - Security Monitoring Application
 //!
 //! This application provides continuous security monitoring on edge devices.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use keyring::Entry;
 
 const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
