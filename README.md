@@ -4,8 +4,13 @@
 
 **KlaayGuard** is a tray-only desktop agent, written in Rust on Tauri 2. It
 collects security-posture telemetry with a bundled copy of
-[osquery](https://osquery.io) and reports it to the Klaay API every 15 minutes.
-It has no window and no web frontend.
+[osquery](https://osquery.io) and reports it to a server every 15 minutes. It
+has no window and no web frontend.
+
+By default the agent talks to Klaay's hosted service. You can point it at your
+own server instead. See [Bring your own server](#bring-your-own-server).
+
+KlaayGuard is free software under GPL-3.0-or-later. See [License](#license).
 
 Documentation:
 
@@ -21,11 +26,11 @@ sequenceDiagram
     autonumber
     participant Agent as KlaayGuard Agent
     participant Browser as Default Browser
-    participant API as Klaay API
+    participant API as Server API
     participant Osquery as osquery (bundled sidecar)
 
     %% Sign-in (first launch or after 401/403)
-    Agent->>Browser: Open {earthenware}/login?app=klaayguard&state=<nonce>
+    Agent->>Browser: Open {web-app}/login?app=klaayguard&state=<nonce>
     Browser-->>Agent: klaayguard://…?token=<jwt>&state=<nonce>
     Agent->>API: GET /me (validate token)
     API-->>Agent: 200 OK
@@ -89,7 +94,7 @@ source ~/.cargo/env
 # Install the Tauri CLI (Rust, not npm)
 cargo install tauri-cli --version "^2"
 
-# Ruby/rake (for vendoring the osquery sidecars) — preinstalled on macOS
+# Ruby and rake, to fetch the osquery sidecars — preinstalled on macOS
 ```
 
 ### Setup and build
@@ -98,8 +103,9 @@ cargo install tauri-cli --version "^2"
 git clone https://github.com/klaayinc/klaayguard.git
 cd klaayguard
 
-# Vendor the osquery sidecars (once). Downloads osquery 5.18.1 from the
-# official GitHub release and verifies SHA-256 digests.
+# Fetch the osquery sidecar for your platform (once). Downloads osquery
+# 5.18.1 from the official GitHub release and verifies its SHA-256.
+# On Windows, run ./.github/scripts/fetch-osquery-windows.ps1 instead.
 rake
 
 # Default environment is production
@@ -115,7 +121,7 @@ cargo tauri build --target x86_64-apple-darwin       # macOS Intel
 cargo tauri build --target x86_64-unknown-linux-gnu  # Linux
 ```
 
-Run against a local stack (kiln on :3000, earthenware on :5173):
+Run against your own server (API on :3000, web app on :5173):
 
 ```bash
 KLAAY_ENV=development VITE_API_BASE_URL=http://localhost:3000 VITE_EARTHENWARE_URL=http://localhost:5173 \
@@ -167,6 +173,23 @@ the matching URLs in as compile-time defaults:
 
 At runtime, an environment variable overrides the baked-in default. The final
 fallback is production.
+
+### Bring your own server
+
+The default URLs point at Klaay's hosted service. To run the agent against your
+own backend, override the two URLs at build time or at run time:
+
+- `VITE_API_BASE_URL` — your API base URL.
+- `VITE_EARTHENWARE_URL` — your web app URL, used for sign-in and the Employee
+  Hub link.
+
+Your server must implement the calls in [API endpoints](#api-endpoints). The
+agent sends a Bearer token that it receives from a `klaayguard://` deep link
+after sign-in. The server controls the query set, so you define exactly what the
+agent collects. See the [Privacy Datasheet](docs/PRIVACY_DATASHEET.md).
+
+You do not need Klaay credentials or certificates to build the agent or to run
+it against your own server.
 
 ### Environment variables
 
@@ -248,6 +271,25 @@ so Sentry is off in production — see the note in
 
 ## Contributing
 
-1. Create a feature branch.
-2. Make your changes and test on the target platforms.
-3. Open a pull request against `main`.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first. In short:
+
+1. Sign the [Contributor License Agreement](CLA.md). The bot asks on your first
+   pull request.
+2. Create a feature branch.
+3. Make your changes. Run `cargo test`, `cargo fmt --all --check`, and
+   `cargo clippy --all-targets -- -D warnings`.
+4. Add a `// SPDX-License-Identifier: GPL-3.0-or-later` header to each new Rust
+   file.
+5. Open a pull request against `main`.
+
+Report a security problem in private. Follow [SECURITY.md](SECURITY.md).
+
+## License
+
+KlaayGuard is free software under GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+- [NOTICE](NOTICE) — the bundled osquery binary and other third-party software.
+- [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) — the license of every Rust
+  dependency.
+- [TRADEMARK.md](TRADEMARK.md) — the GPL covers the code, not the Klaay names or
+  logo.
