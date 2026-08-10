@@ -1,0 +1,34 @@
+# cargo-deny configuration.
+#
+# Purpose: keep every dependency's license compatible with the project's
+# GPL-3.0-or-later license. A dependency under a GPL-incompatible license then
+# fails CI instead of silently shipping.
+#
+# Run locally: cargo deny check licenses
+
+[licenses]
+# The complete set the current graph uses (all permissive or weak-copyleft,
+# all one-way compatible with GPL-3.0-or-later), plus the project's own license.
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MPL-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    # `ring` combines an ISC-style license for its Rust code with the
+    # OpenSSL/BoringSSL license for the vendored crypto; both are permissive
+    # and GPL-compatible.
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Informational only here; the license gate is the point of this file.
+multiple-versions = "allow"
