@@ -26,6 +26,7 @@ allow = [
     # OpenSSL/BoringSSL license for the vendored crypto; both are permissive
     # and GPL-compatible.
     "OpenSSL",
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
