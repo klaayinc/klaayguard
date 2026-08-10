@@ -1,11 +1,9 @@
-# KlaayGuard Individual Contributor License Agreement ("Agreement") v1.0-draft
+# KlaayGuard Individual Contributor License Agreement ("Agreement") v1.0
 
-> **Draft — one item needs a lawyer's confirmation.** This text adapts the Apache
-> Software Foundation Individual Contributor License Agreement V2.2 for Klaay ApS.
-> The counterparty, the entity, and the dual-license intent are set. The
-> governing-law and data-protection clause below (§ "Governing law and personal
-> data") is drafted and needs Danish-law/GDPR review before the project accepts
-> signatures.
+> This Agreement adapts the Apache Software Foundation Individual Contributor
+> License Agreement V2.2 for Klaay ApS. The intellectual-property terms are the
+> Apache text, unchanged. Klaay ApS is the counterparty. The data handling in the
+> final section follows Klaay's privacy policy.
 
 Thank you for your interest in KlaayGuard. To clarify the intellectual property
 license granted with Contributions from any person or entity, Klaay ApS (the
@@ -117,11 +115,8 @@ dispute that arises from it.
 
 Klaay ApS is the data controller for the personal data in this Agreement. To
 record and manage your agreement, Klaay ApS stores your name, your email address,
-and your GitHub username. The lawful basis is the legitimate interest of Klaay
-ApS in establishing the license to Your Contributions. Klaay ApS keeps this data
-for as long as the Work uses Your Contributions. To ask about your data, contact
-legal@klaay.com.
-
-> **Lawyer to confirm (the only open item):** the Danish governing-law and
-> jurisdiction choice; the GDPR lawful basis, the data listed, and the retention
-> period above; and whether Klaay's privacy policy must be linked here.
+and your GitHub username, on the lawful basis of its legitimate interest in
+establishing the license to Your Contributions. Klaay ApS keeps this record for
+as long as the Work uses Your Contributions. Klaay's privacy policy at
+https://klaay.com/privacy-policy describes your rights and how to exercise them.
+For data questions, contact privacy@klaay.com.
