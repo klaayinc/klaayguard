@@ -589,6 +589,109 @@ fn generate_device_identity() -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
+/// Quote and escape a path for the Desktop Entry `Exec` field. The entry is
+/// always double-quoted, so a path with spaces stays one argument; the
+/// reserved characters `"`, `` ` ``, `$`, `\` are backslash-escaped, and a
+/// literal `%` is doubled so it is not read as a field code.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_exec_field(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Content of the Linux autostart entry.
+#[cfg(any(target_os = "linux", test))]
+fn autostart_entry(exec: &str) -> String {
+    format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=KlaayGuard\n\
+         Comment=KlaayGuard security agent\n\
+         Exec={}\n\
+         Terminal=false\n\
+         X-GNOME-Autostart-enabled=true\n",
+        desktop_exec_field(exec)
+    )
+}
+
+/// The executable to autostart. Inside an AppImage, current_exe points at a
+/// temporary mount that is gone after exit; the APPIMAGE variable holds the
+/// real file.
+#[cfg(any(target_os = "linux", test))]
+fn autostart_exec(appimage_env: Option<&str>, current_exe: &str) -> String {
+    appimage_env
+        .filter(|s| !s.is_empty())
+        .unwrap_or(current_exe)
+        .to_string()
+}
+
+/// Location of the XDG autostart entry for this user.
+#[cfg(any(target_os = "linux", test))]
+fn autostart_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config/autostart/klaayguard.desktop")
+}
+
+/// Whether the user disabled autostart. The GNOME toggle writes
+/// `X-GNOME-Autostart-enabled=false`; `Hidden=true` is the generic disable.
+/// Honor either, so a rewrite does not turn autostart back on.
+#[cfg(any(target_os = "linux", test))]
+fn autostart_is_user_disabled(contents: &str) -> bool {
+    contents.lines().any(|l| {
+        let l = l.trim().replace(' ', "").to_ascii_lowercase();
+        l == "x-gnome-autostart-enabled=false" || l == "hidden=true"
+    })
+}
+
+/// Install or refresh the autostart entry so the agent starts at login,
+/// matching the macOS LaunchAgent behavior. Idempotent, honors a user
+/// disable, and writes atomically.
+#[cfg(target_os = "linux")]
+fn install_autostart_entry() -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("no home directory")?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+
+    // Trust the APPIMAGE path only if it is absolute and present; otherwise a
+    // stray value would persist an attacker-chosen Exec under our name.
+    let appimage = std::env::var("APPIMAGE").ok().filter(|p| {
+        let p = std::path::Path::new(p);
+        p.is_absolute() && p.exists()
+    });
+    let entry = autostart_entry(&autostart_exec(appimage.as_deref(), &exe.to_string_lossy()));
+    let path = autostart_path(&home);
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if autostart_is_user_disabled(&existing) {
+            log::info!("autostart: user disabled the entry; leaving it");
+            return Ok(());
+        }
+        if existing == entry {
+            return Ok(());
+        }
+    }
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| "autostart path has no parent".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    // Write to a temp file in the same dir, then rename, so a crash mid-write
+    // never leaves a truncated entry.
+    let tmp = path.with_extension("desktop.tmp");
+    std::fs::write(&tmp, &entry).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
 /// Resolve the stable device identity. The first run decides it and stores it
 /// in the keychain; every later run returns the stored value.
 async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, String> {
@@ -1809,6 +1912,17 @@ pub fn run() {
                         Level::Error,
                     );
                 }
+
+                // Start at login, like the macOS LaunchAgent. An agent that
+                // only runs when a human remembers to launch it leaves gaps
+                // the fleet dashboard cannot tell from an offline machine.
+                if let Err(e) = install_autostart_entry() {
+                    log::error!("autostart install failed: {}", e);
+                    sentry::capture_message(
+                        &format!("autostart_install_failed: {}", e),
+                        Level::Error,
+                    );
+                }
             }
 
             // Architecture mismatch: warn the user natively and do NOT start the
@@ -2317,6 +2431,69 @@ mod happy_path_tests {
         assert_eq!(
             dir,
             std::path::PathBuf::from("/Users/u/Library/Logs/com.klaay.app")
+        );
+    }
+
+    #[test]
+    fn autostart_entry_launches_the_running_executable() {
+        let entry = autostart_entry("/opt/KlaayGuard.AppImage");
+        assert!(entry.contains("Exec=\"/opt/KlaayGuard.AppImage\""));
+        assert!(entry.contains("Type=Application"));
+        assert!(entry.contains("Name=KlaayGuard"));
+    }
+
+    #[test]
+    fn autostart_exec_field_quotes_and_escapes() {
+        // A plain path is still quoted (valid, and simplest).
+        assert_eq!(desktop_exec_field("/opt/K.AppImage"), "\"/opt/K.AppImage\"");
+        // Spaces stay inside the quotes.
+        assert_eq!(
+            desktop_exec_field("/home/u/My Apps/K.AppImage"),
+            "\"/home/u/My Apps/K.AppImage\""
+        );
+        // Reserved characters are backslash-escaped inside the quotes.
+        assert_eq!(
+            desktop_exec_field("/a/$x`y\"z\\w"),
+            "\"/a/\\$x\\`y\\\"z\\\\w\""
+        );
+        // A literal percent must be doubled so it is not read as a field code.
+        assert_eq!(desktop_exec_field("/a/50%off"), "\"/a/50%%off\"");
+    }
+
+    #[test]
+    fn autostart_respects_a_user_disable() {
+        assert!(autostart_is_user_disabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=false\n"
+        ));
+        assert!(autostart_is_user_disabled("[Desktop Entry]\nHidden=true\n"));
+        assert!(!autostart_is_user_disabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=true\n"
+        ));
+        assert!(!autostart_is_user_disabled("[Desktop Entry]\n"));
+    }
+
+    #[test]
+    fn autostart_exec_prefers_the_appimage_path() {
+        // Inside an AppImage, current_exe points at the temporary mount; the
+        // APPIMAGE variable holds the real file the user keeps.
+        assert_eq!(
+            autostart_exec(
+                Some("/home/u/Apps/KlaayGuard.AppImage"),
+                "/tmp/.mount_x/usr/bin/KlaayGuard"
+            ),
+            "/home/u/Apps/KlaayGuard.AppImage"
+        );
+        assert_eq!(
+            autostart_exec(None, "/usr/bin/KlaayGuard"),
+            "/usr/bin/KlaayGuard"
+        );
+    }
+
+    #[test]
+    fn autostart_path_is_the_xdg_autostart_entry() {
+        assert_eq!(
+            autostart_path(std::path::Path::new("/home/u")),
+            std::path::PathBuf::from("/home/u/.config/autostart/klaayguard.desktop")
         );
     }
 
