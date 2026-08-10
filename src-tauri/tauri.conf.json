@@ -37,14 +37,21 @@
     },
     "linux": {
       "deb": {
-        "files": {
-          "share/applications/klaayguard.desktop": "./linux/klaayguard.desktop"
-        }
+        "desktopTemplate": "./linux/klaayguard.desktop.hbs",
+        "postInstallScript": "./linux/postinst.sh",
+        "postRemoveScript": "./linux/postrm.sh"
       },
-      "appimage": {
-        "files": {
-          "share/applications/klaayguard.desktop": "./linux/klaayguard.desktop"
-        }
+      "rpm": {
+        "desktopTemplate": "./linux/klaayguard.desktop.hbs",
+        "postInstallScript": "./linux/postinst.sh",
+        "postRemoveScript": "./linux/postrm.sh"
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["klaayguard"]
       }
     }
   }
