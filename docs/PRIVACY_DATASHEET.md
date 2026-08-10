@@ -6,13 +6,15 @@
 
 ## 1. Overview
 
-KlaayGuard is a lightweight desktop agent that collects a narrow set of security-posture telemetry from a workstation and reports it to the Klaay platform every 15 minutes. It is built on [osquery](https://osquery.io), an open-source endpoint instrumentation tool originally developed at Facebook and now widely used in enterprise security programs.
+KlaayGuard is a lightweight desktop agent that collects a narrow set of security-posture telemetry from a workstation and reports it to a server every 15 minutes. By default that server is the Klaay platform. KlaayGuard is built on [osquery](https://osquery.io), an open-source endpoint instrumentation tool originally developed at Facebook and now widely used in enterprise security programs.
 
-KlaayGuard's purpose is limited to verifying that workstations meeting Klaay-managed controls (e.g., disk encryption enabled, screen lock configured, OS patch level current) actually meet them. It is not an EDR/DLP product, and it is not designed for general endpoint surveillance.
+KlaayGuard's purpose is limited to verifying that workstations that must meet controls (disk encryption enabled, screen lock configured, OS patch level current) actually meet them. It is not an EDR or DLP product, and it is not designed for general endpoint surveillance.
 
-## 2. Data Collected and Transmitted to Klaay
+The server, not the agent, defines the query set. This datasheet describes the set that Klaay's hosted service requests. An operator that runs its own server defines its own set, bounded by the same safety gate. See §9.
 
-The agent runs only the queries the Klaay server instructs it to. The current production query set is the complete list below. Any change to this set requires a server-side configuration change and would be communicated to customers in advance.
+## 2. Data Collected and Transmitted to the Server
+
+The agent runs only the queries the server instructs it to. The set below is the query set that Klaay's hosted service requests in production. Any change to this set requires a server-side configuration change and Klaay tells customers in advance.
 
 | Query | Fields returned | Purpose | Control mapping |
 |---|---|---|---|
@@ -43,7 +45,7 @@ KlaayGuard does **not** collect any of the following:
 - Logged-in user history or login session records
 - Email, chat, or any application content
 
-Several of these are available as osquery tables, and KlaayGuard's source repository contains them as commented-out entries in the server config to document explicitly that they are not in use. They cannot be enabled silently — enabling any of them is a server-side configuration change that the Klaay team would communicate to the customer in advance.
+Several of these are available as osquery tables, but the query set does not include them. They cannot be enabled silently. The server must request a query, and the agent's read-only gate (§9) still applies to every request. Klaay tells customers in advance of any change to its hosted query set.
 
 ## 4. OS Permissions Required
 
@@ -73,7 +75,7 @@ The agent runs as the logged-in user, not as root/Administrator, and therefore c
 
 ## 6. Network Transmission
 
-- All transmission is over **HTTPS** to `https://api.klaay.com`.
+- All transmission is over **HTTPS** to the configured server. By default this is `https://api.klaay.com`.
 - Authentication is via short-lived JWT bearer tokens; the agent's auth token is stored in the operating system's secure credential store (macOS Keychain, Windows Credential Manager, or libsecret on Linux).
 - Sign-in is performed once at first launch in the user's default browser at `https://app.klaay.com`; the browser returns a token to the agent through the `klaayguard://` URL scheme.
 - The agent uploads collected rows in batches every **15 minutes**. There is no real-time streaming and no peer-to-peer or third-party data flow.
@@ -94,7 +96,9 @@ Customers preferring stricter isolation may install KlaayGuard inside a dedicate
 
 ## 9. Source and Verification
 
-The data-collection scope described above is defined in the server-side controller `app/controllers/klaayguard/config_controller.rb` in the Klaay platform. Customers under NDA may request a code-level walkthrough or attestation.
+The server defines the query set. The agent enforces one hard limit that no server can cross: it runs a query only if it is a single read-only statement. You can read this gate in the agent source at [`src-tauri/src/lib.rs`](../src-tauri/src/lib.rs) (`is_read_only_query`). The gate accepts one plain `SELECT` or one `WITH … ` common table expression, and refuses stacked statements and every non-query verb.
+
+The query set in §2 is the set Klaay's hosted service requests. Klaay customers under NDA may request a code-level walkthrough or attestation. Because the agent is open source, anyone can verify the safety gate directly.
 
 ## 10. Contact
 
