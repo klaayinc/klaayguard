@@ -1,5 +1,10 @@
 # KlaayGuard — guide for employees
 
+> **This is a sample.** It describes KlaayGuard as Klaay deploys it against
+> Klaay's hosted service. KlaayGuard is free software. If you run your own
+> server, copy this page and change the names and the sign-in details to match
+> your deployment.
+
 You were asked to install KlaayGuard on your computer. This page tells you what
 it is, what it can see, and what it cannot see.
 
