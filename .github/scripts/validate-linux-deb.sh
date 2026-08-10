@@ -27,8 +27,26 @@ DESKTOP="data/usr/share/applications/KlaayGuard.desktop"
 # The app binary and the osquery sidecar must be present.
 test -f data/usr/bin/KlaayGuard && pass "binary /usr/bin/KlaayGuard" \
   || fail "binary /usr/bin/KlaayGuard is missing"
-test -f data/usr/bin/osqueryi && pass "sidecar /usr/bin/osqueryi" \
-  || fail "sidecar /usr/bin/osqueryi is missing"
+# The sidecar must NOT sit at /usr/bin/osqueryi: the official osquery
+# package owns that path, and dpkg aborts the install on the collision.
+test -f data/usr/bin/klaayguard-osqueryi && pass "sidecar /usr/bin/klaayguard-osqueryi" \
+  || fail "sidecar /usr/bin/klaayguard-osqueryi is missing"
+if test -f data/usr/bin/osqueryi; then
+  fail "sidecar occupies /usr/bin/osqueryi, which the osquery package owns"
+else
+  pass "no collision with the osquery package"
+fi
+
+# The Linux sidecar must be stripped; debug info is ~180 MB of dead weight
+# in every package. Requires the `file` tool — fail loudly if it is absent
+# rather than pass vacuously.
+if ! command -v file >/dev/null; then
+  fail "the 'file' tool is missing; cannot check the sidecar is stripped"
+elif file data/usr/bin/klaayguard-osqueryi | grep -q "not stripped"; then
+  fail "sidecar ships unstripped with debug info"
+else
+  pass "sidecar is stripped"
+fi
 
 # The desktop entry must exist, be valid, and register the auth scheme.
 if test -f "$DESKTOP"; then

@@ -55,7 +55,7 @@ jobs:
           set -euo pipefail
           echo "Listing vendor sidecars:"
           ls -l src-tauri/vendor || true
-          test -f src-tauri/vendor/osqueryi-x86_64-unknown-linux-gnu || (echo "Missing Linux x86_64 sidecar" && exit 1)
+          test -f src-tauri/vendor/klaayguard-osqueryi-x86_64-unknown-linux-gnu || (echo "Missing Linux x86_64 sidecar" && exit 1)
 
       - name: Set bundle version from release
         run: |

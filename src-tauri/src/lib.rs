@@ -302,8 +302,8 @@ async fn execute_sql_batch(
     for (logical_id, sql) in queries {
         let cmd = app
             .shell()
-            .sidecar("osqueryi")
-            .map_err(|e| format!("osqueryi sidecar unavailable: {}", e))?
+            .sidecar("klaayguard-osqueryi")
+            .map_err(|e| format!("klaayguard-osqueryi sidecar unavailable: {}", e))?
             .args(["--json", sql.as_str()]);
 
         // osquery failing to spawn at all is a systemic problem — surface it.

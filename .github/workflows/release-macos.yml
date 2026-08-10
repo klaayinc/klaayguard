@@ -61,8 +61,8 @@ jobs:
           set -euo pipefail
           echo "Listing vendor sidecars:"
           ls -l src-tauri/vendor || true
-          test -f src-tauri/vendor/osqueryi-aarch64-apple-darwin || (echo "Missing macOS arm64 sidecar" && exit 1)
-          test -f src-tauri/vendor/osqueryi-x86_64-apple-darwin || (echo "Missing macOS x64 sidecar" && exit 1)
+          test -f src-tauri/vendor/klaayguard-osqueryi-aarch64-apple-darwin || (echo "Missing macOS arm64 sidecar" && exit 1)
+          test -f src-tauri/vendor/klaayguard-osqueryi-x86_64-apple-darwin || (echo "Missing macOS x64 sidecar" && exit 1)
 
       - name: Set bundle version from release
         run: |
