@@ -1,18 +1,20 @@
 # KlaayGuard Individual Contributor License Agreement ("Agreement") v1.0-draft
 
-> **Draft for legal review.** This text adapts the Apache Software Foundation
-> Individual Contributor License Agreement V2.2 for Klaay. Every field marked
-> `[LEGAL: ...]` needs Klaay legal to confirm or complete it before the project
-> accepts it. Do not treat this draft as final.
+> **Draft — one item needs a lawyer's confirmation.** This text adapts the Apache
+> Software Foundation Individual Contributor License Agreement V2.2 for Klaay ApS.
+> The counterparty, the entity, and the dual-license intent are set. The
+> governing-law and data-protection clause below (§ "Governing law and personal
+> data") is drafted and needs Danish-law/GDPR review before the project accepts
+> signatures.
 
 Thank you for your interest in KlaayGuard. To clarify the intellectual property
-license granted with Contributions from any person or entity, Klaay
-[LEGAL: confirm the exact legal entity name, for example "Klaay, Inc."] (the
-"Company") must have on file a signed Contributor License Agreement ("CLA") from
-each Contributor, indicating agreement with the license terms below. This
-agreement is for your protection as a Contributor as well as the protection of
-the Company and the users of the Work. It does not change your rights to use
-your own Contributions for any other purpose.
+license granted with Contributions from any person or entity, Klaay ApS (the
+"Company"), a company registered in Denmark, must have on file a signed
+Contributor License Agreement ("CLA") from each Contributor, indicating agreement
+with the license terms below. This agreement is for your protection as a
+Contributor as well as the protection of the Company and the users of the Work.
+It does not change your rights to use your own Contributions for any other
+purpose.
 
 You do not email this Agreement. When you open your first pull request, the CLA
 Assistant bot posts a link and records your agreement against your GitHub
@@ -56,10 +58,9 @@ Contributions.
    Contributions and such derivative works.
 
    > This grant lets the Company distribute Your Contributions under the
-   > project's GPL-3.0-or-later license and under other license terms. Klaay
+   > project's GPL-3.0-or-later license and under other license terms. Klaay ApS
    > uses this right to keep the option of a commercial or dual license of the
-   > combined Work. [LEGAL: confirm this dual-license intent is stated as Klaay
-   > wants it.]
+   > combined Work.
 
 3. Grant of Patent License. Subject to the terms and conditions of this
    Agreement, You hereby grant to the Company and to recipients of software
@@ -108,6 +109,19 @@ Contributions.
 8. You agree to notify the Company of any facts or circumstances of which you
    become aware that would make these representations inaccurate in any respect.
 
-[LEGAL: add the governing-law clause and any data-privacy notice Klaay requires.
-The Apache original points to a privacy policy for the personal data it collects;
-Klaay must supply its own.]
+## Governing law and personal data
+
+This Agreement is governed by the laws of Denmark, without regard to its
+conflict-of-law rules. The Danish courts have exclusive jurisdiction over any
+dispute that arises from it.
+
+Klaay ApS is the data controller for the personal data in this Agreement. To
+record and manage your agreement, Klaay ApS stores your name, your email address,
+and your GitHub username. The lawful basis is the legitimate interest of Klaay
+ApS in establishing the license to Your Contributions. Klaay ApS keeps this data
+for as long as the Work uses Your Contributions. To ask about your data, contact
+legal@klaay.com.
+
+> **Lawyer to confirm (the only open item):** the Danish governing-law and
+> jurisdiction choice; the GDPR lawful basis, the data listed, and the retention
+> period above; and whether Klaay's privacy policy must be linked here.

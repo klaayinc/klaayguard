@@ -5,9 +5,8 @@ the logos are not part of that license.
 
 ## Reserved marks
 
-"Klaay", "KlaayGuard", and the Klaay logo are trademarks of Klaay
-[LEGAL: confirm the exact legal entity name and any registration numbers]. The
-GPL grants you rights to the code. It grants you no rights to these marks.
+"Klaay", "KlaayGuard", and the Klaay logo are trademarks of Klaay ApS. The GPL
+grants you rights to the code. It grants you no rights to these marks.
 
 ## What you may do
 
