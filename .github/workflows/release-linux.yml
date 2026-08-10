@@ -70,7 +70,7 @@ jobs:
           VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
           VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
         run: |
-          cargo tauri build --bundles deb rpm
+          cargo tauri build --bundles deb rpm appimage
 
       - name: Rename and upload artifacts (Linux x86_64)
         env:

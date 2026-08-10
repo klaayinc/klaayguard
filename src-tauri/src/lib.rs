@@ -430,12 +430,12 @@ struct JsonApiPayload {
     jsonapi: Option<serde_json::Value>,
 }
 
-/// Pull a stable device identifier from osquery `system_info` rows. osquery has no
-/// `hardware_info` table; the serial lives in `system_info.hardware_serial`, with
-/// `uuid` as a fallback.
+/// Pull the hardware serial from osquery `system_info` rows. Do not fall back
+/// to `uuid`: unprivileged osquery on Linux cannot read the DMI uuid and
+/// invents a random one per process, which made a new device on each restart.
 fn extract_serial(rows: &Value) -> Option<String> {
     let obj = rows.as_array()?.first()?;
-    ["hardware_serial", "serial_number", "uuid", "hardware_uuid"]
+    ["hardware_serial", "serial_number"]
         .iter()
         .find_map(|k| {
             obj.get(*k)
@@ -445,17 +445,125 @@ fn extract_serial(rows: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-async fn get_device_serial_number_internal(app: &tauri::AppHandle) -> Result<String, String> {
-    let result = execute_sql_batch(
+/// Which device identity to use and whether to store it.
+enum IdentityDecision {
+    /// A stored identity exists. Use it unchanged.
+    Use(String),
+    /// A new trusted identity. Use it and store it.
+    Adopt(String),
+    /// No trusted source exists. Make one random identity and store it.
+    Generate,
+}
+
+/// A valid machine id is 32 hex characters, with optional whitespace around it.
+fn normalize_machine_id(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    (t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit())).then(|| t.to_ascii_lowercase())
+}
+
+/// App-scoped hash of the systemd machine id. The systemd manual says to not
+/// send the raw id off the machine; the HMAC derives a stable, Klaay-specific
+/// value from it. The key is compiled into the binary, so this is not a
+/// secret — it stops other software from reusing our exact identifier, not a
+/// determined attacker who reads the key.
+fn hash_machine_id(machine_id: &str) -> String {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"com.klaay.klaayguard")
+        .expect("HMAC accepts any key length");
+    mac.update(machine_id.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+/// Rank the identity sources: stored value, then hardware serial, then hashed
+/// machine id, then a generated fallback. Identity is decided once; every
+/// later run must reuse the stored value.
+fn decide_device_identity(
+    stored: Option<&str>,
+    hardware_serial: Option<&str>,
+    machine_id: Option<&str>,
+) -> IdentityDecision {
+    if let Some(s) = stored.filter(|s| !s.is_empty()) {
+        return IdentityDecision::Use(s.to_string());
+    }
+    if let Some(s) = hardware_serial.filter(|s| !s.is_empty()) {
+        return IdentityDecision::Adopt(s.to_string());
+    }
+    if let Some(id) = machine_id.and_then(normalize_machine_id) {
+        return IdentityDecision::Adopt(hash_machine_id(&id));
+    }
+    IdentityDecision::Generate
+}
+
+/// Read the systemd machine id. The dbus path serves older systems.
+fn read_machine_id() -> Option<String> {
+    ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok())
+}
+
+/// 32 hex characters from the OS CSPRNG, for hosts with no other identity.
+fn generate_device_identity() -> Result<String, String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| format!("getrandom failed: {}", e))?;
+    Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+}
+
+/// Resolve the stable device identity. The first run decides it and stores it
+/// in the keychain; every later run returns the stored value.
+async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, String> {
+    // Fast path, and the rule the tests pin as IdentityDecision::Use.
+    match keychain::load_device_identity() {
+        Ok(Some(stored)) if !stored.is_empty() => return Ok(stored),
+        Ok(_) => {}
+        Err(e) => {
+            // A broken credential store forces re-derivation every cycle.
+            // Report it so a locked or absent Secret Service is visible.
+            log::error!("keychain: device identity load failed: {}", e);
+            sentry::capture_message(
+                &format!("keychain_identity_load_failed: {}", e),
+                Level::Error,
+            );
+        }
+    }
+
+    let hardware_serial = match execute_sql_batch(
         app.clone(),
         vec![(
             "system_info".to_string(),
             "SELECT * FROM system_info".to_string(),
         )],
     )
-    .await?;
-    extract_serial(result.get("system_info").unwrap_or(&Value::Null))
-        .ok_or_else(|| "Couldn't find hardware serial number".to_string())
+    .await
+    {
+        Ok(result) => extract_serial(result.get("system_info").unwrap_or(&Value::Null)),
+        Err(e) => {
+            log::warn!("identity: system_info query failed: {}", e);
+            None
+        }
+    };
+
+    let (identity, source) = match decide_device_identity(
+        None,
+        hardware_serial.as_deref(),
+        read_machine_id().as_deref(),
+    ) {
+        IdentityDecision::Use(v) => (v, "stored"),
+        IdentityDecision::Adopt(v) => (v, "adopted from host"),
+        IdentityDecision::Generate => (generate_device_identity()?, "generated"),
+    };
+
+    if let Err(e) = keychain::save_device_identity(&identity) {
+        // Report but still return the identity: one collection with an
+        // unstored identity beats none.
+        log::error!("identity: keychain save failed: {}", e);
+        sentry::capture_message(&format!("device_identity_save_failed: {}", e), Level::Error);
+    }
+    log::info!("identity: device identity {}", source);
+    Ok(identity)
 }
 
 async fn run_cycle(
@@ -580,7 +688,7 @@ async fn run_cycle(
 
     // 3) Build the JSON:API payload from the freshly collected rows
     let collected_at = chrono::Utc::now().to_rfc3339();
-    let device_serial = get_device_serial_number_internal(app)
+    let device_serial = get_device_identity_internal(app)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
     let items = build_payload_items(&results, &collected_at);
@@ -845,7 +953,13 @@ struct SelectedUpdate {
 }
 
 /// macOS artifact tags for the current host: (filename infix, friendly-name infix).
+/// Returns None on other systems: the installer below mounts a DMG, so a
+/// non-macOS host must not download one. Without this gate a Linux or Windows
+/// x86_64 host selects the Intel DMG, downloads it, and fails at mount time.
 fn host_arch_tags() -> Option<(&'static str, &'static str)> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
     match std::env::consts::ARCH {
         "aarch64" => Some(("macOS_arm64", "Apple silicon")),
         "x86_64" => Some(("macOS_x64", "Intel")),
@@ -1116,8 +1230,9 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         // artifact filename) against THIS host's architecture. Picking the wrong
         // arch would install an app the arch-mismatch gate then refuses to launch.
         let Some((arch_tag, arch_label)) = host_arch_tags() else {
-            log::warn!(
-                "⚠️  No macOS update artifact for architecture: {}",
+            log::info!(
+                "ℹ️  Auto-update supports macOS only; skipping on {} {}",
+                std::env::consts::OS,
                 std::env::consts::ARCH
             );
             return Ok(None);
@@ -1990,10 +2105,80 @@ mod happy_path_tests {
     }
 
     #[test]
-    fn serial_falls_back_to_uuid_then_none() {
-        let only_uuid = json!([{"uuid": "9082C1CD"}]);
-        assert_eq!(extract_serial(&only_uuid), Some("9082C1CD".to_string()));
+    fn serial_ignores_osquery_uuid() {
+        // Unprivileged osquery on Linux cannot read the DMI uuid and invents a
+        // random one per process. A uuid must never become the device identity.
+        let only_uuid = json!([{"uuid": "9082C1CD", "hardware_serial": ""}]);
+        assert_eq!(extract_serial(&only_uuid), None);
         assert_eq!(extract_serial(&json!([])), None);
         assert_eq!(extract_serial(&Value::Null), None);
+    }
+
+    #[test]
+    fn machine_id_hash_matches_reference_vector() {
+        // echo -n "0123456789abcdef0123456789abcdef" | openssl dgst -sha256 -hmac "com.klaay.klaayguard"
+        assert_eq!(
+            hash_machine_id("0123456789abcdef0123456789abcdef"),
+            "a94933b40c1cb82efd93d7bb3317a191137577124258761a148dc702565207a6"
+        );
+    }
+
+    #[test]
+    fn machine_id_normalized_before_use() {
+        assert_eq!(
+            normalize_machine_id(" 7cb925cc5c9146aa9c01c733c83dd047\n"),
+            Some("7cb925cc5c9146aa9c01c733c83dd047".to_string())
+        );
+        assert_eq!(normalize_machine_id(""), None);
+        assert_eq!(normalize_machine_id("uninitialized\n"), None);
+        assert_eq!(
+            normalize_machine_id("zz3262c33af9461e9ed5ce8bed32dcbz"),
+            None
+        );
+    }
+
+    #[test]
+    fn identity_prefers_stored_value() {
+        let d = decide_device_identity(
+            Some("stored-id"),
+            Some("G97L3X4KYV"),
+            Some("0123456789abcdef0123456789abcdef"),
+        );
+        assert!(matches!(d, IdentityDecision::Use(v) if v == "stored-id"));
+    }
+
+    #[test]
+    fn identity_adopts_hardware_serial_when_nothing_stored() {
+        let d = decide_device_identity(
+            None,
+            Some("G97L3X4KYV"),
+            Some("0123456789abcdef0123456789abcdef"),
+        );
+        assert!(matches!(d, IdentityDecision::Adopt(v) if v == "G97L3X4KYV"));
+    }
+
+    #[test]
+    fn identity_adopts_hashed_machine_id_without_serial() {
+        // The raw machine id carries a trailing newline straight from the file.
+        let d = decide_device_identity(None, None, Some("0123456789abcdef0123456789abcdef\n"));
+        assert!(matches!(
+            d,
+            IdentityDecision::Adopt(v)
+                if v == "a94933b40c1cb82efd93d7bb3317a191137577124258761a148dc702565207a6"
+        ));
+    }
+
+    #[test]
+    fn identity_generates_as_last_resort() {
+        assert!(matches!(
+            decide_device_identity(None, None, None),
+            IdentityDecision::Generate
+        ));
+    }
+
+    #[test]
+    fn identity_treats_empty_stored_as_missing() {
+        let d = decide_device_identity(Some(""), None, None);
+        assert!(matches!(d, IdentityDecision::Generate));
     }
 }

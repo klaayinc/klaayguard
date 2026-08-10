@@ -9,6 +9,7 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "getrandom 0.2.17",
+ "hmac",
  "keyring",
  "log",
  "nix 0.26.4",

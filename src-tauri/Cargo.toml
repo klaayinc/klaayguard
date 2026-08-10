@@ -35,6 +35,7 @@ sentry = "0.42.0"
 keyring = "2"
 semver = "1.0"
 sha2 = "0.10"
+hmac = "0.12"  # App-scoped hash of the machine id for stable Linux device identity
 getrandom = "0.2"  # CSPRNG for the sign-in state nonce (reuses the version already in-tree)
 
 [target.'cfg(unix)'.dependencies]
