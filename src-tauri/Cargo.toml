@@ -1,8 +1,8 @@
 [package]
 name = "KlaayGuard"
 version = "0.1.12"
-description = "A Tauri App"
-authors = ["you"]
+description = "KlaayGuard security agent. Reports device posture to Klaay."
+authors = ["Klaay <support@klaay.com>"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -19,7 +19,18 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+# default-features off drops native-tls (OpenSSL). Use rustls with the OS
+# trust store, not the compiled-in webpki roots: employee machines behind a
+# TLS-inspecting proxy (Zscaler, Netskope) trust a corporate root that only
+# the OS store holds. Keep the non-TLS defaults the agent relies on: http2,
+# charset, and macOS system-proxy detection.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-native-roots",
+    "charset",
+    "http2",
+    "macos-system-configuration",
+] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
@@ -32,7 +43,19 @@ log = "0.4.27"
 dirs = "5.0"
 tokio = { version = "1.0", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
-sentry = "0.42.0"
+# default-features off drops the OpenSSL transport. Use rustls with native
+# roots (see reqwest above). Re-add the defaults we depend on: debug-images
+# for symbolication of stripped release binaries, and release-health for
+# session tracking. Both are lost when default features go off.
+sentry = { version = "0.42.0", default-features = false, features = [
+    "backtrace",
+    "contexts",
+    "panic",
+    "debug-images",
+    "release-health",
+    "reqwest",
+    "rustls",
+] }
 keyring = "2"
 semver = "1.0"
 sha2 = "0.10"
