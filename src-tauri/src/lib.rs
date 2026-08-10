@@ -81,14 +81,14 @@ fn parse_deep_link_token(url: &str) -> Option<String> {
 }
 
 /// When true, a sign-in callback MUST carry a `state` that matches the nonce we issued.
-/// Left false until Earthenware echoes `state` in the klaayguard:// redirect; flip to
+/// Left false until Klaay Frontend echoes `state` in the klaayguard:// redirect; flip to
 /// true once that ships to fully close the deep-link confused-deputy. A *mismatch* is
 /// rejected regardless of this flag — only a *missing* state is tolerated during rollout.
 const AUTH_STATE_STRICT: bool = false;
 
 /// Decide whether the callback's `state` clears the nonce check. A present-but-wrong
 /// state is always rejected (a positive attack signal); a missing nonce or missing
-/// state is accepted only while `strict` is false (the Earthenware rollout window).
+/// state is accepted only while `strict` is false (the Klaay Frontend rollout window).
 fn auth_state_ok(strict: bool, expected: Option<&str>, provided: Option<&str>) -> bool {
     match (expected, provided) {
         (Some(want), Some(got)) => want == got,
@@ -132,7 +132,7 @@ fn platform_matches(tag: Option<&str>, os: &str) -> bool {
         None | Some("") | Some("all") => true,
         Some("posix") => os == "linux" || os == "macos",
         // osquery names macOS "darwin"; Rust's OS string is "macos". Treat both
-        // as the same platform so the kiln tag "darwin" matches a macOS host.
+        // as the same platform so the Klaay API's "darwin" tag matches a macOS host.
         Some("darwin") | Some("macos") => os == "macos",
         Some(other) => other == os,
     }
@@ -808,7 +808,7 @@ async fn token_definitely_invalid(base: &str, token: &str) -> bool {
 ///
 /// NOTE: this still can't stop an attacker who injects a token for *their own valid*
 /// account (a confused-deputy). Closing that fully needs an app-generated `state` nonce
-/// echoed back by the Earthenware login redirect — tracked as a separate cross-repo task.
+/// echoed back by the Klaay Frontend login redirect — tracked as a separate cross-repo task.
 fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
     let Some(tok) = parse_deep_link_token(url) else {
         log::info!("deep_link_ignored url={}", url);
@@ -1251,7 +1251,7 @@ fn fallback_sign_in(app: tauri::AppHandle) {
 /// Open the employee hub from the fallback window.
 #[tauri::command]
 fn fallback_employee_hub(app: tauri::AppHandle) {
-    open_earthenware(&app, "/employee-hub");
+    open_frontend(&app, "/employee-hub");
 }
 
 /// Content of the Linux autostart entry.
@@ -1890,25 +1890,25 @@ fn get_api_base_url() -> String {
         .unwrap_or_else(|| "https://api.klaay.com".to_string())
 }
 
-fn get_earthenware_url() -> String {
-    std::env::var("VITE_EARTHENWARE_URL")
+fn get_frontend_url() -> String {
+    std::env::var("VITE_FRONTEND_URL")
         .ok()
-        .or_else(|| option_env!("APP_DEFAULT_EARTHENWARE_URL").map(|s| s.to_string()))
+        .or_else(|| option_env!("APP_DEFAULT_FRONTEND_URL").map(|s| s.to_string()))
         .unwrap_or_else(|| "https://app.klaay.com".to_string())
 }
 
-/// Open the browser to the Earthenware sign-in page; it deep-links back via
+/// Open the browser to the Klaay Frontend sign-in page; it deep-links back via
 /// `klaayguard://auth-callback?token=…`. Invoked from the tray "Sign in" item.
-/// Open an Earthenware path in the default browser.
-fn open_earthenware(app: &tauri::AppHandle, path: &str) {
-    let url = format!("{}{}", get_earthenware_url(), path);
+/// Open a Klaay Frontend path in the default browser.
+fn open_frontend(app: &tauri::AppHandle, path: &str) {
+    let url = format!("{}{}", get_frontend_url(), path);
     log::info!("opening url={}", url);
     if let Err(e) = app.opener().open_url(url.clone(), None::<&str>) {
         log::error!("failed to open url {}: {}", url, e);
     }
 }
 
-/// Open the Earthenware sign-in page; it deep-links back via klaayguard://. Issues a
+/// Open the Klaay Frontend sign-in page; it deep-links back via klaayguard://. Issues a
 /// fresh single-use `state` nonce (stored in AppState) and passes it along so the
 /// callback can be bound to a sign-in *this* app initiated. If the OS RNG is somehow
 /// unavailable we open without a nonce (rollout accept-missing path) rather than block
@@ -1922,7 +1922,7 @@ fn open_sign_in(app: &tauri::AppHandle) {
         });
         path.push_str(&format!("&state={}", nonce));
     }
-    open_earthenware(app, &path);
+    open_frontend(app, &path);
 }
 
 /// Handles + assets for keeping the tray in sync with auth state.
@@ -2684,15 +2684,15 @@ pub fn run() {
         .ok()
         .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
         .unwrap_or_else(|| "https://api.klaay.com".to_string());
-    if let Ok(earthenware) = std::env::var("VITE_EARTHENWARE_URL") {
+    if let Ok(frontend) = std::env::var("VITE_FRONTEND_URL") {
         add_breadcrumb(
             "startup",
-            &format!("endpoints api:{} earthenware:{}", api_base, earthenware),
+            &format!("endpoints api:{} frontend:{}", api_base, frontend),
             Level::Info,
         );
         // naive mismatch hint: localhost vs non-localhost
         let api_is_local = api_base.contains("localhost") || api_base.contains("127.0.0.1");
-        let ew_is_local = earthenware.contains("localhost") || earthenware.contains("127.0.0.1");
+        let ew_is_local = frontend.contains("localhost") || frontend.contains("127.0.0.1");
         if api_is_local ^ ew_is_local {
             add_breadcrumb(
                 "startup",
@@ -2703,7 +2703,7 @@ pub fn run() {
     } else {
         add_breadcrumb(
             "startup",
-            &format!("endpoints api:{} earthenware:<unset>", api_base),
+            &format!("endpoints api:{} frontend:<unset>", api_base),
             Level::Info,
         );
     }
@@ -2907,7 +2907,7 @@ pub fn run() {
                 let tray = tauri::tray::TrayIconBuilder::new()
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "auth_action" => open_sign_in(app),
-                        "employee_hub" => open_earthenware(app, "/employee-hub"),
+                        "employee_hub" => open_frontend(app, "/employee-hub"),
                         _ => {}
                     })
                     .icon(if authed { green.clone() } else { red.clone() })
@@ -3120,7 +3120,7 @@ mod happy_path_tests {
     #[test]
     fn auth_state_rollout_semantics() {
         // Rollout (strict=false): missing state OR missing nonce is tolerated...
-        assert!(auth_state_ok(false, Some("n"), None)); // old Earthenware: no echo
+        assert!(auth_state_ok(false, Some("n"), None)); // old Klaay Frontend: no echo
         assert!(auth_state_ok(false, None, None)); // no pending nonce
         assert!(auth_state_ok(false, None, Some("x"))); // unsolicited-ish, tolerated in rollout
                                                         // ...but a present-and-matching state always passes...

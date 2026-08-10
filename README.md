@@ -4,11 +4,8 @@
 
 **KlaayGuard** is a tray-only desktop agent, written in Rust on Tauri 2. It
 collects security-posture telemetry with a bundled copy of
-[osquery](https://osquery.io) and reports it to a server every 15 minutes. It
-has no window and no web frontend.
-
-By default the agent talks to Klaay's hosted service. You can point it at your
-own server instead. See [Bring your own server](#bring-your-own-server).
+[osquery](https://osquery.io) and reports it to the Klaay API every 15 minutes.
+It has no window and no web frontend.
 
 KlaayGuard is free software under GPL-3.0-or-later. See [License](#license).
 
@@ -26,11 +23,11 @@ sequenceDiagram
     autonumber
     participant Agent as KlaayGuard Agent
     participant Browser as Default Browser
-    participant API as Server API
+    participant API as Klaay API
     participant Osquery as osquery (bundled sidecar)
 
     %% Sign-in (first launch or after 401/403)
-    Agent->>Browser: Open {web-app}/login?app=klaayguard&state=<nonce>
+    Agent->>Browser: Open {frontend}/login?app=klaayguard&state=<nonce>
     Browser-->>Agent: klaayguard://…?token=<jwt>&state=<nonce>
     Agent->>API: GET /me (validate token)
     API-->>Agent: 200 OK
@@ -121,10 +118,10 @@ cargo tauri build --target x86_64-apple-darwin       # macOS Intel
 cargo tauri build --target x86_64-unknown-linux-gnu  # Linux
 ```
 
-Run against your own server (API on :3000, web app on :5173):
+Run against a local Klaay stack (API on :3000, Klaay Frontend on :5173):
 
 ```bash
-KLAAY_ENV=development VITE_API_BASE_URL=http://localhost:3000 VITE_EARTHENWARE_URL=http://localhost:5173 \
+KLAAY_ENV=development VITE_API_BASE_URL=http://localhost:3000 VITE_FRONTEND_URL=http://localhost:5173 \
   cargo tauri build && open src-tauri/target/release/bundle/macos/KlaayGuard.app
 ```
 
@@ -165,7 +162,7 @@ INSTALLER_SIGNING_IDENTITY="Developer ID Installer: …" \
 `KLAAY_ENV` selects the environment at build time. `src-tauri/build.rs` bakes
 the matching URLs in as compile-time defaults:
 
-| Environment | API | Web app |
+| Environment | API | Klaay Frontend |
 |---|---|---|
 | `production` (default) | `https://api.klaay.com` | `https://app.klaay.com` |
 | `staging` | `https://api.klaay.dev` | `https://app.klaay.dev` |
@@ -173,23 +170,6 @@ the matching URLs in as compile-time defaults:
 
 At runtime, an environment variable overrides the baked-in default. The final
 fallback is production.
-
-### Bring your own server
-
-The default URLs point at Klaay's hosted service. To run the agent against your
-own backend, override the two URLs at build time or at run time:
-
-- `VITE_API_BASE_URL` — your API base URL.
-- `VITE_EARTHENWARE_URL` — your web app URL, used for sign-in and the Employee
-  Hub link.
-
-Your server must implement the calls in [API endpoints](#api-endpoints). The
-agent sends a Bearer token that it receives from a `klaayguard://` deep link
-after sign-in. The server controls the query set, so you define exactly what the
-agent collects. See the [Privacy Datasheet](docs/PRIVACY_DATASHEET.md).
-
-You do not need Klaay credentials or certificates to build the agent or to run
-it against your own server.
 
 ### Environment variables
 
@@ -199,7 +179,7 @@ All variables are optional.
 |---|---|---|
 | `KLAAY_ENV` | `production` | Selects build environment; also the Sentry environment tag |
 | `VITE_API_BASE_URL` | per environment | Klaay API base URL |
-| `VITE_EARTHENWARE_URL` | per environment | Web app URL for sign-in and Employee Hub |
+| `VITE_FRONTEND_URL` | per environment | Klaay Frontend URL for sign-in and Employee Hub |
 | `VITE_SENTRY_DSN` | empty (Sentry off) | Sentry DSN; CI injects it for releases |
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `900` | Collection loop interval |
 | `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS) |

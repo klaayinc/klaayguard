@@ -33,7 +33,7 @@ jobs:
         env:
           KLAAY_ENV: production
           VITE_API_BASE_URL: https://api.klaay.com
-          VITE_EARTHENWARE_URL: https://app.klaay.com
+          VITE_FRONTEND_URL: https://app.klaay.com
         run: cargo tauri build --bundles nsis
 
       - name: Upload installer

@@ -5,18 +5,15 @@
 **Audience:** Anyone who wants the full picture of what the agent does. For a
 short, non-technical version, see the [Employee Guide](./EMPLOYEE_GUIDE.md).
 
-KlaayGuard is free software. The operator of the server chooses what the agent
-collects and where it reports. This document describes the agent as Klaay
-deploys it against Klaay's hosted service, which is the default. You can point
-the agent at your own server. See the [README](../README.md).
+KlaayGuard is free software under GPL-3.0-or-later. It is the client for the
+Klaay platform.
 
 ## 1. Summary
 
 KlaayGuard is a small background application for work computers. It checks the
-security posture of the computer and reports the result to a server. By default
-that server is the Klaay platform. The operator uses these reports to show that
-company controls are met. Examples of these controls are disk encryption and
-screen lock.
+security posture of the computer and reports the result to the Klaay platform.
+Klaay uses these reports to show that company controls are met. Examples of
+these controls are disk encryption and screen lock.
 
 KlaayGuard is not antivirus software. It is not monitoring software. It does not
 watch what you do. It does not block, change, or remove anything on the
@@ -33,15 +30,14 @@ KlaayGuard has one main function and a small set of support functions.
 
 Every 15 minutes, the agent completes this cycle:
 
-1. It asks the server which checks to run.
+1. It asks the Klaay server which checks to run.
 2. It runs the checks with [osquery](https://osquery.io), an open-source tool
    that reads system settings. KlaayGuard includes its own copy of osquery.
-3. It sends the results to the server over HTTPS. The default server is
-   `https://api.klaay.com`.
+3. It sends the results to `https://api.klaay.com` over HTTPS.
 
 The server defines the checks. The agent refuses any instruction that is not a
 read-only query. It keeps no local database. Results go directly from the
-computer to the server.
+computer to Klaay.
 
 ### 2.2 Support functions
 
@@ -86,11 +82,9 @@ the OS permissions that the agent does not request.
 
 ## 4. Where data goes
 
-- Posture reports go to the configured server over HTTPS. By default this is the
-  Klaay API (`https://api.klaay.com`).
-- Sign-in uses the configured web application. By default this is the Klaay web
-  application (`https://app.klaay.com`).
-- Crash reports go to Sentry, when the operator turns that on.
+- Posture reports go to the Klaay API (`https://api.klaay.com`) over HTTPS.
+- Sign-in uses the Klaay Frontend (`https://app.klaay.com`).
+- Crash reports go to Sentry, when Klaay turns that on.
 - No other party receives data.
 
 ## 5. Installation

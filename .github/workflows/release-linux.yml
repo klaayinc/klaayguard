@@ -23,13 +23,13 @@ jobs:
         include:
           - build: development
             api_url: "http://localhost:3000"
-            earthenware_url: "http://localhost:5173"
+            frontend_url: "http://localhost:5173"
           - build: staging
             api_url: "https://api.klaay.dev"
-            earthenware_url: "https://app.klaay.dev"
+            frontend_url: "https://app.klaay.dev"
           - build: production
             api_url: "https://api.klaay.com"
-            earthenware_url: "https://app.klaay.com"
+            frontend_url: "https://app.klaay.com"
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +65,7 @@ jobs:
         env:
           KLAAY_ENV: ${{ matrix.build }}
           VITE_API_BASE_URL: ${{ matrix.api_url }}
-          VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
+          VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
           VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
         run: |
           cargo tauri build --bundles deb rpm appimage

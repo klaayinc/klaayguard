@@ -50,9 +50,8 @@ shell. Run the PowerShell script instead:
 ./.github/scripts/fetch-osquery-windows.ps1
 ```
 
-To point the agent at your own server, set the environment variables the README
-documents (`VITE_API_BASE_URL`, `VITE_EARTHENWARE_URL`, `KLAAY_ENV`). You do not
-need Klaay credentials to build or run the agent against your own backend.
+To build against a local Klaay stack, set the environment variables the README
+documents (`VITE_API_BASE_URL`, `VITE_FRONTEND_URL`, `KLAAY_ENV`).
 
 ## Before you open a pull request
 
