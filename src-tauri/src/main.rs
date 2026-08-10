@@ -2,23 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    // Early panic hook to write immediately to macOS user Logs folder
-    {
-        std::panic::set_hook(Box::new(|panic_info| {
-            let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-            let msg = format!("[{}][panic] {}\n", ts, panic_info);
-            let log_dir = dirs::home_dir()
-                .map(|h| h.join("Library/Logs/com.klaay.app"))
-                .unwrap_or(std::path::PathBuf::from("./"));
-            let _ = std::fs::create_dir_all(&log_dir);
-            let log_path = log_dir.join("KlaayGuard.log");
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
-        }));
-    }
+    // Early panic hook: write to the platform log directory before Tauri and
+    // its logger exist. Uses the same directory as tauri-plugin-log, so one
+    // location holds every log.
+    std::panic::set_hook(Box::new(|panic_info| {
+        klaay_guard_lib::append_early_log(&format!("[panic] {}", panic_info));
+    }));
 
     // Initialize Sentry for error tracking
     // Runtime env first, then the compile-time default from build.rs. Released
@@ -103,19 +92,7 @@ fn main() {
                     if is_arm_hw { "arm64" } else { "x86_64" }
                 );
 
-                let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-                let full = format!("[{}][arch][ERROR] {}\n", ts, &msg);
-                let log_dir = dirs::home_dir()
-                    .map(|h| h.join("Library/Logs/com.klaay.app"))
-                    .unwrap_or(std::path::PathBuf::from("./"));
-                let _ = std::fs::create_dir_all(&log_dir);
-                let log_path = log_dir.join("KlaayGuard.log");
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                    .and_then(|mut f| std::io::Write::write_all(&mut f, full.as_bytes()));
-
+                klaay_guard_lib::append_early_log(&format!("[arch][ERROR] {}", msg));
                 sentry::capture_message(&format!("arch_mismatch: {}", msg), sentry::Level::Error);
                 eprintln!("{}", msg);
                 // Signal the frontend; the window is created in lib.rs setup, so we also set env vars for later use.
@@ -131,20 +108,7 @@ fn main() {
     log::set_max_level(log::LevelFilter::Info);
 
     // Early boot log write for visibility before Tauri is fully initialized
-    {
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-        let msg = format!("[{}][startup] KlaayGuard launching...\n", ts);
-        let log_dir = dirs::home_dir()
-            .map(|h| h.join("Library/Logs/com.klaay.app"))
-            .unwrap_or(std::path::PathBuf::from("./"));
-        let _ = std::fs::create_dir_all(&log_dir);
-        let log_path = log_dir.join("KlaayGuard.log");
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, msg.as_bytes()));
-    }
+    klaay_guard_lib::append_early_log("[startup] KlaayGuard launching...");
 
     klaay_guard_lib::run()
 }
