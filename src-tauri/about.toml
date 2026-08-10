@@ -1,5 +1,8 @@
 # cargo-about configuration. Generates THIRD-PARTY-LICENSES.md.
 # Run: cargo about generate about.hbs -o ../THIRD-PARTY-LICENSES.md
+#
+# Keep this list in step with the `allow` list in deny.toml. cargo-about accepts
+# a dependency license here; cargo-deny enforces the same set in CI.
 accepted = [
     "GPL-3.0-or-later",
     "MIT",

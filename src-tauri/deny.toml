@@ -9,6 +9,7 @@
 [licenses]
 # The complete set the current graph uses (all permissive or weak-copyleft,
 # all one-way compatible with GPL-3.0-or-later), plus the project's own license.
+# Keep this list in step with `accepted` in about.toml.
 allow = [
     "GPL-3.0-or-later",
     "MIT",

@@ -3,8 +3,9 @@ name: CLA Assistant
 # Asks each contributor to sign the Contributor License Agreement (CLA.md) on
 # their first pull request, then records the signature. The CTO must finish the
 # setup on the public repo before this runs:
-#   1. Create a PERSONAL_ACCESS_TOKEN secret with repo scope for the signature
-#      store, or point path-to-storage at a separate private repo.
+#   1. Create a PERSONAL_ACCESS_TOKEN secret with repo scope. It stores the
+#      signatures at path-to-signatures below; to keep them in a separate repo,
+#      add remote-organization-name and remote-repository-name.
 #   2. Confirm the CLA document link below points at the published CLA.md.
 # Until the token exists, this job is inactive and blocks nothing.
 
@@ -23,11 +24,15 @@ permissions:
 jobs:
   cla:
     runs-on: ubuntu-22.04
-    # Skip until the token is set, so the job never fails on a fresh fork.
     if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
+    # Map the secret to an env value here. The `secrets` context is not available
+    # in a step-level `if`, so the step guard below reads this instead. This keeps
+    # the job inactive until the CTO sets the token.
+    env:
+      HAS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN != '' }}
     steps:
       - name: CLA Assistant
-        if: ${{ secrets.PERSONAL_ACCESS_TOKEN != '' }}
+        if: env.HAS_TOKEN == 'true'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
