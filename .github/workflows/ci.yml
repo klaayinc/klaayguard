@@ -40,6 +40,10 @@ jobs:
             librsvg2-dev patchelf ruby ruby-rake
 
       - name: Fetch osquery sidecar
+        env:
+          # Authenticate the osquery release API lookup so it does not hit the
+          # unauthenticated 60-req/hr rate limit on shared runner IPs.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: rake
 
       - name: cargo test
@@ -119,6 +123,8 @@ jobs:
       # shell, so Windows fetches with the PowerShell script instead.
       - name: Fetch osquery sidecar (macOS, Linux)
         if: runner.os != 'Windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: rake
 
       - name: Fetch osquery sidecar (Windows)
@@ -156,6 +162,10 @@ jobs:
             librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
 
       - name: Fetch osquery sidecar
+        env:
+          # Authenticate the osquery release API lookup so it does not hit the
+          # unauthenticated 60-req/hr rate limit on shared runner IPs.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: rake
 
       - name: Install tauri-cli

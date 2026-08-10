@@ -51,6 +51,8 @@ jobs:
         run: cargo install tauri-cli --version "=2.11.4" --locked
 
       - name: Setup osquery binaries (macOS)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: rake
 
       - name: Verify sidecar binaries exist (macOS)

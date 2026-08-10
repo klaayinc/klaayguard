@@ -45,6 +45,8 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
 
       - name: Setup osquery binaries (Linux)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: rake
 
       - name: Verify sidecar binaries exist (Linux x86_64)

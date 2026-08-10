@@ -37,10 +37,26 @@ file DIR_TMP do
 end
 
 OSQUERY_VERSION = "5.18.1"
+
+# Headers for the GitHub REST API call below. The API rate-limits unauthenticated
+# requests to 60 per hour per IP, and CI runners share IPs, so a plain request
+# hits a 403 under load. When GITHUB_TOKEN (or GH_TOKEN) is set — always in CI —
+# send it to raise the limit. A local build without a token still works; it makes
+# far fewer requests.
+def github_api_headers
+    headers = {
+        "Accept" => "application/vnd.github+json",
+        "User-Agent" => "klaayguard-osquery-fetch",
+    }
+    token = ENV["GITHUB_TOKEN"] || ENV["GH_TOKEN"]
+    headers["Authorization"] = "Bearer #{token}" if token && !token.empty?
+    headers
+end
+
 # Fetch and cache checksums from GitHub Releases for the pinned version
 def fetch_release_assets
     url = "https://api.github.com/repos/osquery/osquery/releases/tags/#{OSQUERY_VERSION}"
-    data = JSON.parse(URI.open(url).read)
+    data = with_retries { JSON.parse(URI.open(url, github_api_headers).read) }
     data["assets"] || []
 end
 
