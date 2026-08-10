@@ -249,7 +249,8 @@ end
 
 def vendor_binaries
     # Verify only the binaries relevant to the current platform/arch.
-    # CI should rely on the vendored sidecars in src-tauri/vendor and never download on demand.
+    # `rake fetch` (the default) downloads these before a build; `verify` only
+    # checks that they are present and not Git LFS pointers.
     platform = RUBY_PLATFORM
     if platform =~ /darwin/
         [
@@ -301,7 +302,37 @@ end
 
 task :refresh_binaries => [OSQUERYI_PATH, OSQUERYI_LINUX_X64_PATH, OSQUERYI_LINUX_AARCH64_PATH]
 
-task default: [:verify]
+# Fetch the osquery sidecar for the current platform. The build needs only the
+# sidecar for the target it builds, so this downloads and checksum-verifies just
+# that one (both variants on macOS, where one build produces two targets). The
+# file tasks skip the download when the sidecar already exists, so a repeat build
+# is fast. Windows is the exception: rake does not fetch it, because the file
+# tasks use a Unix shell. CI and the build docs fetch the Windows sidecar with a
+# separate step.
+task :fetch do
+    platform = RUBY_PLATFORM
+    if platform =~ /darwin/
+        Rake::Task[OSQUERYI_PATH].invoke
+    elsif platform =~ /linux/
+        arch = begin
+            `uname -m`.strip
+        rescue
+            ""
+        end
+        if arch =~ /(aarch64|arm64)/
+            Rake::Task[OSQUERYI_LINUX_AARCH64_PATH].invoke
+        else
+            Rake::Task[OSQUERYI_LINUX_X64_PATH].invoke
+        end
+    elsif platform =~ /mswin|mingw|cygwin/
+        abort "rake does not fetch the Windows osquery sidecar. Follow the " \
+              "Windows build step in CONTRIBUTING.md."
+    else
+        raise "Unsupported platform for osquery fetch: #{platform}"
+    end
+end
+
+task default: [:fetch]
 
 task :clean_vendor do
     sh "rm -f src-tauri/vendor/*osqueryi*"

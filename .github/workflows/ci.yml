@@ -21,11 +21,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          # osquery sidecars live in Git LFS and are required for tauri_build to
-          # resolve the externalBin resource paths, so the crate won't compile
-          # without them.
-          lfs: true
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -44,7 +39,7 @@ jobs:
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake
 
-      - name: Verify osquery sidecars (from LFS)
+      - name: Fetch osquery sidecar
         run: rake
 
       - name: cargo test
@@ -100,8 +95,6 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -122,11 +115,16 @@ jobs:
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake
 
-      # rake (verify) needs Ruby/Unix; on Windows the LFS sidecar is validated by
-      # tauri_build during the build below.
-      - name: Verify osquery sidecars (from LFS)
+      # rake fetches the macOS and Linux sidecars. Its file tasks use a Unix
+      # shell, so Windows fetches with the PowerShell script instead.
+      - name: Fetch osquery sidecar (macOS, Linux)
         if: runner.os != 'Windows'
         run: rake
+
+      - name: Fetch osquery sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/fetch-osquery-windows.ps1
 
       - name: cargo build (release, warning-free)
         working-directory: src-tauri
@@ -141,8 +139,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -159,7 +155,7 @@ jobs:
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
 
-      - name: Verify osquery sidecars (from LFS)
+      - name: Fetch osquery sidecar
         run: rake
 
       - name: Install tauri-cli

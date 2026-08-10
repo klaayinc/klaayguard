@@ -43,6 +43,13 @@ cargo tauri build
 `rake` downloads the osquery binary for your platform and checks its SHA-256
 before the build uses it. The build fails if the checksum does not match.
 
+On Windows, `rake` does not fetch the sidecar, because its file tasks use a Unix
+shell. Run the PowerShell script instead:
+
+```powershell
+./.github/scripts/fetch-osquery-windows.ps1
+```
+
 To point the agent at your own server, set the environment variables the README
 documents (`VITE_API_BASE_URL`, `VITE_EARTHENWARE_URL`, `KLAAY_ENV`). You do not
 need Klaay credentials to build or run the agent against your own backend.
