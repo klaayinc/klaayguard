@@ -1942,10 +1942,10 @@ fn open_sign_in(app: &tauri::AppHandle) {
 /// Handles + assets for keeping the tray in sync with auth state.
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
+    /// The "Sign out" item, added to the menu only while signed in.
     sign_out: tauri::menu::MenuItem<tauri::Wry>,
-    /// Deadline for the two-click confirm. Some(t) means armed until t; None
-    /// means idle. Set under this lock on the main and timer threads.
-    sign_out_deadline: std::sync::Mutex<Option<std::time::Instant>>,
+    /// The tray menu itself, so "Sign out" can be added and removed at runtime.
+    menu: tauri::menu::Menu<tauri::Wry>,
     tray: tauri::tray::TrayIcon<tauri::Wry>,
     green: tauri::image::Image<'static>,
     red: tauri::image::Image<'static>,
@@ -2003,14 +2003,9 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray.item.set_text(&text);
             let _ = tray.item.set_enabled(enabled);
-            // "Sign out" only makes sense while signed in. When signed out, keep
-            // it disabled and reset it, so a stale confirm label cannot linger.
-            let _ = tray.sign_out.set_enabled(signed_in);
-            if !signed_in {
-                *tray.sign_out_deadline.lock().unwrap() = None;
-                let _ = tray.sign_out.set_text(SIGN_OUT_LABEL);
-            }
-            // Swap the menubar icon's status dot only when auth state flips.
+            // On an auth-state flip, swap the status dot and add or remove the
+            // "Sign out" item. "Sign out" shows only while signed in, appended
+            // last so it sits at the very bottom of the menu.
             let prev = tray
                 .last_signed_in
                 .swap(signed_in, std::sync::atomic::Ordering::Relaxed);
@@ -2021,49 +2016,26 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
                     tray.red.clone()
                 };
                 let _ = tray.tray.set_icon(Some(icon));
+                if signed_in {
+                    let _ = tray.menu.append(&tray.sign_out);
+                } else {
+                    let _ = tray.menu.remove(&tray.sign_out);
+                }
             }
         }
     });
 }
 
-/// The tray "Sign out" item needs two clicks, so one stray click cannot drop the
-/// session. The first click arms the item and shows the confirm label; a second
-/// click within the timeout signs out.
+/// The tray shows "Sign out" only while signed in, at the very bottom of the
+/// menu. There is no confirm step: a click signs out and the status dot turns
+/// red. Its position keeps it away from the other clickable items.
 const SIGN_OUT_LABEL: &str = "Sign out";
-const SIGN_OUT_CONFIRM_LABEL: &str = "Click again to confirm";
-const SIGN_OUT_CONFIRM_SECONDS: u64 = 4;
-
-/// Decide the next confirm deadline and whether to sign out now. A click within
-/// the window — a live deadline still in the future — confirms and disarms. Any
-/// other click arms a fresh window. The decision is time-based, not tied to the
-/// revert timer, so a click at the exact expiry is unambiguous. Pure, so the
-/// two-click timing is unit-tested without a tray.
-fn decide_sign_out(
-    deadline: Option<std::time::Instant>,
-    now: std::time::Instant,
-    window: Duration,
-) -> (Option<std::time::Instant>, bool) {
-    match deadline {
-        Some(d) if now < d => (None, true),
-        _ => (Some(now + window), false),
-    }
-}
-
-/// Set the tray "Sign out" label. Menu mutation must run on the main thread, so
-/// route every change through here; from the main thread this still applies.
-fn set_sign_out_label(app: &tauri::AppHandle, label: &'static str) {
-    let handle = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Some(tray) = handle.try_state::<TrayMenu>() {
-            let _ = tray.sign_out.set_text(label);
-        }
-    });
-}
 
 /// Clear the session at the user's request: drop the in-memory token, delete it
-/// from the OS credential store, forget any pending sign-in nonce, and return
-/// the tray to the signed-out state. An explicit sign out deletes the stored
-/// token, unlike an invalidated one.
+/// from the OS credential store, forget any pending sign-in nonce, and refresh
+/// the tray. refresh_tray then turns the dot red and removes the "Sign out"
+/// item. An explicit sign out deletes the stored token, unlike an invalidated
+/// one, so the next start does not reuse it.
 async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
     *state.auth_token.write().await = None;
     *state.pending_auth_state.write().await = None;
@@ -2076,46 +2048,12 @@ async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
     refresh_tray(app, state).await;
 }
 
-/// Handle a click on the tray "Sign out" item. Runs on the menu-event thread.
+/// Handle a click on the tray "Sign out" item.
 fn handle_sign_out_click(app: &tauri::AppHandle) {
-    let Some(tray) = app.try_state::<TrayMenu>() else {
-        return;
-    };
-    let window = Duration::from_secs(SIGN_OUT_CONFIRM_SECONDS);
-    let do_sign_out = {
-        let mut guard = tray.sign_out_deadline.lock().unwrap();
-        let (next, confirm) = decide_sign_out(*guard, std::time::Instant::now(), window);
-        *guard = next;
-        confirm
-    };
-    if do_sign_out {
-        set_sign_out_label(app, SIGN_OUT_LABEL);
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let state = app.state::<Arc<AppState>>().inner().clone();
-            sign_out(&app, &state).await;
-        });
-        return;
-    }
-    set_sign_out_label(app, SIGN_OUT_CONFIRM_LABEL);
-    // Revert the label once the window passes, unless a later click extended it.
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(window).await;
-        let expired = app
-            .try_state::<TrayMenu>()
-            .map(|tray| {
-                let mut guard = tray.sign_out_deadline.lock().unwrap();
-                let expired = guard.is_some_and(|d| std::time::Instant::now() >= d);
-                if expired {
-                    *guard = None;
-                }
-                expired
-            })
-            .unwrap_or(false);
-        if expired {
-            set_sign_out_label(&app, SIGN_OUT_LABEL);
-        }
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        sign_out(&app, &state).await;
     });
 }
 
@@ -2978,9 +2916,10 @@ pub fn run() {
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(app.handle(), &state_for_loop);
 
-            // Tray menu: live auth/countdown item, an Employee Hub link, a
-            // two-click "Sign out", and a version line. No quit. The auth item
-            // and the sign-out item update at runtime.
+            // Tray menu: live auth/countdown item, an Employee Hub link, and a
+            // version line. "Sign out" is appended below the version only while
+            // signed in (see refresh_tray), so it sits at the very bottom, away
+            // from the other clickable items. No quit.
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
@@ -2995,19 +2934,18 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
-            // Enabled only while signed in; refresh_tray keeps this in sync.
-            let sign_out_i = tauri::menu::MenuItem::with_id(
-                app,
-                "sign_out",
-                SIGN_OUT_LABEL,
-                authed,
-                None::<&str>,
-            )?;
             let version_i = tauri::menu::MenuItem::with_id(
                 app,
                 "version",
                 format!("Version {}", env!("CARGO_PKG_VERSION")),
                 false,
+                None::<&str>,
+            )?;
+            let sign_out_i = tauri::menu::MenuItem::with_id(
+                app,
+                "sign_out",
+                SIGN_OUT_LABEL,
+                true,
                 None::<&str>,
             )?;
             let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
@@ -3016,11 +2954,16 @@ pub fn run() {
                 &[
                     &item as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
                     &hub_i,
-                    &sign_out_i,
                     &sep,
                     &version_i,
                 ],
             )?;
+            // Start with "Sign out" present only if already signed in; the
+            // last_signed_in state below matches, so refresh_tray keeps it in
+            // sync on later flips.
+            if authed {
+                let _ = menu.append(&sign_out_i);
+            }
             // Status-dot icons: green when signed in, red when not. A tray
             // failure must not kill the agent: collection works without a
             // tray, and Linux gets a fallback window below.
@@ -3046,7 +2989,7 @@ pub fn run() {
                 app.manage(TrayMenu {
                     item: item.clone(),
                     sign_out: sign_out_i.clone(),
-                    sign_out_deadline: std::sync::Mutex::new(None),
+                    menu: menu.clone(),
                     tray,
                     green,
                     red,
@@ -3830,40 +3773,5 @@ listener {
         assert_eq!(program, "notify-send");
         assert!(args.contains(&"KlaayGuard".to_string()));
         assert!(args.contains(&"Sign in now.".to_string()));
-    }
-
-    // The tray "Sign out" needs two clicks within a time window. The decision is
-    // time-based, so a click at the exact expiry is unambiguous.
-    #[test]
-    fn sign_out_first_click_arms_a_window() {
-        let now = std::time::Instant::now();
-        let window = Duration::from_secs(4);
-        // Idle -> arm: no sign out, deadline set to now + window.
-        assert_eq!(
-            decide_sign_out(None, now, window),
-            (Some(now + window), false)
-        );
-    }
-
-    #[test]
-    fn sign_out_second_click_within_window_confirms() {
-        let now = std::time::Instant::now();
-        let window = Duration::from_secs(4);
-        let deadline = now + window;
-        let later = now + Duration::from_millis(100);
-        // Armed and still inside the window -> sign out, disarm.
-        assert_eq!(decide_sign_out(Some(deadline), later, window), (None, true));
-    }
-
-    #[test]
-    fn sign_out_click_after_window_rearms_not_confirms() {
-        let now = std::time::Instant::now();
-        let window = Duration::from_secs(4);
-        let expired = now - Duration::from_millis(1);
-        // The deadline already passed -> arm a fresh window, do not sign out.
-        assert_eq!(
-            decide_sign_out(Some(expired), now, window),
-            (Some(now + window), false)
-        );
     }
 }
