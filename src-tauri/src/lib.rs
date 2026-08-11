@@ -611,6 +611,52 @@ fn desktop_exec_field(path: &str) -> String {
     out
 }
 
+/// A fallback window is needed when the tray cannot serve as the UI: the
+/// tray failed to build, or no StatusNotifier host is on the bus to show it
+/// (stock GNOME without the AppIndicator extension).
+#[cfg(any(target_os = "linux", test))]
+fn fallback_window_needed(tray_built: bool, watcher_present: bool) -> bool {
+    !tray_built || !watcher_present
+}
+
+/// Whether a StatusNotifier host listens on the session bus. Errors and a
+/// slow bus both count as absent: a wedged bus must not hang startup, and if
+/// D-Bus is broken the tray cannot show either, so the window is the only UI.
+#[cfg(target_os = "linux")]
+fn status_notifier_watcher_present() -> bool {
+    // Probe on a worker thread with a hard deadline, so a stuck session bus
+    // cannot block the setup thread forever.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let probe = || -> zbus::Result<bool> {
+            let conn = zbus::blocking::Connection::session()?;
+            let proxy = zbus::blocking::fdo::DBusProxy::new(&conn)?;
+            let name = zbus::names::BusName::try_from("org.kde.StatusNotifierWatcher")?;
+            Ok(proxy.name_has_owner(name)?)
+        };
+        let _ = tx.send(probe().unwrap_or(false));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(present) => present,
+        Err(_) => {
+            log::warn!("StatusNotifierWatcher probe timed out; assuming no tray host");
+            false
+        }
+    }
+}
+
+/// Open the sign-in page from the fallback window.
+#[tauri::command]
+fn fallback_sign_in(app: tauri::AppHandle) {
+    open_sign_in(&app);
+}
+
+/// Open the employee hub from the fallback window.
+#[tauri::command]
+fn fallback_employee_hub(app: tauri::AppHandle) {
+    open_earthenware(&app, "/employee-hub");
+}
+
 /// Content of the Linux autostart entry.
 #[cfg(any(target_os = "linux", test))]
 fn autostart_entry(exec: &str) -> String {
@@ -1863,6 +1909,10 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(state.clone())
+        .invoke_handler(tauri::generate_handler![
+            fallback_sign_in,
+            fallback_employee_hub
+        ])
         // Single-instance must init first, so a second launch exits before the
         // other plugins spin up. Tauri documents this ordering.
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
@@ -2034,31 +2084,71 @@ pub fn run() {
                     &version_i,
                 ],
             )?;
-            // Status-dot icons: green when signed in, red when not.
-            let (green, red) = {
-                let base = app.default_window_icon().expect("default window icon");
-                (
+            // Status-dot icons: green when signed in, red when not. A tray
+            // failure must not kill the agent: collection works without a
+            // tray, and Linux gets a fallback window below.
+            let tray_built = (|| -> Result<(), Box<dyn std::error::Error>> {
+                let base = app
+                    .default_window_icon()
+                    .ok_or("no default window icon")?;
+                let (green, red) = (
                     icon_with_dot(base, [46, 204, 113, 255]),
                     icon_with_dot(base, [231, 76, 60, 255]),
-                )
-            };
-            let tray = tauri::tray::TrayIconBuilder::new()
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "auth_action" => open_sign_in(app),
-                    "employee_hub" => open_earthenware(app, "/employee-hub"),
-                    _ => {}
-                })
-                .icon(if authed { green.clone() } else { red.clone() })
-                .tooltip("KlaayGuard")
-                .menu(&menu)
-                .build(app)?;
-            app.manage(TrayMenu {
-                item: item.clone(),
-                tray,
-                green,
-                red,
-                last_signed_in: std::sync::atomic::AtomicBool::new(authed),
-            });
+                );
+                let tray = tauri::tray::TrayIconBuilder::new()
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "auth_action" => open_sign_in(app),
+                        "employee_hub" => open_earthenware(app, "/employee-hub"),
+                        _ => {}
+                    })
+                    .icon(if authed { green.clone() } else { red.clone() })
+                    .tooltip("KlaayGuard")
+                    .menu(&menu)
+                    .build(app)?;
+                app.manage(TrayMenu {
+                    item: item.clone(),
+                    tray,
+                    green,
+                    red,
+                    last_signed_in: std::sync::atomic::AtomicBool::new(authed),
+                });
+                Ok(())
+            })();
+            if let Err(e) = &tray_built {
+                log::error!("tray build failed; continuing without tray: {}", e);
+                sentry::capture_message(&format!("tray_build_failed: {}", e), Level::Error);
+            }
+
+            // Stock GNOME shows no AppIndicator tray. When the tray cannot
+            // be the UI, open a small window so the user can still sign in.
+            #[cfg(target_os = "linux")]
+            {
+                let watcher = status_notifier_watcher_present();
+                if fallback_window_needed(tray_built.is_ok(), watcher) {
+                    log::warn!(
+                        "tray unusable (built={}, watcher={}); opening fallback window",
+                        tray_built.is_ok(),
+                        watcher
+                    );
+                    if let Err(e) = tauri::WebviewWindowBuilder::new(
+                        app,
+                        "fallback",
+                        tauri::WebviewUrl::App("fallback.html".into()),
+                    )
+                    .title("KlaayGuard")
+                    .inner_size(440.0, 340.0)
+                    .build()
+                    {
+                        log::error!("fallback window failed: {}", e);
+                        sentry::capture_message(
+                            &format!("fallback_window_failed: {}", e),
+                            Level::Error,
+                        );
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            drop(tray_built);
             // Spawn the single collect-and-send loop + the tray countdown clock.
             let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
             let app_handle = app.handle().clone();
@@ -2082,6 +2172,20 @@ pub fn run() {
                     handle_deep_link_url(_app_handle, &st, &s);
                 }
             }
+        }
+        // Linux only. Closing the Linux fallback window destroys the last
+        // window, which would otherwise exit the whole app and stop
+        // collection; veto that window-triggered exit (code None). A
+        // deliberate app.exit(code) carries Some and still exits.
+        //
+        // Not compiled on macOS: the agent has no windows there, so this
+        // event only ever comes from an OS quit (Cmd+Q, logout, shutdown).
+        // Vetoing those would cancel a user logout — the wrong behavior and
+        // not needed, since there is no window to protect.
+        #[cfg(target_os = "linux")]
+        tauri::RunEvent::ExitRequested { code, api, .. } if code.is_none() => {
+            log::info!("exit requested by window close; keeping the agent running");
+            api.prevent_exit();
         }
         _ => {}
     });
@@ -2432,6 +2536,17 @@ mod happy_path_tests {
             dir,
             std::path::PathBuf::from("/Users/u/Library/Logs/com.klaay.app")
         );
+    }
+
+    #[test]
+    fn fallback_window_shown_only_when_tray_unusable() {
+        // Tray built and a StatusNotifier host answers: no window.
+        assert!(!fallback_window_needed(true, true));
+        // Tray failed to build: window.
+        assert!(fallback_window_needed(false, true));
+        // Tray built but nothing shows it (stock GNOME): window.
+        assert!(fallback_window_needed(true, false));
+        assert!(fallback_window_needed(false, false));
     }
 
     #[test]

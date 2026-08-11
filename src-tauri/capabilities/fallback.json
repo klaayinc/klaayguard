@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "fallback-window",
+  "description": "Core APIs for the Linux fallback window. Note: Tauri skips the command ACL for app-defined commands from local windows, so fallback_sign_in and fallback_employee_hub are reachable from any local window, not only this one. Both only open a browser URL, so the exposure is benign; remote origins stay blocked.",
+  "windows": ["fallback"],
+  "permissions": [
+    "core:default"
+  ]
+}

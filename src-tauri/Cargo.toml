@@ -65,6 +65,11 @@ getrandom = "0.2"  # CSPRNG for the sign-in state nonce (reuses the version alre
 [target.'cfg(unix)'.dependencies]
 nix = "0.26"  # For Unix-specific system calls if needed
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Session-bus probe for a StatusNotifier host (tray support detection).
+# Already in the tree through tauri-plugin-single-instance.
+zbus = "5"
+
 
 #[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Updater disabled
