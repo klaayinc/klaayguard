@@ -120,16 +120,39 @@ fn is_read_only_query(sql: &str) -> bool {
     lower.starts_with("select") || lower.starts_with("with")
 }
 
-/// Turn the /klaayguard/config payload into (logical_id, sql) pairs. An item with an
-/// explicit `sql` uses it; otherwise it defaults to `SELECT * FROM <id>`. Statements
-/// that aren't a single read-only query are dropped (see `is_read_only_query`).
-fn parse_config_queries(cfg: &Value) -> Vec<(String, String)> {
+/// Whether a config item's `platform` tag matches this host's OS. Mirrors
+/// osquery query-pack semantics: absent / empty / "all" runs everywhere;
+/// "posix" runs on linux and macos; any other value must equal the OS string
+/// (`std::env::consts::OS`: "linux" / "macos" / "windows"). `os` is a parameter
+/// so tests pin every branch without cross-compiling. Backward compatible: an
+/// item with no tag always runs, so older configs behave as before.
+fn platform_matches(tag: Option<&str>, os: &str) -> bool {
+    match tag.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("all") => true,
+        Some("posix") => os == "linux" || os == "macos",
+        // osquery names macOS "darwin"; Rust's OS string is "macos". Treat both
+        // as the same platform so the kiln tag "darwin" matches a macOS host.
+        Some("darwin") | Some("macos") => os == "macos",
+        Some(other) => other == os,
+    }
+}
+
+/// Turn the /klaayguard/config payload into (logical_id, sql) pairs for `os`. An
+/// item with an explicit `sql` uses it; otherwise it defaults to
+/// `SELECT * FROM <id>`. Items whose `platform` tag does not match `os` are
+/// skipped; statements that aren't a single read-only query are dropped (see
+/// `is_read_only_query`).
+fn parse_config_queries(cfg: &Value, os: &str) -> Vec<(String, String)> {
     cfg.get("data")
         .and_then(|d| d.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|item| {
                     let id = item.get("id").and_then(|v| v.as_str())?;
+                    let platform = item.get("platform").and_then(|v| v.as_str());
+                    if !platform_matches(platform, os) {
+                        return None;
+                    }
                     let sql = item
                         .get("sql")
                         .and_then(|v| v.as_str())
@@ -893,7 +916,7 @@ async fn run_cycle(
     }
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
-    let queries = parse_config_queries(&cfg_json);
+    let queries = parse_config_queries(&cfg_json, std::env::consts::OS);
 
     if queries.is_empty() {
         emit_error_and_focus(
@@ -2550,7 +2573,7 @@ mod happy_path_tests {
             {"type": "osquery-table", "id": "system_info"},
             {"type": "osquery-table", "id": "users", "sql": "SELECT username FROM users"}
         ]});
-        let q = parse_config_queries(&cfg);
+        let q = parse_config_queries(&cfg, "linux");
         assert_eq!(q.len(), 2);
         assert!(q.contains(&(
             "system_info".to_string(),
@@ -2564,8 +2587,48 @@ mod happy_path_tests {
 
     #[test]
     fn config_queries_empty_when_no_data() {
-        assert!(parse_config_queries(&json!({})).is_empty());
-        assert!(parse_config_queries(&json!({"data": []})).is_empty());
+        assert!(parse_config_queries(&json!({}), "linux").is_empty());
+        assert!(parse_config_queries(&json!({"data": []}), "linux").is_empty());
+    }
+
+    #[test]
+    fn platform_matches_mirrors_osquery_pack_semantics() {
+        // Absent / empty / "all" run everywhere.
+        assert!(platform_matches(None, "linux"));
+        assert!(platform_matches(Some(""), "macos"));
+        assert!(platform_matches(Some("all"), "windows"));
+        // posix = linux + macos, not windows.
+        assert!(platform_matches(Some("posix"), "linux"));
+        assert!(platform_matches(Some("posix"), "macos"));
+        assert!(!platform_matches(Some("posix"), "windows"));
+        // A specific OS matches only itself; case/whitespace insensitive.
+        assert!(platform_matches(Some("linux"), "linux"));
+        assert!(!platform_matches(Some("darwin"), "linux"));
+        // osquery's "darwin" tag matches a "macos" host (Rust's OS string).
+        assert!(platform_matches(Some("darwin"), "macos"));
+        assert!(platform_matches(Some(" Darwin "), "macos"));
+        assert!(platform_matches(Some("macos"), "macos"));
+    }
+
+    #[test]
+    fn config_queries_filter_by_platform() {
+        let cfg = json!({"data": [
+            {"id": "system_info"},
+            {"id": "screenlock", "platform": "darwin", "sql": "SELECT enabled FROM screenlock"},
+            {"id": "users", "platform": "linux", "sql": "SELECT username FROM users"}
+        ]});
+        // On Linux: the untagged item and the linux item run; the darwin item is skipped.
+        let linux = parse_config_queries(&cfg, "linux");
+        let linux_ids: Vec<&String> = linux.iter().map(|(id, _)| id).collect();
+        assert!(linux_ids.contains(&&"system_info".to_string()));
+        assert!(linux_ids.contains(&&"users".to_string()));
+        assert!(!linux_ids.contains(&&"screenlock".to_string()));
+        // On macOS: the untagged item and the darwin item run; the linux item is skipped.
+        let mac = parse_config_queries(&cfg, "macos");
+        let mac_ids: Vec<&String> = mac.iter().map(|(id, _)| id).collect();
+        assert!(mac_ids.contains(&&"system_info".to_string()));
+        assert!(mac_ids.contains(&&"screenlock".to_string()));
+        assert!(!mac_ids.contains(&&"users".to_string()));
     }
 
     #[test]
@@ -2586,7 +2649,7 @@ mod happy_path_tests {
             {"id": "system_info"},
             {"id": "evil", "sql": "SELECT 1; ATTACH DATABASE 'x' AS y"}
         ]});
-        let q = parse_config_queries(&cfg);
+        let q = parse_config_queries(&cfg, "linux");
         assert_eq!(q.len(), 1);
         assert_eq!(q[0].0, "system_info");
     }
