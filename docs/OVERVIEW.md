@@ -97,7 +97,8 @@ distribution). A Windows build is planned but not yet available.
 
 Platform differences on Linux:
 
-- The app does not update itself yet. Install each new version.
+- The AppImage updates itself. The .deb and .rpm installs do not; install
+  each new version through the package manager.
 - On a plain GNOME desktop the tray icon needs the "AppIndicator and
   KStatusNotifierItem Support" extension. Ubuntu includes it.
 

@@ -52,8 +52,9 @@ Almost nothing:
   GNOME desktop, install the "AppIndicator and KStatusNotifierItem
   Support" extension. Ubuntu includes it.
 - One sign-in in your browser after you install it.
-- Nothing else. It has no window and uses almost no battery. On macOS it
-  updates itself. On Linux, install new versions when your IT team asks.
+- Nothing else. It has no window and uses almost no battery. On macOS and on the
+  Linux AppImage it updates itself. For .deb or .rpm installs, install new
+  versions when your IT team asks.
 
 ## How do I install it on Linux?
 

@@ -1178,10 +1178,44 @@ struct SelectedUpdate {
     sha256: Option<String>,
 }
 
+/// Pick the AppImage asset for this architecture. `original_name` is the
+/// contract; the human label carries no architecture.
+#[cfg(any(target_os = "linux", test))]
+fn select_appimage_asset<'a>(assets: &'a [ReleaseAsset], arch: &str) -> Option<&'a ReleaseAsset> {
+    let infix = format!("Linux_{}", arch);
+    assets.iter().find(|asset| {
+        asset
+            .original_name
+            .as_deref()
+            .is_some_and(|n| n.ends_with(".AppImage") && n.contains(&infix))
+    })
+}
+
+/// The file to replace on self-update. Set only when this process runs from
+/// an AppImage; deb and rpm installs update through the package manager.
+#[cfg(any(target_os = "linux", test))]
+fn appimage_update_target(appimage_env: Option<&str>) -> Option<std::path::PathBuf> {
+    appimage_env
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Where to stage the downloaded AppImage: same directory as the target, so
+/// the final rename stays on one filesystem and is atomic.
+#[cfg(any(target_os = "linux", test))]
+fn staged_appimage_path(target: &std::path::Path, pid: u32) -> std::path::PathBuf {
+    let base = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "KlaayGuard.AppImage".to_string());
+    target.with_file_name(format!(".{}.update-{}", base, pid))
+}
+
 /// macOS artifact tags for the current host: (filename infix, friendly-name infix).
 /// Returns None on other systems: the installer below mounts a DMG, so a
 /// non-macOS host must not download one. Without this gate a Linux or Windows
 /// x86_64 host selects the Intel DMG, downloads it, and fails at mount time.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn host_arch_tags() -> Option<(&'static str, &'static str)> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -1196,6 +1230,7 @@ fn host_arch_tags() -> Option<(&'static str, &'static str)> {
 /// Pick the DMG asset matching this host's architecture. Prefers the real
 /// artifact filename (`original_name`); falls back to the friendly label only
 /// when it is absent. Returns None rather than guess the wrong architecture.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn select_dmg_asset<'a>(
     assets: &'a [ReleaseAsset],
     arch_tag: &str,
@@ -1451,19 +1486,54 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             release.version
         );
 
+        // Linux self-update replaces the AppImage file in place. deb and rpm
+        // installs go through the package manager, so they skip.
+        #[cfg(target_os = "linux")]
+        {
+            let appimage = std::env::var("APPIMAGE").ok();
+            let Some(_target) = appimage_update_target(appimage.as_deref()) else {
+                log::info!(
+                    "ℹ️  Auto-update on Linux serves AppImage installs only; this is not one"
+                );
+                return Ok(None);
+            };
+            return match select_appimage_asset(&release.assets, std::env::consts::ARCH) {
+                Some(asset) => {
+                    log::info!(
+                        "✅ Selected Linux AppImage update: {} (ID: {})",
+                        asset.original_name.as_deref().unwrap_or(&asset.name),
+                        asset.id
+                    );
+                    Ok(Some(SelectedUpdate {
+                        asset_id: asset.id.to_string(),
+                        sha256: asset.sha256.clone(),
+                    }))
+                }
+                None => {
+                    log::warn!(
+                        "⚠️  No Linux {} AppImage asset in the release",
+                        std::env::consts::ARCH
+                    );
+                    Ok(None)
+                }
+            };
+        }
+
         // The manifest returns every macOS build (arm64 + x64); the human-facing
         // `name` does not distinguish them, so match on `original_name` (the real
         // artifact filename) against THIS host's architecture. Picking the wrong
         // arch would install an app the arch-mismatch gate then refuses to launch.
+        #[cfg(not(target_os = "linux"))]
         let Some((arch_tag, arch_label)) = host_arch_tags() else {
             log::info!(
-                "ℹ️  Auto-update supports macOS only; skipping on {} {}",
+                "ℹ️  Auto-update supports macOS and Linux AppImage installs; skipping on {} {}",
                 std::env::consts::OS,
                 std::env::consts::ARCH
             );
             return Ok(None);
         };
 
+        #[cfg(not(target_os = "linux"))]
         if let Some(dmg_asset) = select_dmg_asset(&release.assets, arch_tag, arch_label) {
             log::info!(
                 "✅ Selected {} update: {} (ID: {})",
@@ -1502,6 +1572,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
     Ok(None)
 }
 
+#[allow(clippy::needless_return)] // the cfg-gated platform blocks need explicit returns
 async fn download_and_install_update_internal(
     api_base: &str,
     asset_id: &str,
@@ -1532,21 +1603,6 @@ async fn download_and_install_update_internal(
         return Err(error_msg);
     }
 
-    // Stage the download in a private, process-scoped temp path rather than the
-    // world-known ~/Downloads/KlaayGuard-update.dmg. The signature gate in
-    // replace_application verifies the *mounted* bundle, so this is defense-in-depth
-    // against a local process swapping the file between write and mount (TOCTOU).
-    let dmg_path =
-        std::env::temp_dir().join(format!("KlaayGuard-update-{}.dmg", std::process::id()));
-
-    log::info!("💾 Downloading to: {:?}", dmg_path);
-
-    // Save the DMG file
-    let mut file = std::fs::File::create(&dmg_path).map_err(|e| {
-        log::error!("❌ Failed to create update file: {}", e);
-        format!("Failed to create update file: {}", e)
-    })?;
-
     let bytes = response.bytes().await.map_err(|e| {
         log::error!("❌ Download error: {}", e);
         format!("Download error: {}", e)
@@ -1554,7 +1610,7 @@ async fn download_and_install_update_internal(
 
     log::info!("📊 Downloaded {} bytes", bytes.len());
 
-    // Verify integrity before we mount and swap a running security agent.
+    // Verify integrity before we swap a running security agent.
     match expected_sha256 {
         Some(expected) if !sha256_matches(&bytes, expected) => {
             let msg = format!("Update checksum mismatch for expected {}", expected);
@@ -1566,17 +1622,151 @@ async fn download_and_install_update_internal(
         None => log::warn!("⚠️  No checksum provided for update asset; skipping verification"),
     }
 
-    std::io::Write::write_all(&mut file, &bytes).map_err(|e| {
-        log::error!("❌ Write error: {}", e);
-        format!("Write error: {}", e)
-    })?;
+    #[cfg(target_os = "linux")]
+    {
+        // macOS gets a codesign gate after the checksum; Linux has nothing
+        // after it. Refuse to install unverifiable bytes.
+        if expected_sha256.is_none() {
+            let msg = "No checksum for the AppImage update; refusing to install".to_string();
+            log::error!("❌ {}", msg);
+            sentry::capture_message(&msg, Level::Error);
+            return Err(msg);
+        }
+        return install_appimage_update(&bytes, app);
+    }
 
-    log::info!("✅ Update downloaded successfully to: {:?}", dmg_path);
+    #[cfg(target_os = "macos")]
+    {
+        // Stage the download in a private, process-scoped temp path rather than the
+        // world-known ~/Downloads/KlaayGuard-update.dmg. The signature gate in
+        // replace_application verifies the *mounted* bundle, so this is defense-in-depth
+        // against a local process swapping the file between write and mount (TOCTOU).
+        let dmg_path =
+            std::env::temp_dir().join(format!("KlaayGuard-update-{}.dmg", std::process::id()));
 
-    // Mount the DMG and replace the app
-    log::info!("🔄 Starting application replacement process...");
-    replace_application(&dmg_path, app).await?;
+        log::info!("💾 Staging to: {:?}", dmg_path);
 
+        let mut file = std::fs::File::create(&dmg_path).map_err(|e| {
+            log::error!("❌ Failed to create update file: {}", e);
+            format!("Failed to create update file: {}", e)
+        })?;
+        std::io::Write::write_all(&mut file, &bytes).map_err(|e| {
+            log::error!("❌ Write error: {}", e);
+            format!("Write error: {}", e)
+        })?;
+
+        log::info!("✅ Update downloaded successfully to: {:?}", dmg_path);
+
+        // Mount the DMG and replace the app
+        log::info!("🔄 Starting application replacement process...");
+        replace_application(&dmg_path, app).await?;
+
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // app is consumed only by the linux and macOS install arms.
+        let _ = app;
+        Err("auto-update is not supported on this platform".to_string())
+    }
+}
+
+/// Replace the running AppImage with the downloaded one and relaunch.
+/// The staged file shares the target directory, so the rename is atomic;
+/// a failure at any step leaves the current, known-good file in place.
+#[cfg(target_os = "linux")]
+fn install_appimage_update(bytes: &[u8], app: &tauri::AppHandle) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let target = appimage_update_target(std::env::var("APPIMAGE").ok().as_deref())
+        .ok_or_else(|| "APPIMAGE not set; not an AppImage install".to_string())?;
+    let staged = staged_appimage_path(&target, std::process::id());
+
+    // Create the staged file exclusively (create_new) with private perms, so a
+    // pre-planted symlink or a hostile file in a shared directory cannot be
+    // followed or read mid-write. A leftover from a crashed run is removed
+    // first, then retried once.
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&staged)
+    };
+    let mut file = match open() {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&staged);
+            open().map_err(|e| format!("stage create failed: {}", e))?
+        }
+        Err(e) => return Err(format!("stage create failed: {}", e)),
+    };
+
+    // Write, then fsync before the rename. Without the sync a power loss can
+    // commit the rename ahead of the data blocks and brick the agent.
+    let write_and_sync = file
+        .write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .and_then(|_| std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)));
+    if let Err(e) = write_and_sync {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("stage write failed: {}", e));
+    }
+    drop(file);
+
+    if let Err(e) = std::fs::rename(&staged, &target) {
+        let _ = std::fs::remove_file(&staged);
+        let msg = format!("AppImage replace failed: {}", e);
+        log::error!("❌ {}", msg);
+        sentry::capture_message(&msg, Level::Error);
+        return Err(msg);
+    }
+    // Persist the directory entry so the swap survives a crash right after.
+    if let Some(dir) = target.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+
+    log::info!("✅ AppImage replaced at {:?}; relaunching", target);
+    // The single-instance plugin allows one process at a time, so the new one
+    // must start only after this one exits. Poll this PID rather than sleep a
+    // fixed time: a fixed sleep that is too short forwards to the dying
+    // primary and leaves the agent down. Pass the pid, path, and log path as
+    // positional arguments, never interpolated into the script text. If this
+    // process outlives the 30s cap, record it in the log before exec'ing.
+    let log_file = dirs::data_local_dir()
+        .map(|d| d.join("com.klaay.app/logs/KlaayGuard.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/dev/null"));
+    let spawn = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(
+            "pid=\"$1\"; target=\"$2\"; logf=\"$3\"; i=0; \
+             while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 150 ]; do \
+             sleep 0.2; i=$((i+1)); done; \
+             if kill -0 \"$pid\" 2>/dev/null; then \
+             echo \"[relaunch] old pid $pid still alive after 30s cap; exec anyway\" >>\"$logf\"; \
+             fi; exec \"$target\"",
+        )
+        .arg("sh")
+        .arg(std::process::id().to_string())
+        .arg(&target)
+        .arg(&log_file)
+        .spawn();
+    if let Err(e) = spawn {
+        // The update is already installed; only the relaunch failed. Report
+        // it, but do not return an error that reads as "update failed" — the
+        // new binary runs on the next start.
+        log::error!("relaunch spawn failed (update is installed): {}", e);
+        sentry::capture_message(
+            &format!("appimage_relaunch_spawn_failed: {}", e),
+            Level::Error,
+        );
+        return Ok(());
+    }
+    app.exit(0);
     Ok(())
 }
 
@@ -1648,6 +1838,8 @@ fn verify_klaay_signature(app_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+// Called only from the macOS update arm; dead on Linux and Windows.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 async fn replace_application(
     dmg_path: &std::path::Path,
     app: &tauri::AppHandle,
@@ -2535,6 +2727,55 @@ mod happy_path_tests {
         assert_eq!(
             dir,
             std::path::PathBuf::from("/Users/u/Library/Logs/com.klaay.app")
+        );
+    }
+
+    #[test]
+    fn appimage_asset_selected_by_arch_and_suffix() {
+        let assets = json!([
+            {"id": 1, "original_name": "KlaayGuard_0.2.0_Linux_x86_64_production.deb", "name": "Linux (Debian/Ubuntu .deb)"},
+            {"id": 2, "original_name": "KlaayGuard_0.2.0_macOS_x64_production.dmg", "name": "MacOS (Intel)"},
+            {"id": 3, "original_name": "KlaayGuard_0.2.0_Linux_aarch64_production.AppImage", "name": "Linux (AppImage)"},
+            {"id": 4, "original_name": "KlaayGuard_0.2.0_Linux_x86_64_production.AppImage", "name": "Linux (AppImage)"}
+        ]);
+        let assets: Vec<ReleaseAsset> = serde_json::from_value(assets).unwrap();
+        assert_eq!(select_appimage_asset(&assets, "x86_64").unwrap().id, 4);
+        assert_eq!(select_appimage_asset(&assets, "aarch64").unwrap().id, 3);
+        // The label alone must never match; original_name is the contract.
+        let label_only: Vec<ReleaseAsset> =
+            serde_json::from_value(json!([{"id": 9, "name": "Linux (AppImage)"}])).unwrap();
+        assert!(select_appimage_asset(&label_only, "x86_64").is_none());
+    }
+
+    #[test]
+    fn appimage_update_needs_the_appimage_env() {
+        // deb and rpm installs must not self-replace; only an AppImage run
+        // (APPIMAGE env set) may.
+        assert_eq!(
+            appimage_update_target(Some("/home/u/Apps/KlaayGuard.AppImage")),
+            Some(std::path::PathBuf::from("/home/u/Apps/KlaayGuard.AppImage"))
+        );
+        assert_eq!(appimage_update_target(Some("")), None);
+        assert_eq!(appimage_update_target(None), None);
+    }
+
+    #[test]
+    fn staged_appimage_lands_next_to_the_target() {
+        // The staged file must share the target directory so the final
+        // rename stays on one filesystem and is atomic.
+        let staged = staged_appimage_path(
+            std::path::Path::new("/home/u/Apps/KlaayGuard.AppImage"),
+            4242,
+        );
+        assert_eq!(staged.parent(), Some(std::path::Path::new("/home/u/Apps")));
+        assert!(staged
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("4242"));
+        assert_ne!(
+            staged,
+            std::path::PathBuf::from("/home/u/Apps/KlaayGuard.AppImage")
         );
     }
 
