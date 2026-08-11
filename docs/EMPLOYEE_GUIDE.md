@@ -64,13 +64,29 @@ Pick the file for your system from the link your IT team sends:
 - Fedora or RHEL: the `.rpm` file.
 - Arch or another distribution: the `.AppImage` file.
 
-To run the `.AppImage` file, do these two steps:
+To install the `.AppImage` file:
 
-1. Make the file executable.
-2. Run the file.
+1. Make the file executable:
 
-Open the app once after you install it. On that first run the app
-registers itself to start at login and to receive the sign-in link.
+   ```bash
+   chmod +x KlaayGuard_<version>_Linux_x86_64_<variant>.AppImage
+   ```
+
+2. Start it one time. Use the way that fits you:
+   - Double-click the file in your file manager, or
+   - Start it from your application launcher, or
+   - Start it from a terminal so it keeps running after the terminal closes:
+
+     ```bash
+     setsid -f ./KlaayGuard_<version>_Linux_x86_64_<variant>.AppImage
+     ```
+
+Do not run the AppImage in the foreground of a terminal. It stops when you close
+the terminal.
+
+On that first start the app registers itself to start at login and to receive
+the sign-in link. After that, the app starts by itself each time you log in. You
+do not need the terminal again.
 
 ## What do I need to do?
 
