@@ -1942,6 +1942,9 @@ fn open_sign_in(app: &tauri::AppHandle) {
 /// Handles + assets for keeping the tray in sync with auth state.
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
+    sign_out: tauri::menu::MenuItem<tauri::Wry>,
+    /// True after the first "Sign out" click, until the confirm click or timeout.
+    sign_out_armed: std::sync::atomic::AtomicBool,
     tray: tauri::tray::TrayIcon<tauri::Wry>,
     green: tauri::image::Image<'static>,
     red: tauri::image::Image<'static>,
@@ -1999,6 +2002,14 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray.item.set_text(&text);
             let _ = tray.item.set_enabled(enabled);
+            // "Sign out" only makes sense while signed in. When signed out, keep
+            // it disabled and reset it, so a stale confirm label cannot linger.
+            let _ = tray.sign_out.set_enabled(signed_in);
+            if !signed_in {
+                tray.sign_out_armed
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = tray.sign_out.set_text(SIGN_OUT_LABEL);
+            }
             // Swap the menubar icon's status dot only when auth state flips.
             let prev = tray
                 .last_signed_in
@@ -2011,6 +2022,76 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
                 };
                 let _ = tray.tray.set_icon(Some(icon));
             }
+        }
+    });
+}
+
+/// The tray "Sign out" item needs two clicks, so one stray click cannot drop the
+/// session. The first click arms the item and shows the confirm label; a second
+/// click within the timeout signs out.
+const SIGN_OUT_LABEL: &str = "Sign out";
+const SIGN_OUT_CONFIRM_LABEL: &str = "Click again to confirm";
+const SIGN_OUT_CONFIRM_SECONDS: u64 = 4;
+
+/// Decide the next label and whether to sign out, from whether the item was
+/// already armed. First click arms and shows the confirm label; second click
+/// signs out and resets the label.
+fn sign_out_click(was_armed: bool) -> (&'static str, bool) {
+    if was_armed {
+        (SIGN_OUT_LABEL, true)
+    } else {
+        (SIGN_OUT_CONFIRM_LABEL, false)
+    }
+}
+
+/// Clear the session at the user's request: drop the in-memory token, delete it
+/// from the OS credential store, and return the tray to the signed-out state.
+/// An explicit sign out deletes the stored token, unlike an invalidated one.
+async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    *state.auth_token.write().await = None;
+    if let Err(e) = keychain::delete_token() {
+        log::warn!("sign out: could not delete stored token: {}", e);
+    }
+    log::info!("user signed out from the tray");
+    let _ = app.emit("auth:status", json!({ "authenticated": false }));
+    add_breadcrumb("auth", "user_signed_out", Level::Info);
+    refresh_tray(app, state).await;
+}
+
+/// Handle a click on the tray "Sign out" item. Runs on the menu-event thread.
+fn handle_sign_out_click(app: &tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    let Some(tray) = app.try_state::<TrayMenu>() else {
+        return;
+    };
+    let was_armed = tray.sign_out_armed.swap(true, Ordering::Relaxed);
+    let (label, do_sign_out) = sign_out_click(was_armed);
+    let _ = tray.sign_out.set_text(label);
+    if do_sign_out {
+        tray.sign_out_armed.store(false, Ordering::Relaxed);
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<Arc<AppState>>().inner().clone();
+            sign_out(&app, &state).await;
+        });
+        return;
+    }
+    // Armed but not confirmed: revert the label after the timeout, unless a
+    // confirm click already disarmed it.
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(SIGN_OUT_CONFIRM_SECONDS)).await;
+        let still_armed = app
+            .try_state::<TrayMenu>()
+            .map(|t| t.sign_out_armed.swap(false, Ordering::Relaxed))
+            .unwrap_or(false);
+        if still_armed {
+            let handle = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                if let Some(tray) = handle.try_state::<TrayMenu>() {
+                    let _ = tray.sign_out.set_text(SIGN_OUT_LABEL);
+                }
+            });
         }
     });
 }
@@ -2874,8 +2955,9 @@ pub fn run() {
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(app.handle(), &state_for_loop);
 
-            // Tray menu: live auth/countdown item, an Employee Hub link, and a version
-            // line. No quit, no sign-out. Only the auth item updates at runtime.
+            // Tray menu: live auth/countdown item, an Employee Hub link, a
+            // two-click "Sign out", and a version line. No quit. The auth item
+            // and the sign-out item update at runtime.
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
@@ -2888,6 +2970,14 @@ pub fn run() {
                 "employee_hub",
                 "Employee Hub",
                 true,
+                None::<&str>,
+            )?;
+            // Enabled only while signed in; refresh_tray keeps this in sync.
+            let sign_out_i = tauri::menu::MenuItem::with_id(
+                app,
+                "sign_out",
+                SIGN_OUT_LABEL,
+                authed,
                 None::<&str>,
             )?;
             let version_i = tauri::menu::MenuItem::with_id(
@@ -2903,6 +2993,7 @@ pub fn run() {
                 &[
                     &item as &dyn tauri::menu::IsMenuItem<tauri::Wry>,
                     &hub_i,
+                    &sign_out_i,
                     &sep,
                     &version_i,
                 ],
@@ -2922,6 +3013,7 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "auth_action" => open_sign_in(app),
                         "employee_hub" => open_earthenware(app, "/employee-hub"),
+                        "sign_out" => handle_sign_out_click(app),
                         _ => {}
                     })
                     .icon(if authed { green.clone() } else { red.clone() })
@@ -2930,6 +3022,8 @@ pub fn run() {
                     .build(app)?;
                 app.manage(TrayMenu {
                     item: item.clone(),
+                    sign_out: sign_out_i.clone(),
+                    sign_out_armed: std::sync::atomic::AtomicBool::new(false),
                     tray,
                     green,
                     red,
@@ -3713,5 +3807,17 @@ listener {
         assert_eq!(program, "notify-send");
         assert!(args.contains(&"KlaayGuard".to_string()));
         assert!(args.contains(&"Sign in now.".to_string()));
+    }
+
+    // The tray "Sign out" needs two clicks. The first arms it and shows the
+    // confirm label; the second signs out.
+    #[test]
+    fn sign_out_first_click_arms_and_shows_confirm() {
+        assert_eq!(sign_out_click(false), (SIGN_OUT_CONFIRM_LABEL, false));
+    }
+
+    #[test]
+    fn sign_out_second_click_confirms_and_resets_label() {
+        assert_eq!(sign_out_click(true), (SIGN_OUT_LABEL, true));
     }
 }

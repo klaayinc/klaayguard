@@ -138,6 +138,18 @@ pub fn load_token() -> Result<Option<String>, String> {
     }
 }
 
+/// Remove the stored auth token. An explicit sign out deletes the credential so
+/// the next start does not reuse it. A missing entry is a success — the goal is
+/// "no token", which already holds.
+pub fn delete_token() -> Result<(), String> {
+    log::info!("🔑 keychain access: delete_password");
+    match entry_for(KEYCHAIN_ACCOUNT)?.delete_password() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete_password error: {}", e)),
+    }
+}
+
 pub fn save_device_identity(id: &str) -> Result<(), String> {
     match keyring_set(DEVICE_ID_ACCOUNT, id) {
         Ok(()) => {
