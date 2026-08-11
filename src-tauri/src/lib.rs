@@ -1896,13 +1896,77 @@ fn get_earthenware_url() -> String {
         .unwrap_or_else(|| "https://app.klaay.com".to_string())
 }
 
+/// Environment variables that the AppImage runtime (AppRun) points at the
+/// bundled libraries and GTK modules. A browser we spawn must not inherit the
+/// AppImage values, or it loads the wrong libraries and fails to start.
+#[cfg(target_os = "linux")]
+const APPIMAGE_CHILD_ENV_VARS: [&str; 6] = [
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "GTK_PATH",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GIO_MODULE_DIR",
+    "GSETTINGS_SCHEMA_DIR",
+];
+
+/// Remove the colon-separated entries that live under `appdir` (the AppImage
+/// mount point). Returns the remaining entries, or None when nothing is left,
+/// which tells the caller to unset the variable for the child process.
+#[cfg(target_os = "linux")]
+fn strip_appimage_paths(value: &str, appdir: &str) -> Option<String> {
+    let appdir = appdir.trim_end_matches('/');
+    let prefix = format!("{}/", appdir);
+    let kept: Vec<&str> = value
+        .split(':')
+        .filter(|p| !p.is_empty() && *p != appdir && !p.starts_with(&prefix))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(":"))
+}
+
+/// Open a URL in the user's default browser.
+///
+/// Inside a Linux AppImage, `xdg-open` and the browser it launches inherit the
+/// AppImage's `LD_LIBRARY_PATH` and GTK module variables, so the browser loads
+/// the bundled libraries and fails to start — sign-in then never opens, with no
+/// error. When we detect the AppImage (`APPDIR` is set), spawn `xdg-open`
+/// ourselves with those variables stripped of AppImage paths. Off Linux, and on
+/// Linux outside an AppImage, use the opener plugin unchanged.
+fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if let Some(appdir) = std::env::var("APPDIR").ok().filter(|s| !s.is_empty()) {
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url);
+        for var in APPIMAGE_CHILD_ENV_VARS {
+            if let Ok(current) = std::env::var(var) {
+                match strip_appimage_paths(&current, &appdir) {
+                    Some(kept) => {
+                        cmd.env(var, kept);
+                    }
+                    None => {
+                        cmd.env_remove(var);
+                    }
+                }
+            }
+        }
+        match cmd.spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                log::warn!("sanitized xdg-open failed ({e}); falling back to opener plugin");
+            }
+        }
+    }
+    app.opener()
+        .open_url(url.to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Open the browser to the Earthenware sign-in page; it deep-links back via
 /// `klaayguard://auth-callback?token=…`. Invoked from the tray "Sign in" item.
 /// Open an Earthenware path in the default browser.
 fn open_earthenware(app: &tauri::AppHandle, path: &str) {
     let url = format!("{}{}", get_earthenware_url(), path);
     log::info!("opening url={}", url);
-    if let Err(e) = app.opener().open_url(url.clone(), None::<&str>) {
+    if let Err(e) = open_external_url(app, &url) {
         log::error!("failed to open url {}: {}", url, e);
     }
 }
@@ -3698,5 +3762,61 @@ listener {
         assert_eq!(program, "notify-send");
         assert!(args.contains(&"KlaayGuard".to_string()));
         assert!(args.contains(&"Sign in now.".to_string()));
+    }
+
+    // The AppImage sets LD_LIBRARY_PATH and the GTK module vars to its own mount.
+    // A browser we spawn must not inherit those, or it loads the wrong libraries
+    // and never opens. strip_appimage_paths removes only the AppImage entries.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_drops_every_mount_entry() {
+        let value = "/tmp/.mount_KlaayX/usr/lib:/tmp/.mount_KlaayX/usr/lib/x86_64-linux-gnu";
+        assert_eq!(strip_appimage_paths(value, "/tmp/.mount_KlaayX"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_keeps_system_entries() {
+        let value = "/tmp/.mount_KlaayX/usr/lib:/opt/foo/lib:/usr/lib";
+        assert_eq!(
+            strip_appimage_paths(value, "/tmp/.mount_KlaayX"),
+            Some("/opt/foo/lib:/usr/lib".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_single_mount_file_is_removed() {
+        // GDK_PIXBUF_MODULE_FILE is a single path, not a list.
+        let value = "/tmp/.mount_KlaayX/usr/lib/gdk-pixbuf/loaders.cache";
+        assert_eq!(strip_appimage_paths(value, "/tmp/.mount_KlaayX"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_leaves_non_appimage_value_untouched() {
+        assert_eq!(
+            strip_appimage_paths("/usr/lib", "/tmp/.mount_KlaayX"),
+            Some("/usr/lib".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_matches_on_a_path_boundary() {
+        // A directory that merely starts with the mount name is not under it.
+        assert_eq!(
+            strip_appimage_paths("/tmp/.mount_KlaayXtra/lib", "/tmp/.mount_KlaayX"),
+            Some("/tmp/.mount_KlaayXtra/lib".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_tolerates_trailing_slash_and_empties() {
+        assert_eq!(
+            strip_appimage_paths("/tmp/.mount_KlaayX/usr/lib::", "/tmp/.mount_KlaayX/"),
+            None
+        );
     }
 }
