@@ -1943,8 +1943,9 @@ fn open_sign_in(app: &tauri::AppHandle) {
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
     sign_out: tauri::menu::MenuItem<tauri::Wry>,
-    /// True after the first "Sign out" click, until the confirm click or timeout.
-    sign_out_armed: std::sync::atomic::AtomicBool,
+    /// Deadline for the two-click confirm. Some(t) means armed until t; None
+    /// means idle. Set under this lock on the main and timer threads.
+    sign_out_deadline: std::sync::Mutex<Option<std::time::Instant>>,
     tray: tauri::tray::TrayIcon<tauri::Wry>,
     green: tauri::image::Image<'static>,
     red: tauri::image::Image<'static>,
@@ -2006,8 +2007,7 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
             // it disabled and reset it, so a stale confirm label cannot linger.
             let _ = tray.sign_out.set_enabled(signed_in);
             if !signed_in {
-                tray.sign_out_armed
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                *tray.sign_out_deadline.lock().unwrap() = None;
                 let _ = tray.sign_out.set_text(SIGN_OUT_LABEL);
             }
             // Swap the menubar icon's status dot only when auth state flips.
@@ -2033,22 +2033,40 @@ const SIGN_OUT_LABEL: &str = "Sign out";
 const SIGN_OUT_CONFIRM_LABEL: &str = "Click again to confirm";
 const SIGN_OUT_CONFIRM_SECONDS: u64 = 4;
 
-/// Decide the next label and whether to sign out, from whether the item was
-/// already armed. First click arms and shows the confirm label; second click
-/// signs out and resets the label.
-fn sign_out_click(was_armed: bool) -> (&'static str, bool) {
-    if was_armed {
-        (SIGN_OUT_LABEL, true)
-    } else {
-        (SIGN_OUT_CONFIRM_LABEL, false)
+/// Decide the next confirm deadline and whether to sign out now. A click within
+/// the window — a live deadline still in the future — confirms and disarms. Any
+/// other click arms a fresh window. The decision is time-based, not tied to the
+/// revert timer, so a click at the exact expiry is unambiguous. Pure, so the
+/// two-click timing is unit-tested without a tray.
+fn decide_sign_out(
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+    window: Duration,
+) -> (Option<std::time::Instant>, bool) {
+    match deadline {
+        Some(d) if now < d => (None, true),
+        _ => (Some(now + window), false),
     }
 }
 
+/// Set the tray "Sign out" label. Menu mutation must run on the main thread, so
+/// route every change through here; from the main thread this still applies.
+fn set_sign_out_label(app: &tauri::AppHandle, label: &'static str) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray) = handle.try_state::<TrayMenu>() {
+            let _ = tray.sign_out.set_text(label);
+        }
+    });
+}
+
 /// Clear the session at the user's request: drop the in-memory token, delete it
-/// from the OS credential store, and return the tray to the signed-out state.
-/// An explicit sign out deletes the stored token, unlike an invalidated one.
+/// from the OS credential store, forget any pending sign-in nonce, and return
+/// the tray to the signed-out state. An explicit sign out deletes the stored
+/// token, unlike an invalidated one.
 async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
     *state.auth_token.write().await = None;
+    *state.pending_auth_state.write().await = None;
     if let Err(e) = keychain::delete_token() {
         log::warn!("sign out: could not delete stored token: {}", e);
     }
@@ -2060,15 +2078,18 @@ async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
 
 /// Handle a click on the tray "Sign out" item. Runs on the menu-event thread.
 fn handle_sign_out_click(app: &tauri::AppHandle) {
-    use std::sync::atomic::Ordering;
     let Some(tray) = app.try_state::<TrayMenu>() else {
         return;
     };
-    let was_armed = tray.sign_out_armed.swap(true, Ordering::Relaxed);
-    let (label, do_sign_out) = sign_out_click(was_armed);
-    let _ = tray.sign_out.set_text(label);
+    let window = Duration::from_secs(SIGN_OUT_CONFIRM_SECONDS);
+    let do_sign_out = {
+        let mut guard = tray.sign_out_deadline.lock().unwrap();
+        let (next, confirm) = decide_sign_out(*guard, std::time::Instant::now(), window);
+        *guard = next;
+        confirm
+    };
     if do_sign_out {
-        tray.sign_out_armed.store(false, Ordering::Relaxed);
+        set_sign_out_label(app, SIGN_OUT_LABEL);
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let state = app.state::<Arc<AppState>>().inner().clone();
@@ -2076,22 +2097,24 @@ fn handle_sign_out_click(app: &tauri::AppHandle) {
         });
         return;
     }
-    // Armed but not confirmed: revert the label after the timeout, unless a
-    // confirm click already disarmed it.
+    set_sign_out_label(app, SIGN_OUT_CONFIRM_LABEL);
+    // Revert the label once the window passes, unless a later click extended it.
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(SIGN_OUT_CONFIRM_SECONDS)).await;
-        let still_armed = app
+        tokio::time::sleep(window).await;
+        let expired = app
             .try_state::<TrayMenu>()
-            .map(|t| t.sign_out_armed.swap(false, Ordering::Relaxed))
-            .unwrap_or(false);
-        if still_armed {
-            let handle = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                if let Some(tray) = handle.try_state::<TrayMenu>() {
-                    let _ = tray.sign_out.set_text(SIGN_OUT_LABEL);
+            .map(|tray| {
+                let mut guard = tray.sign_out_deadline.lock().unwrap();
+                let expired = guard.is_some_and(|d| std::time::Instant::now() >= d);
+                if expired {
+                    *guard = None;
                 }
-            });
+                expired
+            })
+            .unwrap_or(false);
+        if expired {
+            set_sign_out_label(&app, SIGN_OUT_LABEL);
         }
     });
 }
@@ -3023,7 +3046,7 @@ pub fn run() {
                 app.manage(TrayMenu {
                     item: item.clone(),
                     sign_out: sign_out_i.clone(),
-                    sign_out_armed: std::sync::atomic::AtomicBool::new(false),
+                    sign_out_deadline: std::sync::Mutex::new(None),
                     tray,
                     green,
                     red,
@@ -3809,15 +3832,38 @@ listener {
         assert!(args.contains(&"Sign in now.".to_string()));
     }
 
-    // The tray "Sign out" needs two clicks. The first arms it and shows the
-    // confirm label; the second signs out.
+    // The tray "Sign out" needs two clicks within a time window. The decision is
+    // time-based, so a click at the exact expiry is unambiguous.
     #[test]
-    fn sign_out_first_click_arms_and_shows_confirm() {
-        assert_eq!(sign_out_click(false), (SIGN_OUT_CONFIRM_LABEL, false));
+    fn sign_out_first_click_arms_a_window() {
+        let now = std::time::Instant::now();
+        let window = Duration::from_secs(4);
+        // Idle -> arm: no sign out, deadline set to now + window.
+        assert_eq!(
+            decide_sign_out(None, now, window),
+            (Some(now + window), false)
+        );
     }
 
     #[test]
-    fn sign_out_second_click_confirms_and_resets_label() {
-        assert_eq!(sign_out_click(true), (SIGN_OUT_LABEL, true));
+    fn sign_out_second_click_within_window_confirms() {
+        let now = std::time::Instant::now();
+        let window = Duration::from_secs(4);
+        let deadline = now + window;
+        let later = now + Duration::from_millis(100);
+        // Armed and still inside the window -> sign out, disarm.
+        assert_eq!(decide_sign_out(Some(deadline), later, window), (None, true));
+    }
+
+    #[test]
+    fn sign_out_click_after_window_rearms_not_confirms() {
+        let now = std::time::Instant::now();
+        let window = Duration::from_secs(4);
+        let expired = now - Duration::from_millis(1);
+        // The deadline already passed -> arm a fresh window, do not sign out.
+        assert_eq!(
+            decide_sign_out(Some(expired), now, window),
+            (Some(now + window), false)
+        );
     }
 }
