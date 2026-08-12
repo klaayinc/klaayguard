@@ -778,7 +778,7 @@ fn build_payload_items(
 /// handling stays the backstop for a token that later turns out bad.
 async fn token_definitely_invalid(base: &str, token: &str) -> bool {
     let client = match reqwest::Client::builder()
-        .user_agent("klaayguard/0.1")
+        .user_agent(concat!("KlaayGuard/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -1040,6 +1040,15 @@ struct JsonApiPayload {
     meta: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     jsonapi: Option<serde_json::Value>,
+}
+
+/// The check-in `meta`: the device identity plus the agent version, so the
+/// backend can record which build sent each check-in.
+fn checkin_meta(device_uuid: &str) -> serde_json::Value {
+    json!({
+        "device_uuid": device_uuid,
+        "app_version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 /// Pull the hardware serial from osquery `system_info` rows. Do not fall back
@@ -1556,7 +1565,7 @@ async fn run_cycle(
     }
     let payload = JsonApiPayload {
         data: items,
-        meta: Some(json!({ "device_uuid": device_serial })),
+        meta: Some(checkin_meta(&device_serial)),
         jsonapi: Some(json!({ "version": "1.0" })),
     };
 
@@ -1642,7 +1651,7 @@ async fn run_cycle(
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
-            .user_agent("klaayguard/0.1")
+            .user_agent(concat!("KlaayGuard/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client");
 
@@ -3773,5 +3782,15 @@ listener {
         assert_eq!(program, "notify-send");
         assert!(args.contains(&"KlaayGuard".to_string()));
         assert!(args.contains(&"Sign in now.".to_string()));
+    }
+
+    // Every check-in must carry the device id and the running agent version, so
+    // the backend can record which build sent it.
+    #[test]
+    fn checkin_meta_carries_device_and_agent_version() {
+        let m = checkin_meta("device-abc");
+        assert_eq!(m["device_uuid"], "device-abc");
+        assert_eq!(m["app_version"], env!("CARGO_PKG_VERSION"));
+        assert!(!m["app_version"].as_str().unwrap().is_empty());
     }
 }
