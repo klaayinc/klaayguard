@@ -2584,6 +2584,153 @@ fn verify_klaay_signature(app_path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The mount point (`/Volumes/...`) from `hdiutil attach` output. hdiutil prints
+/// a table; the mount point is the last tab-separated field of the line that
+/// names a `/Volumes/` path. A volume name may contain spaces, so split on tabs,
+/// not spaces.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_hdiutil_mount_point(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .find(|line| line.contains("/Volumes/"))
+        .and_then(|line| line.split('\t').next_back())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Where to stage the downloaded `.app`: the same directory as the target, so
+/// the final rename stays on one filesystem and is atomic. Mirrors
+/// `staged_appimage_path` for the macOS bundle.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn staged_app_path(target: &std::path::Path, pid: u32) -> std::path::PathBuf {
+    let base = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "KlaayGuard.app".to_string());
+    target.with_file_name(format!(".{}.update-{}", base, pid))
+}
+
+/// Detach a mounted update volume. Tries a graceful detach, then a forced one,
+/// so a busy volume still comes down. Runs on every path — success or failure —
+/// so a failed update never leaks a `/Volumes/KlaayGuard` mount that forces the
+/// next one to mount as `/Volumes/KlaayGuard 1`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn detach_dmg(mount_point: &str) {
+    log::info!("💿 Unmounting DMG from: {}", mount_point);
+    let detached = std::process::Command::new("hdiutil")
+        .args(["detach", mount_point])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if detached {
+        log::info!("✅ DMG unmounted successfully");
+        return;
+    }
+    log::warn!("⚠️  Graceful detach failed; forcing");
+    let _ = std::process::Command::new("hdiutil")
+        .args(["detach", "-force", mount_point])
+        .status();
+}
+
+/// Install the new bundle next to the target, verify it, then swap it in with
+/// atomic renames.
+///
+/// The old, racy path deleted `/Applications/KlaayGuard.app` and then copied the
+/// new one on top. If anything failed in that window — or the machine was busy —
+/// the app was simply gone, and the launchd `KeepAlive` job spun trying to open a
+/// missing bundle (191,227 log lines on one test Mac). This path never deletes
+/// the live app: it copies the new bundle beside it, verifies the copy, and
+/// swaps by rename. The app is only ever absent for one metadata rename, and the
+/// old agent keeps running until the swap completes.
+#[cfg(target_os = "macos")]
+fn stage_verify_and_swap(
+    source_app: &std::path::Path,
+    target_app: &std::path::Path,
+) -> Result<(), String> {
+    let pid = std::process::id();
+    let staged = staged_app_path(target_app, pid);
+    let base = target_app
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "KlaayGuard.app".to_string());
+    let backup = target_app.with_file_name(format!(".{}.old-{}", base, pid));
+
+    // Clear leftovers from any earlier crashed update.
+    let _ = std::fs::remove_dir_all(&staged);
+    let _ = std::fs::remove_dir_all(&backup);
+
+    // 1) Copy the new bundle next to the target. `ditto` is Apple's tool for
+    //    copying an `.app`: it preserves symlinks, extended attributes, and the
+    //    code signature that `spctl` then checks.
+    log::info!("📋 Staging new app at {:?}", staged);
+    let copy = std::process::Command::new("/usr/bin/ditto")
+        .arg(source_app)
+        .arg(&staged)
+        .status()
+        .map_err(|e| format!("ditto spawn failed: {}", e))?;
+    if !copy.success() {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err("Failed to stage new app (ditto)".to_string());
+    }
+
+    // 2) Verify the STAGED copy — the exact bytes we will run, not the mounted
+    //    source. A copy that stripped or corrupted the signature fails here,
+    //    before we touch the working install.
+    if let Err(e) = verify_klaay_signature(&staged) {
+        log::error!("❌ Update signature verification failed: {}", e);
+        sentry::capture_message(&format!("update_signature_rejected:{}", e), Level::Error);
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(format!("Refusing unverified update: {}", e));
+    }
+
+    // 3) Swap with renames on one filesystem. Move the old app aside, move the
+    //    new one in, then delete the old. If the second rename fails, roll the
+    //    old app back so the agent keeps a working install.
+    if target_app.exists() {
+        std::fs::rename(target_app, &backup)
+            .map_err(|e| format!("Failed to move old app aside: {}", e))?;
+    }
+    match std::fs::rename(&staged, target_app) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            log::info!("✅ New app swapped into place");
+            Ok(())
+        }
+        Err(e) => {
+            if backup.exists() {
+                let _ = std::fs::rename(&backup, target_app);
+            }
+            let _ = std::fs::remove_dir_all(&staged);
+            Err(format!("Failed to swap new app into place: {}", e))
+        }
+    }
+}
+
+/// Verify and install the mounted bundle into `/Applications`. Returns without
+/// touching the disk on a non-macOS host — this arm only runs on macOS.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn install_from_mount(mount_point: &str) -> Result<(), String> {
+    let source_app = std::path::Path::new(mount_point).join("KlaayGuard.app");
+    let target_app = std::path::Path::new("/Applications/KlaayGuard.app");
+
+    log::info!("📂 Source app: {:?}", source_app);
+    log::info!("📂 Target app: {:?}", target_app);
+
+    if !source_app.exists() {
+        return Err(format!("Source app not found at: {:?}", source_app));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        stage_verify_and_swap(&source_app, target_app)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = target_app;
+        Err("macOS update path invoked on a non-macOS host".to_string())
+    }
+}
+
 // Called only from the macOS update arm; dead on Linux and Windows.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 async fn replace_application(
@@ -2592,9 +2739,9 @@ async fn replace_application(
 ) -> Result<(), String> {
     log::info!("💿 Mounting DMG: {:?}", dmg_path);
 
-    // Mount the DMG
+    // Mount the DMG. `-nobrowse` keeps the update volume out of Finder.
     let mount_output = std::process::Command::new("hdiutil")
-        .args(["attach", dmg_path.to_str().unwrap()])
+        .args(["attach", "-nobrowse", dmg_path.to_str().unwrap()])
         .output()
         .map_err(|e| {
             log::error!("❌ Failed to mount DMG: {}", e);
@@ -2611,117 +2758,32 @@ async fn replace_application(
         return Err(error_msg);
     }
 
-    // Extract mount point from hdiutil output
     let mount_output_str = String::from_utf8_lossy(&mount_output.stdout);
     log::info!("📋 hdiutil output: {}", mount_output_str);
 
-    let mount_point = mount_output_str
-        .lines()
-        .find(|line| line.contains("/Volumes/"))
+    let mount_point = parse_hdiutil_mount_point(&mount_output_str)
         .ok_or_else(|| {
             log::error!("❌ Could not find mount point in hdiutil output");
-            "Could not find mount point"
+            "Could not find mount point".to_string()
         })?
-        .split('\t')
-        .next_back()
-        .ok_or_else(|| {
-            log::error!("❌ Could not parse mount point from line");
-            "Could not parse mount point"
-        })?;
+        .to_string();
 
     log::info!("📍 Mount point: {}", mount_point);
 
-    let source_app = std::path::Path::new(mount_point).join("KlaayGuard.app");
-    let target_app = std::path::Path::new("/Applications/KlaayGuard.app");
+    // Install, then ALWAYS detach the volume — success or failure — so a failed
+    // update leaves no mounted `/Volumes/KlaayGuard` behind.
+    let result = install_from_mount(&mount_point);
+    detach_dmg(&mount_point);
 
-    log::info!("📂 Source app: {:?}", source_app);
-    log::info!("📂 Target app: {:?}", target_app);
-
-    // Check if source app exists
-    if !source_app.exists() {
-        let error_msg = format!("Source app not found at: {:?}", source_app);
-        log::error!("❌ {}", error_msg);
-        return Err(error_msg);
-    }
-
-    // Independent trust anchor: refuse to install anything not signed by Klaay and
-    // notarized. This is the gate that turns "the server said so" into a verifiable
-    // guarantee. On failure, detach the DMG and abort — the running agent is untouched.
-    #[cfg(target_os = "macos")]
-    if let Err(e) = verify_klaay_signature(&source_app) {
-        log::error!("❌ Update signature verification failed: {}", e);
-        sentry::capture_message(&format!("update_signature_rejected:{}", e), Level::Error);
-        let _ = std::process::Command::new("hdiutil")
-            .args(["detach", mount_point])
-            .output();
-        return Err(format!("Refusing unverified update: {}", e));
-    }
-
-    // Remove old app and copy new one
-    if target_app.exists() {
-        log::info!("🗑️  Removing old app from: {:?}", target_app);
-        std::fs::remove_dir_all(target_app).map_err(|e| {
-            log::error!("❌ Failed to remove old app: {}", e);
-            format!("Failed to remove old app: {}", e)
-        })?;
-        log::info!("✅ Old app removed successfully");
-    } else {
-        log::info!("ℹ️  No existing app found at target location");
-    }
-
-    log::info!(
-        "📋 Copying new app from {:?} to {:?}",
-        source_app,
-        target_app
-    );
-    let copy_result = std::process::Command::new("cp")
-        .args([
-            "-R",
-            source_app.to_str().unwrap(),
-            target_app.to_str().unwrap(),
-        ])
-        .status()
-        .map_err(|e| {
-            log::error!("❌ Failed to copy new app: {}", e);
-            format!("Failed to copy new app: {}", e)
-        })?;
-
-    if !copy_result.success() {
-        let error_msg = "Failed to copy new app - cp command failed".to_string();
-        log::error!("❌ {}", error_msg);
-        return Err(error_msg);
-    }
-
-    log::info!("✅ New app copied successfully");
-
-    // Unmount the DMG
-    log::info!("💿 Unmounting DMG from: {}", mount_point);
-    let unmount_result = std::process::Command::new("hdiutil")
-        .args(["detach", mount_point])
-        .status()
-        .map_err(|e| {
-            log::error!("❌ Failed to unmount DMG: {}", e);
-            format!("Failed to unmount DMG: {}", e)
-        })?;
-
-    if !unmount_result.success() {
-        log::warn!("⚠️  DMG unmount failed, but continuing...");
-    } else {
-        log::info!("✅ DMG unmounted successfully");
-    }
-
-    // Remove the DMG file
+    // Best-effort: drop the downloaded DMG.
     log::info!("🗑️  Removing temporary DMG file: {:?}", dmg_path);
     if let Err(e) = std::fs::remove_file(dmg_path) {
         log::warn!("⚠️  Failed to remove DMG file: {}", e);
-        // Don't fail the whole process for this
-    } else {
-        log::info!("✅ Temporary DMG file removed");
     }
 
-    log::info!("🎉 Application updated successfully! Restarting...");
+    result?;
 
-    // Restart the application
+    log::info!("🎉 Application updated successfully! Restarting...");
     app.restart();
 }
 /// Main entry point for the KlaayGuard security monitoring application.
@@ -3763,6 +3825,50 @@ listener {
             staged,
             std::path::PathBuf::from("/home/u/Apps/KlaayGuard.AppImage")
         );
+    }
+
+    #[test]
+    fn staged_app_lands_next_to_the_target() {
+        // The staged bundle must share the target directory so the final rename
+        // stays on one filesystem and is atomic.
+        let staged = staged_app_path(std::path::Path::new("/Applications/KlaayGuard.app"), 4242);
+        assert_eq!(staged.parent(), Some(std::path::Path::new("/Applications")));
+        assert!(staged
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("4242"));
+        assert_ne!(
+            staged,
+            std::path::PathBuf::from("/Applications/KlaayGuard.app")
+        );
+    }
+
+    #[test]
+    fn parses_mount_point_from_hdiutil_output() {
+        // Real `hdiutil attach` output: a table of dev node, type, mount point,
+        // separated by tabs. Take the mount point off the /Volumes line.
+        let out = "/dev/disk4          \tGUID_partition_scheme          \t\n\
+                   /dev/disk4s1        \tApple_APFS                     \t\n\
+                   /dev/disk4s2        \tApple_HFS                      \t/Volumes/KlaayGuard\n";
+        assert_eq!(parse_hdiutil_mount_point(out), Some("/Volumes/KlaayGuard"));
+    }
+
+    #[test]
+    fn parses_mount_point_with_a_space_in_the_volume_name() {
+        // A leaked prior mount forces this one to " 1"; the name has a space, so
+        // splitting on tabs (not spaces) must still return the whole path.
+        let out = "/dev/disk5s2        \tApple_HFS                      \t/Volumes/KlaayGuard 1\n";
+        assert_eq!(
+            parse_hdiutil_mount_point(out),
+            Some("/Volumes/KlaayGuard 1")
+        );
+    }
+
+    #[test]
+    fn no_mount_point_when_hdiutil_output_has_no_volume() {
+        assert_eq!(parse_hdiutil_mount_point("/dev/disk9\tApple_HFS\t\n"), None);
+        assert_eq!(parse_hdiutil_mount_point(""), None);
     }
 
     #[test]
