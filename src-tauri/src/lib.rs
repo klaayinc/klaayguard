@@ -841,15 +841,30 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
 
     match outcome {
         Some(true) => {
-            // A failed save means the token lives in memory only and the user
-            // signs in again on every launch. Common on Linux without a
-            // Secret Service daemon — make it visible instead of silent.
-            if let Err(e) = keychain::save_token(&tok) {
-                log::error!("keychain: token save failed: {}", e);
-                sentry::capture_message(
-                    &format!("keychain_token_save_failed: {}", e),
-                    Level::Error,
-                );
+            // The keyring is the primary store. Without a Secret Service daemon
+            // (common on Linux) the agent falls back to a user-only file so the
+            // sign-in still survives a reboot. Tell the user the store is
+            // degraded instead of failing silently.
+            match keychain::save_token(&tok) {
+                Ok(keychain::CredentialStore::Keyring) => {}
+                Ok(keychain::CredentialStore::File) => {
+                    log::warn!("secure credential store unavailable; saved sign-in to a file");
+                    notify_user(
+                        "KlaayGuard",
+                        "No secure credential store found. Your sign-in is saved with reduced \
+                         protection. Install a keyring (gnome-keyring or KWallet) for full \
+                         protection.",
+                    );
+                    add_breadcrumb("auth", "token_saved_file_fallback", Level::Warning);
+                    sentry::capture_message("keychain_token_file_fallback", Level::Warning);
+                }
+                Err(e) => {
+                    log::error!("keychain: token save failed: {}", e);
+                    sentry::capture_message(
+                        &format!("keychain_token_save_failed: {}", e),
+                        Level::Error,
+                    );
+                }
             }
             let _ = app.emit("auth:status", json!({ "authenticated": true }));
             add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
