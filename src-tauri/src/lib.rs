@@ -1191,7 +1191,14 @@ fn notification_command(title: &str, body: &str) -> Option<(&'static str, Vec<St
 /// Show a native notification. Failure is fine; this is best-effort UX.
 fn notify_user(title: &str, body: &str) {
     if let Some((program, args)) = notification_command(title, body) {
-        let _ = std::process::Command::new(program).args(args).spawn();
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args);
+        // notify-send is a system binary; from an AppImage it must not inherit
+        // the bundled library paths, or it fails to start and the notification
+        // never shows.
+        #[cfg(target_os = "linux")]
+        apply_appimage_sanitization(&mut cmd);
+        let _ = cmd.spawn();
     }
 }
 
@@ -1955,29 +1962,175 @@ fn strip_appimage_paths(value: &str, appdir: &str) -> Option<String> {
 /// error. When we detect the AppImage (`APPDIR` is set), spawn `xdg-open`
 /// ourselves with those variables stripped of AppImage paths. Off Linux, and on
 /// Linux outside an AppImage, use the opener plugin unchanged.
-fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    if let Some(appdir) = std::env::var("APPDIR").ok().filter(|s| !s.is_empty()) {
-        let mut cmd = std::process::Command::new("xdg-open");
-        cmd.arg(url);
-        for var in APPIMAGE_CHILD_ENV_VARS {
-            if let Ok(current) = std::env::var(var) {
-                match strip_appimage_paths(&current, &appdir) {
-                    Some(kept) => {
-                        cmd.env(var, kept);
-                    }
-                    None => {
-                        cmd.env_remove(var);
-                    }
+/// Strip the AppImage-injected library paths from a spawned command. From an
+/// AppImage a system binary (browser, xdg-open, notify-send) must not inherit
+/// the bundled `LD_LIBRARY_PATH`/GTK paths, or it fails to start. A no-op when
+/// not running from an AppImage.
+#[cfg(target_os = "linux")]
+fn apply_appimage_sanitization(cmd: &mut std::process::Command) {
+    let Some(appdir) = std::env::var("APPDIR").ok().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    for var in APPIMAGE_CHILD_ENV_VARS {
+        if let Ok(current) = std::env::var(var) {
+            match strip_appimage_paths(&current, &appdir) {
+                Some(kept) => {
+                    cmd.env(var, kept);
+                }
+                None => {
+                    cmd.env_remove(var);
                 }
             }
         }
-        match cmd.spawn() {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                log::warn!("sanitized xdg-open failed ({e}); falling back to opener plugin");
+    }
+}
+
+/// The browser binary name from `xdg-settings get default-web-browser`, which
+/// returns a desktop-file name like `chromium.desktop`.
+#[cfg(target_os = "linux")]
+fn browser_binary_from_setting(setting: &str) -> Option<String> {
+    let name = setting.trim().strip_suffix(".desktop")?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Ask the desktop for the default browser binary.
+#[cfg(target_os = "linux")]
+fn default_browser_binary() -> Option<String> {
+    let mut cmd = std::process::Command::new("xdg-settings");
+    cmd.args(["get", "default-web-browser"]);
+    apply_appimage_sanitization(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    browser_binary_from_setting(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Open the URL in a new browser window. A focusing compositor (Hyprland,
+/// GNOME, KDE) raises a new window, unlike a background tab in a running
+/// browser. Most browsers accept `--new-window`.
+#[cfg(target_os = "linux")]
+fn open_in_new_browser_window(url: &str) -> Result<(), String> {
+    let browser = default_browser_binary().ok_or("no default browser")?;
+    let mut cmd = std::process::Command::new(&browser);
+    cmd.args(["--new-window", url]);
+    apply_appimage_sanitization(&mut cmd);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{}: {}", browser, e))
+}
+
+/// Copy text to the clipboard, best-effort. Tries Wayland (`wl-copy`) then X11
+/// (`xclip`, `xsel`), so it works across desktops. Returns true if a tool ran.
+#[cfg(target_os = "linux")]
+fn copy_to_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    let attempts: [(&str, &[&str]); 3] = [
+        ("wl-copy", &[]),
+        ("xclip", &["-selection", "clipboard"]),
+        ("xsel", &["--clipboard", "--input"]),
+    ];
+    for (bin, args) in attempts {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        apply_appimage_sanitization(&mut cmd);
+        if let Ok(mut child) = cmd.spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
             }
+            // Do not wait: wl-copy stays resident to serve the clipboard.
+            return true;
         }
+    }
+    false
+}
+
+/// Open a URL in the browser: a new window first (a focusing compositor raises
+/// it), else `xdg-open` (a tab). No notification — the caller handles that.
+#[cfg(target_os = "linux")]
+fn open_url_in_browser(url: &str) -> Result<(), String> {
+    if open_in_new_browser_window(url).is_ok() {
+        return Ok(());
+    }
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(url);
+    apply_appimage_sanitization(&mut cmd);
+    cmd.spawn()
+        .map(|_| ())
+        .map_err(|e| format!("xdg-open: {}", e))
+}
+
+/// Whether `notify-send` can attach a clickable action (libnotify >= 0.8).
+/// Older distros lack it, so we check once and fall back to a plain notice.
+#[cfg(target_os = "linux")]
+fn notify_send_supports_actions() -> bool {
+    use std::sync::OnceLock;
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let mut cmd = std::process::Command::new("notify-send");
+        cmd.arg("--help");
+        apply_appimage_sanitization(&mut cmd);
+        cmd.output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--action"))
+            .unwrap_or(false)
+    })
+}
+
+/// Tell the user the browser is opening, and how to reach the page if the window
+/// did not surface. The URL is in the body and on the clipboard. Where the
+/// notification daemon supports actions, clicking the notification opens the URL.
+#[cfg(target_os = "linux")]
+fn notify_sign_in_link(url: &str, on_clipboard: bool) {
+    let title = "KlaayGuard — sign in";
+    let clip = if on_clipboard {
+        " It is on your clipboard, or open it here:"
+    } else {
+        " Open it here:"
+    };
+    let body = format!("Opening your browser to sign in.{}\n{}", clip, url);
+
+    if notify_send_supports_actions() {
+        // notify-send --action implies --wait: it stays until the user acts,
+        // then prints the action name. On click, open the URL. Run off-thread.
+        let url = url.to_string();
+        std::thread::spawn(move || {
+            let mut cmd = std::process::Command::new("notify-send");
+            cmd.args(["--app-name=KlaayGuard", "--action=default=Open sign-in"])
+                .arg(title)
+                .arg(&body)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            apply_appimage_sanitization(&mut cmd);
+            if let Ok(out) = cmd.output() {
+                if String::from_utf8_lossy(&out.stdout).trim() == "default" {
+                    let _ = open_url_in_browser(&url);
+                }
+            }
+        });
+    } else {
+        notify_user(title, &body);
+    }
+}
+
+/// Open a URL in the user's browser, and make sure the user can find it.
+///
+/// On Wayland an app cannot raise a window, and a URL opened in an
+/// already-running browser lands as a background tab the user may never see. So
+/// on Linux: open a new browser window (a focusing compositor raises it), copy
+/// the URL to the clipboard, and post a notification (clickable where the daemon
+/// supports it) that names the link. Off Linux, use the opener plugin unchanged.
+fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let on_clipboard = copy_to_clipboard(url);
+        notify_sign_in_link(url, on_clipboard);
+        if open_url_in_browser(url).is_ok() {
+            return Ok(());
+        }
+        log::warn!("browser open failed; falling back to opener plugin");
     }
     app.opener()
         .open_url(url.to_string(), None::<&str>)
@@ -3902,6 +4055,22 @@ listener {
             strip_appimage_paths("/tmp/.mount_KlaayX/usr/lib::", "/tmp/.mount_KlaayX/"),
             None
         );
+    }
+
+    // `xdg-settings get default-web-browser` returns a desktop-file name.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn browser_binary_strips_the_desktop_suffix() {
+        assert_eq!(
+            browser_binary_from_setting("chromium.desktop\n").as_deref(),
+            Some("chromium")
+        );
+        assert_eq!(
+            browser_binary_from_setting("  firefox.desktop  ").as_deref(),
+            Some("firefox")
+        );
+        assert_eq!(browser_binary_from_setting(""), None);
+        assert_eq!(browser_binary_from_setting("not-a-desktop"), None);
     }
 
     // Every check-in must carry the device id and the running agent version, so
