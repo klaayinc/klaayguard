@@ -138,6 +138,21 @@ pub fn load_token() -> Result<Option<String>, String> {
     }
 }
 
+/// Remove the stored auth token from both stores. An explicit sign out must
+/// leave no token behind. Clear the file fallback, then clear the keyring
+/// best-effort: a missing entry or an unavailable keyring is success once the
+/// file is gone (the token may only ever have lived in the file).
+pub fn delete_token() -> Result<(), String> {
+    file_delete(KEYCHAIN_ACCOUNT);
+    if let Ok(entry) = entry_for(KEYCHAIN_ACCOUNT) {
+        match entry.delete_password() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => log::warn!("sign out: keyring delete failed ({}); file cleared", e),
+        }
+    }
+    Ok(())
+}
+
 pub fn save_device_identity(id: &str) -> Result<(), String> {
     match keyring_set(DEVICE_ID_ACCOUNT, id) {
         Ok(()) => {

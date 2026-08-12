@@ -1942,6 +1942,10 @@ fn open_sign_in(app: &tauri::AppHandle) {
 /// Handles + assets for keeping the tray in sync with auth state.
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
+    /// The "Sign out" item, added to the menu only while signed in.
+    sign_out: tauri::menu::MenuItem<tauri::Wry>,
+    /// The tray menu itself, so "Sign out" can be added and removed at runtime.
+    menu: tauri::menu::Menu<tauri::Wry>,
     tray: tauri::tray::TrayIcon<tauri::Wry>,
     green: tauri::image::Image<'static>,
     red: tauri::image::Image<'static>,
@@ -1999,7 +2003,9 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray.item.set_text(&text);
             let _ = tray.item.set_enabled(enabled);
-            // Swap the menubar icon's status dot only when auth state flips.
+            // On an auth-state flip, swap the status dot and add or remove the
+            // "Sign out" item. "Sign out" shows only while signed in, appended
+            // last so it sits at the very bottom of the menu.
             let prev = tray
                 .last_signed_in
                 .swap(signed_in, std::sync::atomic::Ordering::Relaxed);
@@ -2010,8 +2016,44 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
                     tray.red.clone()
                 };
                 let _ = tray.tray.set_icon(Some(icon));
+                if signed_in {
+                    let _ = tray.menu.append(&tray.sign_out);
+                } else {
+                    let _ = tray.menu.remove(&tray.sign_out);
+                }
             }
         }
+    });
+}
+
+/// The tray shows "Sign out" only while signed in, at the very bottom of the
+/// menu. There is no confirm step: a click signs out and the status dot turns
+/// red. Its position keeps it away from the other clickable items.
+const SIGN_OUT_LABEL: &str = "Sign out";
+
+/// Clear the session at the user's request: drop the in-memory token, delete it
+/// from the OS credential store, forget any pending sign-in nonce, and refresh
+/// the tray. refresh_tray then turns the dot red and removes the "Sign out"
+/// item. An explicit sign out deletes the stored token, unlike an invalidated
+/// one, so the next start does not reuse it.
+async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    *state.auth_token.write().await = None;
+    *state.pending_auth_state.write().await = None;
+    if let Err(e) = keychain::delete_token() {
+        log::warn!("sign out: could not delete stored token: {}", e);
+    }
+    log::info!("user signed out from the tray");
+    let _ = app.emit("auth:status", json!({ "authenticated": false }));
+    add_breadcrumb("auth", "user_signed_out", Level::Info);
+    refresh_tray(app, state).await;
+}
+
+/// Handle a click on the tray "Sign out" item.
+fn handle_sign_out_click(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        sign_out(&app, &state).await;
     });
 }
 
@@ -2874,8 +2916,10 @@ pub fn run() {
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(app.handle(), &state_for_loop);
 
-            // Tray menu: live auth/countdown item, an Employee Hub link, and a version
-            // line. No quit, no sign-out. Only the auth item updates at runtime.
+            // Tray menu: live auth/countdown item, an Employee Hub link, and a
+            // version line. "Sign out" is appended below the version only while
+            // signed in (see refresh_tray), so it sits at the very bottom, away
+            // from the other clickable items. No quit.
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
@@ -2897,6 +2941,13 @@ pub fn run() {
                 false,
                 None::<&str>,
             )?;
+            let sign_out_i = tauri::menu::MenuItem::with_id(
+                app,
+                "sign_out",
+                SIGN_OUT_LABEL,
+                true,
+                None::<&str>,
+            )?;
             let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
             let menu = tauri::menu::Menu::with_items(
                 app,
@@ -2907,6 +2958,12 @@ pub fn run() {
                     &version_i,
                 ],
             )?;
+            // Start with "Sign out" present only if already signed in; the
+            // last_signed_in state below matches, so refresh_tray keeps it in
+            // sync on later flips.
+            if authed {
+                let _ = menu.append(&sign_out_i);
+            }
             // Status-dot icons: green when signed in, red when not. A tray
             // failure must not kill the agent: collection works without a
             // tray, and Linux gets a fallback window below.
@@ -2922,6 +2979,7 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "auth_action" => open_sign_in(app),
                         "employee_hub" => open_earthenware(app, "/employee-hub"),
+                        "sign_out" => handle_sign_out_click(app),
                         _ => {}
                     })
                     .icon(if authed { green.clone() } else { red.clone() })
@@ -2930,6 +2988,8 @@ pub fn run() {
                     .build(app)?;
                 app.manage(TrayMenu {
                     item: item.clone(),
+                    sign_out: sign_out_i.clone(),
+                    menu: menu.clone(),
                     tray,
                     green,
                     red,
