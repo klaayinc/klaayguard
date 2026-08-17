@@ -779,7 +779,7 @@ fn build_payload_items(
 /// handling stays the backstop for a token that later turns out bad.
 async fn token_definitely_invalid(base: &str, token: &str) -> bool {
     let client = match reqwest::Client::builder()
-        .user_agent("klaayguard/0.1")
+        .user_agent(concat!("KlaayGuard/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -842,15 +842,30 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
 
     match outcome {
         Some(true) => {
-            // A failed save means the token lives in memory only and the user
-            // signs in again on every launch. Common on Linux without a
-            // Secret Service daemon — make it visible instead of silent.
-            if let Err(e) = keychain::save_token(&tok) {
-                log::error!("keychain: token save failed: {}", e);
-                sentry::capture_message(
-                    &format!("keychain_token_save_failed: {}", e),
-                    Level::Error,
-                );
+            // The keyring is the primary store. Without a Secret Service daemon
+            // (common on Linux) the agent falls back to a user-only file so the
+            // sign-in still survives a reboot. Tell the user the store is
+            // degraded instead of failing silently.
+            match keychain::save_token(&tok) {
+                Ok(keychain::CredentialStore::Keyring) => {}
+                Ok(keychain::CredentialStore::File) => {
+                    log::warn!("secure credential store unavailable; saved sign-in to a file");
+                    notify_user(
+                        "KlaayGuard",
+                        "No secure credential store found. Your sign-in is saved with reduced \
+                         protection. Install a keyring (gnome-keyring or KWallet) for full \
+                         protection.",
+                    );
+                    add_breadcrumb("auth", "token_saved_file_fallback", Level::Warning);
+                    sentry::capture_message("keychain_token_file_fallback", Level::Warning);
+                }
+                Err(e) => {
+                    log::error!("keychain: token save failed: {}", e);
+                    sentry::capture_message(
+                        &format!("keychain_token_save_failed: {}", e),
+                        Level::Error,
+                    );
+                }
             }
             let _ = app.emit("auth:status", json!({ "authenticated": true }));
             add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
@@ -1026,6 +1041,15 @@ struct JsonApiPayload {
     meta: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     jsonapi: Option<serde_json::Value>,
+}
+
+/// The check-in `meta`: the device identity plus the agent version, so the
+/// backend can record which build sent each check-in.
+fn checkin_meta(device_uuid: &str) -> serde_json::Value {
+    json!({
+        "device_uuid": device_uuid,
+        "app_version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 /// Pull the hardware serial from osquery `system_info` rows. Do not fall back
@@ -1542,7 +1566,7 @@ async fn run_cycle(
     }
     let payload = JsonApiPayload {
         data: items,
-        meta: Some(json!({ "device_uuid": device_serial })),
+        meta: Some(checkin_meta(&device_serial)),
         jsonapi: Some(json!({ "version": "1.0" })),
     };
 
@@ -1628,7 +1652,7 @@ async fn run_cycle(
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let client = reqwest::Client::builder()
-            .user_agent("klaayguard/0.1")
+            .user_agent(concat!("KlaayGuard/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client");
 
@@ -1897,13 +1921,77 @@ fn get_frontend_url() -> String {
         .unwrap_or_else(|| "https://app.klaay.com".to_string())
 }
 
+/// Environment variables that the AppImage runtime (AppRun) points at the
+/// bundled libraries and GTK modules. A browser we spawn must not inherit the
+/// AppImage values, or it loads the wrong libraries and fails to start.
+#[cfg(target_os = "linux")]
+const APPIMAGE_CHILD_ENV_VARS: [&str; 6] = [
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "GTK_PATH",
+    "GDK_PIXBUF_MODULE_FILE",
+    "GIO_MODULE_DIR",
+    "GSETTINGS_SCHEMA_DIR",
+];
+
+/// Remove the colon-separated entries that live under `appdir` (the AppImage
+/// mount point). Returns the remaining entries, or None when nothing is left,
+/// which tells the caller to unset the variable for the child process.
+#[cfg(target_os = "linux")]
+fn strip_appimage_paths(value: &str, appdir: &str) -> Option<String> {
+    let appdir = appdir.trim_end_matches('/');
+    let prefix = format!("{}/", appdir);
+    let kept: Vec<&str> = value
+        .split(':')
+        .filter(|p| !p.is_empty() && *p != appdir && !p.starts_with(&prefix))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join(":"))
+}
+
+/// Open a URL in the user's default browser.
+///
+/// Inside a Linux AppImage, `xdg-open` and the browser it launches inherit the
+/// AppImage's `LD_LIBRARY_PATH` and GTK module variables, so the browser loads
+/// the bundled libraries and fails to start — sign-in then never opens, with no
+/// error. When we detect the AppImage (`APPDIR` is set), spawn `xdg-open`
+/// ourselves with those variables stripped of AppImage paths. Off Linux, and on
+/// Linux outside an AppImage, use the opener plugin unchanged.
+fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if let Some(appdir) = std::env::var("APPDIR").ok().filter(|s| !s.is_empty()) {
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(url);
+        for var in APPIMAGE_CHILD_ENV_VARS {
+            if let Ok(current) = std::env::var(var) {
+                match strip_appimage_paths(&current, &appdir) {
+                    Some(kept) => {
+                        cmd.env(var, kept);
+                    }
+                    None => {
+                        cmd.env_remove(var);
+                    }
+                }
+            }
+        }
+        match cmd.spawn() {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                log::warn!("sanitized xdg-open failed ({e}); falling back to opener plugin");
+            }
+        }
+    }
+    app.opener()
+        .open_url(url.to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Open the browser to the Klaay Frontend sign-in page; it deep-links back via
 /// `klaayguard://auth-callback?token=…`. Invoked from the tray "Sign in" item.
 /// Open a Klaay Frontend path in the default browser.
 fn open_frontend(app: &tauri::AppHandle, path: &str) {
     let url = format!("{}{}", get_frontend_url(), path);
     log::info!("opening url={}", url);
-    if let Err(e) = app.opener().open_url(url.clone(), None::<&str>) {
+    if let Err(e) = open_external_url(app, &url) {
         log::error!("failed to open url {}: {}", url, e);
     }
 }
@@ -1928,6 +2016,10 @@ fn open_sign_in(app: &tauri::AppHandle) {
 /// Handles + assets for keeping the tray in sync with auth state.
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
+    /// The "Sign out" item, added to the menu only while signed in.
+    sign_out: tauri::menu::MenuItem<tauri::Wry>,
+    /// The tray menu itself, so "Sign out" can be added and removed at runtime.
+    menu: tauri::menu::Menu<tauri::Wry>,
     tray: tauri::tray::TrayIcon<tauri::Wry>,
     green: tauri::image::Image<'static>,
     red: tauri::image::Image<'static>,
@@ -1985,7 +2077,9 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray.item.set_text(&text);
             let _ = tray.item.set_enabled(enabled);
-            // Swap the menubar icon's status dot only when auth state flips.
+            // On an auth-state flip, swap the status dot and add or remove the
+            // "Sign out" item. "Sign out" shows only while signed in, appended
+            // last so it sits at the very bottom of the menu.
             let prev = tray
                 .last_signed_in
                 .swap(signed_in, std::sync::atomic::Ordering::Relaxed);
@@ -1996,8 +2090,44 @@ async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
                     tray.red.clone()
                 };
                 let _ = tray.tray.set_icon(Some(icon));
+                if signed_in {
+                    let _ = tray.menu.append(&tray.sign_out);
+                } else {
+                    let _ = tray.menu.remove(&tray.sign_out);
+                }
             }
         }
+    });
+}
+
+/// The tray shows "Sign out" only while signed in, at the very bottom of the
+/// menu. There is no confirm step: a click signs out and the status dot turns
+/// red. Its position keeps it away from the other clickable items.
+const SIGN_OUT_LABEL: &str = "Sign out";
+
+/// Clear the session at the user's request: drop the in-memory token, delete it
+/// from the OS credential store, forget any pending sign-in nonce, and refresh
+/// the tray. refresh_tray then turns the dot red and removes the "Sign out"
+/// item. An explicit sign out deletes the stored token, unlike an invalidated
+/// one, so the next start does not reuse it.
+async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    *state.auth_token.write().await = None;
+    *state.pending_auth_state.write().await = None;
+    if let Err(e) = keychain::delete_token() {
+        log::warn!("sign out: could not delete stored token: {}", e);
+    }
+    log::info!("user signed out from the tray");
+    let _ = app.emit("auth:status", json!({ "authenticated": false }));
+    add_breadcrumb("auth", "user_signed_out", Level::Info);
+    refresh_tray(app, state).await;
+}
+
+/// Handle a click on the tray "Sign out" item.
+fn handle_sign_out_click(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<Arc<AppState>>().inner().clone();
+        sign_out(&app, &state).await;
     });
 }
 
@@ -2860,8 +2990,10 @@ pub fn run() {
             // Handle deep link if app was launched by klaayguard:// URL (first instance)
             try_handle_deep_link_from_args(app.handle(), &state_for_loop);
 
-            // Tray menu: live auth/countdown item, an Employee Hub link, and a version
-            // line. No quit, no sign-out. Only the auth item updates at runtime.
+            // Tray menu: live auth/countdown item, an Employee Hub link, and a
+            // version line. "Sign out" is appended below the version only while
+            // signed in (see refresh_tray), so it sits at the very bottom, away
+            // from the other clickable items. No quit.
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
@@ -2883,6 +3015,13 @@ pub fn run() {
                 false,
                 None::<&str>,
             )?;
+            let sign_out_i = tauri::menu::MenuItem::with_id(
+                app,
+                "sign_out",
+                SIGN_OUT_LABEL,
+                true,
+                None::<&str>,
+            )?;
             let sep = tauri::menu::PredefinedMenuItem::separator(app)?;
             let menu = tauri::menu::Menu::with_items(
                 app,
@@ -2893,6 +3032,12 @@ pub fn run() {
                     &version_i,
                 ],
             )?;
+            // Start with "Sign out" present only if already signed in; the
+            // last_signed_in state below matches, so refresh_tray keeps it in
+            // sync on later flips.
+            if authed {
+                let _ = menu.append(&sign_out_i);
+            }
             // Status-dot icons: green when signed in, red when not. A tray
             // failure must not kill the agent: collection works without a
             // tray, and Linux gets a fallback window below.
@@ -2908,6 +3053,7 @@ pub fn run() {
                     .on_menu_event(|app, event| match event.id.as_ref() {
                         "auth_action" => open_sign_in(app),
                         "employee_hub" => open_frontend(app, "/employee-hub"),
+                        "sign_out" => handle_sign_out_click(app),
                         _ => {}
                     })
                     .icon(if authed { green.clone() } else { red.clone() })
@@ -2916,6 +3062,8 @@ pub fn run() {
                     .build(app)?;
                 app.manage(TrayMenu {
                     item: item.clone(),
+                    sign_out: sign_out_i.clone(),
+                    menu: menu.clone(),
                     tray,
                     green,
                     red,
@@ -3699,5 +3847,71 @@ listener {
         assert_eq!(program, "notify-send");
         assert!(args.contains(&"KlaayGuard".to_string()));
         assert!(args.contains(&"Sign in now.".to_string()));
+    }
+
+    // The AppImage sets LD_LIBRARY_PATH and the GTK module vars to its own mount.
+    // A browser we spawn must not inherit those, or it loads the wrong libraries
+    // and never opens. strip_appimage_paths removes only the AppImage entries.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_drops_every_mount_entry() {
+        let value = "/tmp/.mount_KlaayX/usr/lib:/tmp/.mount_KlaayX/usr/lib/x86_64-linux-gnu";
+        assert_eq!(strip_appimage_paths(value, "/tmp/.mount_KlaayX"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_keeps_system_entries() {
+        let value = "/tmp/.mount_KlaayX/usr/lib:/opt/foo/lib:/usr/lib";
+        assert_eq!(
+            strip_appimage_paths(value, "/tmp/.mount_KlaayX"),
+            Some("/opt/foo/lib:/usr/lib".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_single_mount_file_is_removed() {
+        // GDK_PIXBUF_MODULE_FILE is a single path, not a list.
+        let value = "/tmp/.mount_KlaayX/usr/lib/gdk-pixbuf/loaders.cache";
+        assert_eq!(strip_appimage_paths(value, "/tmp/.mount_KlaayX"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_leaves_non_appimage_value_untouched() {
+        assert_eq!(
+            strip_appimage_paths("/usr/lib", "/tmp/.mount_KlaayX"),
+            Some("/usr/lib".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_matches_on_a_path_boundary() {
+        // A directory that merely starts with the mount name is not under it.
+        assert_eq!(
+            strip_appimage_paths("/tmp/.mount_KlaayXtra/lib", "/tmp/.mount_KlaayX"),
+            Some("/tmp/.mount_KlaayXtra/lib".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn strip_appimage_paths_tolerates_trailing_slash_and_empties() {
+        assert_eq!(
+            strip_appimage_paths("/tmp/.mount_KlaayX/usr/lib::", "/tmp/.mount_KlaayX/"),
+            None
+        );
+    }
+
+    // Every check-in must carry the device id and the running agent version, so
+    // the backend can record which build sent it.
+    #[test]
+    fn checkin_meta_carries_device_and_agent_version() {
+        let m = checkin_meta("device-abc");
+        assert_eq!(m["device_uuid"], "device-abc");
+        assert_eq!(m["app_version"], env!("CARGO_PKG_VERSION"));
+        assert!(!m["app_version"].as_str().unwrap().is_empty());
     }
 }
