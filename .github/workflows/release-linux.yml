@@ -23,17 +23,15 @@ jobs:
         include:
           - build: development
             api_url: "http://localhost:3000"
-            earthenware_url: "http://localhost:5173"
+            frontend_url: "http://localhost:5173"
           - build: staging
             api_url: "https://api.klaay.dev"
-            earthenware_url: "https://app.klaay.dev"
+            frontend_url: "https://app.klaay.dev"
           - build: production
             api_url: "https://api.klaay.com"
-            earthenware_url: "https://app.klaay.com"
+            frontend_url: "https://app.klaay.com"
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -47,6 +45,8 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
 
       - name: Setup osquery binaries (Linux)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: rake
 
       - name: Verify sidecar binaries exist (Linux x86_64)
@@ -67,8 +67,8 @@ jobs:
         env:
           KLAAY_ENV: ${{ matrix.build }}
           VITE_API_BASE_URL: ${{ matrix.api_url }}
-          VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
-          VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
+          VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
         run: |
           cargo tauri build --bundles deb rpm appimage
 

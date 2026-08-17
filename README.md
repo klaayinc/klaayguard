@@ -7,6 +7,8 @@ collects security-posture telemetry with a bundled copy of
 [osquery](https://osquery.io) and reports it to the Klaay API every 15 minutes.
 It has no window and no web frontend.
 
+KlaayGuard is free software under GPL-3.0-or-later. See [License](#license).
+
 Documentation:
 
 - [Overview](docs/OVERVIEW.md) — what the agent does, in full
@@ -25,7 +27,7 @@ sequenceDiagram
     participant Osquery as osquery (bundled sidecar)
 
     %% Sign-in (first launch or after 401/403)
-    Agent->>Browser: Open {earthenware}/login?app=klaayguard&state=<nonce>
+    Agent->>Browser: Open {frontend}/login?app=klaayguard&state=<nonce>
     Browser-->>Agent: klaayguard://…?token=<jwt>&state=<nonce>
     Agent->>API: GET /me (validate token)
     API-->>Agent: 200 OK
@@ -89,7 +91,7 @@ source ~/.cargo/env
 # Install the Tauri CLI (Rust, not npm)
 cargo install tauri-cli --version "^2"
 
-# Ruby/rake (for vendoring the osquery sidecars) — preinstalled on macOS
+# Ruby and rake, to fetch the osquery sidecars — preinstalled on macOS
 ```
 
 ### Setup and build
@@ -98,8 +100,9 @@ cargo install tauri-cli --version "^2"
 git clone https://github.com/klaayinc/klaayguard.git
 cd klaayguard
 
-# Vendor the osquery sidecars (once). Downloads osquery 5.18.1 from the
-# official GitHub release and verifies SHA-256 digests.
+# Fetch the osquery sidecar for your platform (once). Downloads osquery
+# 5.18.1 from the official GitHub release and verifies its SHA-256.
+# On Windows, run ./.github/scripts/fetch-osquery-windows.ps1 instead.
 rake
 
 # Default environment is production
@@ -115,10 +118,10 @@ cargo tauri build --target x86_64-apple-darwin       # macOS Intel
 cargo tauri build --target x86_64-unknown-linux-gnu  # Linux
 ```
 
-Run against a local stack (kiln on :3000, earthenware on :5173):
+Run against a local Klaay stack (API on :3000, Klaay Frontend on :5173):
 
 ```bash
-KLAAY_ENV=development VITE_API_BASE_URL=http://localhost:3000 VITE_EARTHENWARE_URL=http://localhost:5173 \
+KLAAY_ENV=development VITE_API_BASE_URL=http://localhost:3000 VITE_FRONTEND_URL=http://localhost:5173 \
   cargo tauri build && open src-tauri/target/release/bundle/macos/KlaayGuard.app
 ```
 
@@ -159,7 +162,7 @@ INSTALLER_SIGNING_IDENTITY="Developer ID Installer: …" \
 `KLAAY_ENV` selects the environment at build time. `src-tauri/build.rs` bakes
 the matching URLs in as compile-time defaults:
 
-| Environment | API | Web app |
+| Environment | API | Klaay Frontend |
 |---|---|---|
 | `production` (default) | `https://api.klaay.com` | `https://app.klaay.com` |
 | `staging` | `https://api.klaay.dev` | `https://app.klaay.dev` |
@@ -176,7 +179,7 @@ All variables are optional.
 |---|---|---|
 | `KLAAY_ENV` | `production` | Selects build environment; also the Sentry environment tag |
 | `VITE_API_BASE_URL` | per environment | Klaay API base URL |
-| `VITE_EARTHENWARE_URL` | per environment | Web app URL for sign-in and Employee Hub |
+| `VITE_FRONTEND_URL` | per environment | Klaay Frontend URL for sign-in and Employee Hub |
 | `VITE_SENTRY_DSN` | empty (Sentry off) | Sentry DSN; CI injects it for releases |
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `900` | Collection loop interval |
 | `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS) |
@@ -248,6 +251,25 @@ so Sentry is off in production — see the note in
 
 ## Contributing
 
-1. Create a feature branch.
-2. Make your changes and test on the target platforms.
-3. Open a pull request against `main`.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first. In short:
+
+1. Sign the [Contributor License Agreement](CLA.md). The bot asks on your first
+   pull request.
+2. Create a feature branch.
+3. Make your changes. Run `cargo test`, `cargo fmt --all --check`, and
+   `cargo clippy --all-targets -- -D warnings`.
+4. Add a `// SPDX-License-Identifier: GPL-3.0-or-later` header to each new Rust
+   file.
+5. Open a pull request against `main`.
+
+Report a security problem in private. Follow [SECURITY.md](SECURITY.md).
+
+## License
+
+KlaayGuard is free software under GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+- [NOTICE](NOTICE) — the bundled osquery binary and other third-party software.
+- [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md) — the license of every Rust
+  dependency.
+- [TRADEMARK.md](TRADEMARK.md) — the GPL covers the code, not the Klaay names or
+  logo.

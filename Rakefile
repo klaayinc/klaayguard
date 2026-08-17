@@ -37,10 +37,26 @@ file DIR_TMP do
 end
 
 OSQUERY_VERSION = "5.18.1"
+
+# Headers for the GitHub REST API call below. The API rate-limits unauthenticated
+# requests to 60 per hour per IP, and CI runners share IPs, so a plain request
+# hits a 403 under load. When GITHUB_TOKEN (or GH_TOKEN) is set — always in CI —
+# send it to raise the limit. A local build without a token still works; it makes
+# far fewer requests.
+def github_api_headers
+    headers = {
+        "Accept" => "application/vnd.github+json",
+        "User-Agent" => "klaayguard-osquery-fetch",
+    }
+    token = ENV["GITHUB_TOKEN"] || ENV["GH_TOKEN"]
+    headers["Authorization"] = "Bearer #{token}" if token && !token.empty?
+    headers
+end
+
 # Fetch and cache checksums from GitHub Releases for the pinned version
 def fetch_release_assets
     url = "https://api.github.com/repos/osquery/osquery/releases/tags/#{OSQUERY_VERSION}"
-    data = JSON.parse(URI.open(url).read)
+    data = with_retries { JSON.parse(URI.open(url, github_api_headers).read) }
     data["assets"] || []
 end
 
@@ -249,7 +265,8 @@ end
 
 def vendor_binaries
     # Verify only the binaries relevant to the current platform/arch.
-    # CI should rely on the vendored sidecars in src-tauri/vendor and never download on demand.
+    # `rake fetch` (the default) downloads these before a build; `verify` only
+    # checks that they are present and not Git LFS pointers.
     platform = RUBY_PLATFORM
     if platform =~ /darwin/
         [
@@ -301,7 +318,37 @@ end
 
 task :refresh_binaries => [OSQUERYI_PATH, OSQUERYI_LINUX_X64_PATH, OSQUERYI_LINUX_AARCH64_PATH]
 
-task default: [:verify]
+# Fetch the osquery sidecar for the current platform. The build needs only the
+# sidecar for the target it builds, so this downloads and checksum-verifies just
+# that one (both variants on macOS, where one build produces two targets). The
+# file tasks skip the download when the sidecar already exists, so a repeat build
+# is fast. Windows is the exception: rake does not fetch it, because the file
+# tasks use a Unix shell. CI and the build docs fetch the Windows sidecar with a
+# separate step.
+task :fetch do
+    platform = RUBY_PLATFORM
+    if platform =~ /darwin/
+        Rake::Task[OSQUERYI_PATH].invoke
+    elsif platform =~ /linux/
+        arch = begin
+            `uname -m`.strip
+        rescue
+            ""
+        end
+        if arch =~ /(aarch64|arm64)/
+            Rake::Task[OSQUERYI_LINUX_AARCH64_PATH].invoke
+        else
+            Rake::Task[OSQUERYI_LINUX_X64_PATH].invoke
+        end
+    elsif platform =~ /mswin|mingw|cygwin/
+        abort "rake does not fetch the Windows osquery sidecar. Follow the " \
+              "Windows build step in CONTRIBUTING.md."
+    else
+        raise "Unsupported platform for osquery fetch: #{platform}"
+    end
+end
+
+task default: [:fetch]
 
 task :clean_vendor do
     sh "rm -f src-tauri/vendor/*osqueryi*"

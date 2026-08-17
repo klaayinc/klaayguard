@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 fn main() {
     // Re-run this script when any env that feeds the compiled-in defaults changes.
     // Without these, cargo caches build.rs output and a later build with a different
@@ -6,7 +7,7 @@ fn main() {
         "KLAAY_ENV",
         "NODE_ENV",
         "VITE_API_BASE_URL",
-        "VITE_EARTHENWARE_URL",
+        "VITE_FRONTEND_URL",
         "VITE_SENTRY_DSN",
     ] {
         println!("cargo:rerun-if-env-changed={}", var);
@@ -45,19 +46,16 @@ fn main() {
         api_base
     );
 
-    // Earthenware (web app) base — needed by the tray "Sign in" action now that
+    // Klaay Frontend (web app) base — needed by the tray "Sign in" action now that
     // the login UI lives in Rust, not a webview.
-    let default_earthenware = match klaay_env.as_str() {
+    let default_frontend = match klaay_env.as_str() {
         "staging" => "https://app.klaay.dev",
         "development" => "http://localhost:5173",
         _ => "https://app.klaay.com",
     };
-    let earthenware =
-        std::env::var("VITE_EARTHENWARE_URL").unwrap_or_else(|_| default_earthenware.to_string());
-    println!(
-        "cargo:rustc-env=APP_DEFAULT_EARTHENWARE_URL={}",
-        earthenware
-    );
+    let frontend =
+        std::env::var("VITE_FRONTEND_URL").unwrap_or_else(|_| default_frontend.to_string());
+    println!("cargo:rustc-env=APP_DEFAULT_FRONTEND_URL={}", frontend);
 
     // Sentry DSN and environment. main.rs reads these at runtime, but released
     // builds start under launchd with a near-empty environment, so the runtime

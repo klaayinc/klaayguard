@@ -2,9 +2,11 @@
 
 **Product:** KlaayGuard desktop agent
 **Version of this document:** 2026-08-06
-**Audience:** Team members who want the full picture of what the agent does.
-For a short, non-technical version, see the
-[Employee Guide](./EMPLOYEE_GUIDE.md).
+**Audience:** Anyone who wants the full picture of what the agent does. For a
+short, non-technical version, see the [Employee Guide](./EMPLOYEE_GUIDE.md).
+
+KlaayGuard is free software under GPL-3.0-or-later. It is the client for the
+Klaay platform.
 
 ## 1. Summary
 
@@ -81,7 +83,7 @@ the OS permissions that the agent does not request.
 ## 4. Where data goes
 
 - Posture reports go to the Klaay API (`https://api.klaay.com`) over HTTPS.
-- Sign-in uses the Klaay web application (`https://app.klaay.com`).
+- Sign-in uses the Klaay Frontend (`https://app.klaay.com`).
 - Crash reports go to Sentry, when Klaay turns that on.
 - No other party receives data.
 
@@ -89,6 +91,7 @@ the OS permissions that the agent does not request.
 
 Klaay distributes installers from the
 [GitHub releases page](https://github.com/klaayinc/klaayguard/releases).
+You can also build the agent from source. See the [README](../README.md).
 The macOS installers are signed and notarized. The Linux packages are
 not signed yet.
 macOS installs use a `.pkg` or `.dmg` file. Linux installs use a `.deb`

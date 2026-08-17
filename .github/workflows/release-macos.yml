@@ -24,13 +24,13 @@ jobs:
         include:
           - build: development
             api_url: "http://localhost:3000"
-            earthenware_url: "http://localhost:5173"
+            frontend_url: "http://localhost:5173"
           - build: staging
             api_url: "https://api.klaay.dev"
-            earthenware_url: "https://app.klaay.dev"
+            frontend_url: "https://app.klaay.dev"
           - build: production
             api_url: "https://api.klaay.com"
-            earthenware_url: "https://app.klaay.com"
+            frontend_url: "https://app.klaay.com"
           - arch: arm64
             target: aarch64-apple-darwin
             dmg_dir: src-tauri/target/aarch64-apple-darwin
@@ -41,8 +41,6 @@ jobs:
             artifact_suffix: macOS_x64
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -53,6 +51,8 @@ jobs:
         run: cargo install tauri-cli --version "=2.11.4" --locked
 
       - name: Setup osquery binaries (macOS)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: rake
 
       - name: Verify sidecar binaries exist (macOS)
@@ -97,8 +97,8 @@ jobs:
         env:
           KLAAY_ENV: ${{ matrix.build }}
           VITE_API_BASE_URL: ${{ matrix.api_url }}
-          VITE_EARTHENWARE_URL: ${{ matrix.earthenware_url }}
-          VITE_SENTRY_DSN: https://64638a7824bb887830771961508ba5ce@o4508818952290304.ingest.us.sentry.io/4510048565067776
+          VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}

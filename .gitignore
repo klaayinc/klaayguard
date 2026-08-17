@@ -26,7 +26,9 @@ dist-ssr
 
 .env
 tmp
+
+# The osquery sidecars are fetched at build time by `rake`, not committed.
+# Ignore every vendored binary; keep the .keep marker and the license texts.
 src-tauri/vendor/*
 !src-tauri/vendor/.keep
 !/src-tauri/vendor/licenses
-!src-tauri/vendor/klaayguard-osqueryi-*

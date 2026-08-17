@@ -1,0 +1,43 @@
+KlaayGuard
+Copyright (C) 2025 Klaay ApS
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+------------------------------------------------------------------------------
+Third-party software
+------------------------------------------------------------------------------
+
+osquery
+  Version: 5.18.1
+  License: Apache License 2.0 (see src-tauri/vendor/licenses/LICENSE-Apache-2.0)
+  Source:  https://github.com/osquery/osquery/releases/tag/5.18.1
+  KlaayGuard bundles the osquery binary as a sidecar and runs read-only
+  queries against it.
+
+Rust dependencies
+  KlaayGuard links many Rust crates under permissive and weak-copyleft
+  licenses (MIT, Apache-2.0, MPL-2.0, BSD, ISC, CDLA-Permissive-2.0, and the
+  ISC/OpenSSL license of `ring`). The full list and license texts are in
+  THIRD-PARTY-LICENSES.md, which also ships inside the installed app.
+
+Linux AppImage — bundled system libraries
+  The Linux AppImage bundles unmodified upstream builds of WebKitGTK, GTK 3,
+  GLib and related libraries under the GNU Lesser General Public License
+  (LGPL) v2.1 or later. Their license texts ship inside the AppImage. Because
+  they are unmodified, the corresponding source is available from your Linux
+  distribution or upstream:
+    WebKitGTK  https://webkitgtk.org/
+    GTK        https://www.gtk.org/
+    GLib       https://gitlab.gnome.org/GNOME/glib
+  The .deb and .rpm packages do not bundle these libraries; they declare them
+  as runtime dependencies and the distribution provides them.
+
+------------------------------------------------------------------------------
+Trademarks
+------------------------------------------------------------------------------
+
+KlaayGuard and the Klaay logo are trademarks of Klaay ApS. The GPL-3.0 license
+grants no rights to use these marks. See TRADEMARK.md.
