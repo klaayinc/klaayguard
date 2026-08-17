@@ -8,10 +8,16 @@
   WriteRegStr HKCR "klaayguard" "URL Protocol" ""
   WriteRegStr HKCR "klaayguard\\DefaultIcon" "" "$INSTDIR\\klaayguard.exe,1"
   WriteRegStr HKCR "klaayguard\\shell\\open\\command" "" '"$INSTDIR\\klaayguard.exe" "%1"'
+
+  ; Start KlaayGuard at user logon. HKCU (not HKLM) needs no admin rights and
+  ; runs as the logged-in user, so posture reports stay continuous. This mirrors
+  ; the macOS LaunchAgent and the Linux XDG autostart entry.
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "KlaayGuard" '"$INSTDIR\\klaayguard.exe"'
 !macroend
 
 !macro customRemove
   DeleteRegKey HKCR "klaayguard"
+  DeleteRegValue HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Run" "KlaayGuard"
 !macroend
 
 
