@@ -1138,6 +1138,13 @@ async fn execute_sql_batch(
         // empty result for it and keep collecting (and sending) the others.
         if !output.status.success() {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
+            // Log it too: Sentry is off in released builds, and a breadcrumb
+            // alone leaves a missing table undiagnosable from the log file.
+            log::warn!(
+                "osquery query '{}' skipped: {}",
+                logical_id,
+                stderr_str.trim()
+            );
             add_breadcrumb(
                 "collection",
                 &format!(
@@ -1159,6 +1166,7 @@ async fn execute_sql_batch(
                 all_results.insert(logical_id, v);
             }
             None => {
+                log::warn!("osquery query '{}' returned unparseable output", logical_id);
                 add_breadcrumb(
                     "collection",
                     &format!("osquery_parse_skipped '{}'", logical_id),
