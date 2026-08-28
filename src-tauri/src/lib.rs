@@ -219,6 +219,8 @@ fn run_builtin_check(check: &str) -> Value {
         "disk_encryption" => collect_disk_encryption(),
         #[cfg(target_os = "linux")]
         "screenlock" => collect_screenlock(),
+        #[cfg(target_os = "windows")]
+        "screenlock" => collect_screenlock_windows(),
         other => {
             log::warn!("unknown or unsupported builtin check '{}'", other);
             add_breadcrumb(
@@ -232,11 +234,12 @@ fn run_builtin_check(check: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Native Linux posture collectors (disk encryption, screen lock). osquery
-// cannot supply these unprivileged: disk_encryption needs root and mis-reports
-// LUKS, and there is no Linux screenlock table. Pure parsers are unit-tested;
-// thin IO wrappers are not. Every path degrades to "unknown", never a false
-// "no", when a mechanism cannot be seen without root.
+// Native Linux and Windows posture collectors (disk encryption, screen lock).
+// osquery cannot supply these unprivileged: disk_encryption needs root and
+// mis-reports LUKS, there is no Linux screenlock table, and the Windows
+// registry table needs anchored keys. Pure parsers are unit-tested; thin IO
+// wrappers are not. Every path degrades to "unknown", never a false "no",
+// when a mechanism cannot be seen without root.
 // ---------------------------------------------------------------------------
 
 /// One block device flattened from `lsblk -J`, with encryption context.
@@ -605,8 +608,9 @@ fn parse_hypridle_config(text: &str) -> Option<u64> {
     None
 }
 
-/// Assemble the single screenlock row.
-#[cfg(any(target_os = "linux", test))]
+/// Assemble the single screenlock row. One shape for every platform: the
+/// backend reads the same five fields whichever agent sent them.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn screenlock_row(
     de: &str,
     enabled: &str,
@@ -746,6 +750,214 @@ fn collect_screenlock() -> Value {
             "no recognized XDG_CURRENT_DESKTOP",
         ),
     }
+}
+
+/// The three screensaver values one registry key can carry, as raw REG_SZ
+/// text. Windows stores them as text, not DWORDs. An absent value stays None
+/// so the parser can tell "not set" from "set to zero".
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default, Clone, PartialEq)]
+struct ScreenSaverValues {
+    active: Option<String>,          // ScreenSaveActive     "1" / "0"
+    secure: Option<String>,          // ScreenSaverIsSecure  "1" / "0"
+    timeout_seconds: Option<String>, // ScreenSaveTimeOut    seconds as text
+}
+
+/// Every screen-lock source on a Windows host, as raw text. The IO wrapper
+/// fills it; every decision below is pure and unit-tested on any host.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default, Clone, PartialEq)]
+struct WindowsScreenLockInputs {
+    /// HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+    /// InactivityTimeoutSecs: the machine inactivity limit, in seconds.
+    inactivity_timeout_secs: Option<String>,
+    /// HKLM\SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop
+    machine_policy: ScreenSaverValues,
+    /// HKCU\Software\Policies\Microsoft\Windows\Control Panel\Desktop
+    user_policy: ScreenSaverValues,
+    /// HKCU\Control Panel\Desktop
+    user_preference: ScreenSaverValues,
+}
+
+/// Parse a REG_SZ boolean ("1" or "0"). Anything else is unknown, never a
+/// silent "no".
+#[cfg(any(target_os = "windows", test))]
+fn parse_reg_sz_bool(raw: Option<&str>) -> Option<bool> {
+    match raw?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a REG_SZ unsigned number ("600"). Empty or non-numeric is unknown.
+#[cfg(any(target_os = "windows", test))]
+fn parse_reg_sz_u64(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok()
+}
+
+/// One parsed value and the key that supplied it.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq)]
+struct Sourced<T> {
+    value: Option<T>,
+    source: &'static str,
+}
+
+/// Pick the first key, by policy precedence, that sets one value. Windows
+/// applies policy PER VALUE, not per key: a machine policy that sets only
+/// ScreenSaverIsSecure leaves the user's own timeout in effect. A first-key-
+/// wins rule would report "unknown" on the most common managed setup.
+#[cfg(any(target_os = "windows", test))]
+fn first_set<'a, T>(
+    ranked: &[(&'static str, &'a ScreenSaverValues)],
+    field: fn(&'a ScreenSaverValues) -> Option<&'a str>,
+    parse: fn(Option<&str>) -> Option<T>,
+) -> Sourced<T> {
+    for (source, values) in ranked {
+        if let Some(raw) = field(values) {
+            return Sourced {
+                value: parse(Some(raw)),
+                source,
+            };
+        }
+    }
+    Sourced {
+        value: None,
+        source: "none",
+    }
+}
+
+/// Windows screenlock row. Decision order:
+/// 1. A machine inactivity limit above zero locks the console whatever the
+///    screensaver says, so it answers "yes" outright.
+/// 2. Otherwise the screensaver must be active, must ask for a password, and
+///    must have a non-zero timeout. Any definite failure is "no"; a missing
+///    value is "unknown". A definite "no" beats "unknown", so a saver that
+///    never asks for a password is reported even when its timeout is unset.
+#[cfg(any(target_os = "windows", test))]
+fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
+    if let Some(secs) = parse_reg_sz_u64(inputs.inactivity_timeout_secs.as_deref()) {
+        if secs > 0 {
+            return screenlock_row(
+                "windows",
+                "yes",
+                Some(secs),
+                "machine_inactivity_policy",
+                &format!("InactivityTimeoutSecs={}", secs),
+            );
+        }
+    }
+    let ranked = [
+        ("machine_policy", &inputs.machine_policy),
+        ("user_policy", &inputs.user_policy),
+        ("user", &inputs.user_preference),
+    ];
+    let active = first_set(&ranked, |v| v.active.as_deref(), parse_reg_sz_bool);
+    let secure = first_set(&ranked, |v| v.secure.as_deref(), parse_reg_sz_bool);
+    let timeout = first_set(&ranked, |v| v.timeout_seconds.as_deref(), parse_reg_sz_u64);
+    let detail = format!(
+        "ScreenSaveActive={}({}) ScreenSaverIsSecure={}({}) ScreenSaveTimeOut={}({})",
+        fmt_opt(active.value),
+        active.source,
+        fmt_opt(secure.value),
+        secure.source,
+        fmt_opt(timeout.value),
+        timeout.source
+    );
+    // The highest-ranking key that contributed anything names the source.
+    let source = [active.source, secure.source, timeout.source]
+        .into_iter()
+        .min_by_key(|s| match *s {
+            "machine_policy" => 0,
+            "user_policy" => 1,
+            "user" => 2,
+            _ => 3,
+        })
+        .unwrap_or("none");
+    if source == "none" {
+        return screenlock_row(
+            "windows",
+            "unknown",
+            None,
+            "none",
+            "no screen-lock policy and no screen saver values found",
+        );
+    }
+    if active.value == Some(false) {
+        return screenlock_row("windows", "no", timeout.value, source, &detail);
+    }
+    if secure.value == Some(false) {
+        return screenlock_row("windows", "no", timeout.value, source, &detail);
+    }
+    if timeout.value == Some(0) {
+        // Mirrors the GNOME idle-delay=0 rule: a lock that never triggers is
+        // not a lock.
+        return screenlock_row("windows", "no", Some(0), source, &detail);
+    }
+    match (active.value, secure.value, timeout.value) {
+        (Some(true), Some(true), Some(t)) => {
+            screenlock_row("windows", "yes", Some(t), source, &detail)
+        }
+        _ => screenlock_row("windows", "unknown", timeout.value, source, &detail),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(|| "unset".to_string())
+}
+
+/// Read one registry value as text. REG_SZ comes back as is; a REG_DWORD is
+/// rendered as decimal, because some management tools write the inactivity
+/// limit either way. A missing key, a missing value, or a wrong type all stay
+/// None, so the parser reports "unknown" and never a false "no".
+#[cfg(target_os = "windows")]
+fn reg_value_text(root: winreg::HKEY, path: &str, name: &str) -> Option<String> {
+    let key = winreg::RegKey::predef(root).open_subkey(path).ok()?;
+    if let Ok(s) = key.get_value::<String, _>(name) {
+        return Some(s);
+    }
+    key.get_value::<u32, _>(name).ok().map(|n| n.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn read_screensaver_values(root: winreg::HKEY, path: &str) -> ScreenSaverValues {
+    ScreenSaverValues {
+        active: reg_value_text(root, path, "ScreenSaveActive"),
+        secure: reg_value_text(root, path, "ScreenSaverIsSecure"),
+        timeout_seconds: reg_value_text(root, path, "ScreenSaveTimeOut"),
+    }
+}
+
+/// Read every screen-lock source from the registry. All four keys are
+/// readable without administrator rights. The build is x64, so no WOW64
+/// redirection applies to HKLM\SOFTWARE.
+#[cfg(target_os = "windows")]
+fn read_windows_screenlock_inputs() -> WindowsScreenLockInputs {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    WindowsScreenLockInputs {
+        inactivity_timeout_secs: reg_value_text(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+            "InactivityTimeoutSecs",
+        ),
+        machine_policy: read_screensaver_values(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Policies\Microsoft\Windows\Control Panel\Desktop",
+        ),
+        user_policy: read_screensaver_values(
+            HKEY_CURRENT_USER,
+            r"Software\Policies\Microsoft\Windows\Control Panel\Desktop",
+        ),
+        user_preference: read_screensaver_values(HKEY_CURRENT_USER, r"Control Panel\Desktop"),
+    }
+}
+
+/// Collect Windows screen-lock posture, unprivileged.
+#[cfg(target_os = "windows")]
+fn collect_screenlock_windows() -> Value {
+    windows_screenlock_row(&read_windows_screenlock_inputs())
 }
 
 /// Flatten osquery results into JSON:API resources, stamping each row with collected_at.
@@ -1839,6 +2051,38 @@ fn select_appimage_asset<'a>(assets: &'a [ReleaseAsset], arch: &str) -> Option<&
     })
 }
 
+/// The release-artifact architecture tag for a Windows host. Windows and
+/// macOS artifacts use the short tag ("x64"); Linux ones use the Rust arch
+/// string ("x86_64"). Passing std::env::consts::ARCH straight through would
+/// never match "Windows_x64" and the agent would stop updating in silence.
+/// Only x64 ships today, so any other arch returns None rather than guess.
+#[cfg(any(target_os = "windows", test))]
+fn windows_arch_tag(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("x64"),
+        _ => None,
+    }
+}
+
+/// Pick the NSIS installer asset for this architecture. `original_name` is
+/// the contract; the friendly label ("Windows Installer") carries neither the
+/// architecture nor the file type. No label fallback: a label-only match
+/// could hand back a `.deb`. The suffix test also rejects `.nsis.zip`,
+/// `.exe.sig`, and `.msi`.
+#[cfg(any(target_os = "windows", test))]
+fn select_windows_installer_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    arch_tag: &str,
+) -> Option<&'a ReleaseAsset> {
+    let infix = format!("Windows_{}", arch_tag);
+    assets.iter().find(|asset| {
+        asset
+            .original_name
+            .as_deref()
+            .is_some_and(|n| n.ends_with(".exe") && n.contains(&infix))
+    })
+}
+
 /// The file to replace on self-update. Set only when this process runs from
 /// an AppImage; deb and rpm installs update through the package manager.
 #[cfg(any(target_os = "linux", test))]
@@ -1863,7 +2107,7 @@ fn staged_appimage_path(target: &std::path::Path, pid: u32) -> std::path::PathBu
 /// Returns None on other systems: the installer below mounts a DMG, so a
 /// non-macOS host must not download one. Without this gate a Linux or Windows
 /// x86_64 host selects the Intel DMG, downloads it, and fails at mount time.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn host_arch_tags() -> Option<(&'static str, &'static str)> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -1878,7 +2122,7 @@ fn host_arch_tags() -> Option<(&'static str, &'static str)> {
 /// Pick the DMG asset matching this host's architecture. Prefers the real
 /// artifact filename (`original_name`); falls back to the friendly label only
 /// when it is absent. Returns None rather than guess the wrong architecture.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn select_dmg_asset<'a>(
     assets: &'a [ReleaseAsset],
     arch_tag: &str,
@@ -1903,6 +2147,15 @@ fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
         .map(|b| format!("{:02x}", b))
         .collect();
     actual.eq_ignore_ascii_case(expected.trim_start_matches("sha256:"))
+}
+
+/// Whether this platform refuses an update that carries no server checksum.
+/// macOS has a second, independent gate after the hash (codesign team match
+/// plus a Gatekeeper assessment), so it may proceed. Linux and Windows have
+/// nothing after the hash, so unverifiable bytes must never run. `os` is a
+/// parameter so tests pin every branch without cross-compiling.
+fn update_requires_checksum(os: &str) -> bool {
+    os != "macos"
 }
 
 #[derive(serde::Deserialize)]
@@ -2419,11 +2672,42 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             };
         }
 
+        // Windows self-update reruns the NSIS installer we ship, so the update
+        // path and the manual install path use one artifact and one hook set.
+        #[cfg(target_os = "windows")]
+        {
+            let Some(arch_tag) = windows_arch_tag(std::env::consts::ARCH) else {
+                log::info!(
+                    "ℹ️  Auto-update on Windows serves x64 builds only; this host is {}",
+                    std::env::consts::ARCH
+                );
+                return Ok(None);
+            };
+            return match select_windows_installer_asset(&release.assets, arch_tag) {
+                Some(asset) => {
+                    log::info!(
+                        "✅ Selected Windows {} installer update: {} (ID: {})",
+                        arch_tag,
+                        asset.original_name.as_deref().unwrap_or(&asset.name),
+                        asset.id
+                    );
+                    Ok(Some(SelectedUpdate {
+                        asset_id: asset.id.to_string(),
+                        sha256: asset.sha256.clone(),
+                    }))
+                }
+                None => {
+                    log::warn!("⚠️  No Windows {} installer asset in the release", arch_tag);
+                    Ok(None)
+                }
+            };
+        }
+
         // The manifest returns every macOS build (arm64 + x64); the human-facing
         // `name` does not distinguish them, so match on `original_name` (the real
         // artifact filename) against THIS host's architecture. Picking the wrong
         // arch would install an app the arch-mismatch gate then refuses to launch.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         let Some((arch_tag, arch_label)) = host_arch_tags() else {
             log::info!(
                 "ℹ️  Auto-update supports macOS and Linux AppImage installs; skipping on {} {}",
@@ -2433,7 +2717,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             return Ok(None);
         };
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         if let Some(dmg_asset) = select_dmg_asset(&release.assets, arch_tag, arch_label) {
             log::info!(
                 "✅ Selected {} update: {} (ID: {})",
@@ -2522,17 +2806,26 @@ async fn download_and_install_update_internal(
         None => log::warn!("⚠️  No checksum provided for update asset; skipping verification"),
     }
 
+    // macOS gets a codesign gate after the checksum; Linux and Windows have
+    // nothing after it. Refuse to install unverifiable bytes there.
+    if expected_sha256.is_none() && update_requires_checksum(std::env::consts::OS) {
+        let msg = format!(
+            "No checksum for the {} update; refusing to install",
+            std::env::consts::OS
+        );
+        log::error!("❌ {}", msg);
+        sentry::capture_message(&msg, Level::Error);
+        return Err(msg);
+    }
+
     #[cfg(target_os = "linux")]
     {
-        // macOS gets a codesign gate after the checksum; Linux has nothing
-        // after it. Refuse to install unverifiable bytes.
-        if expected_sha256.is_none() {
-            let msg = "No checksum for the AppImage update; refusing to install".to_string();
-            log::error!("❌ {}", msg);
-            sentry::capture_message(&msg, Level::Error);
-            return Err(msg);
-        }
         return install_appimage_update(&bytes, app);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return install_windows_update(&bytes, expected_sha256, app);
     }
 
     #[cfg(target_os = "macos")]
@@ -2564,9 +2857,9 @@ async fn download_and_install_update_internal(
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        // app is consumed only by the linux and macOS install arms.
+        // app is consumed only by the platform install arms.
         let _ = app;
         Err("auto-update is not supported on this platform".to_string())
     }
@@ -2666,6 +2959,103 @@ fn install_appimage_update(bytes: &[u8], app: &tauri::AppHandle) -> Result<(), S
         );
         return Ok(());
     }
+    app.exit(0);
+    Ok(())
+}
+
+/// Where to stage the downloaded installer: a private per-user directory
+/// under the local app data root, next to the logs. Another user cannot write
+/// there, so nothing swaps the installer between our write and our run.
+/// `data_local` is a parameter so the path rule is testable on any host.
+#[cfg(any(target_os = "windows", test))]
+fn windows_update_dir(data_local: &std::path::Path) -> std::path::PathBuf {
+    data_local.join("com.klaay.app").join("updates")
+}
+
+/// The installer command line for an unattended update. `/S` runs the NSIS
+/// installer with no window and no prompt; in silent mode the Tauri template
+/// stops the running agent itself instead of asking. `/R` makes the installer
+/// start the new agent when it finishes, as the logged-in user. Without `/S`
+/// an unattended machine stalls on the "close the app" prompt forever.
+#[cfg(any(target_os = "windows", test))]
+fn windows_installer_args() -> [&'static str; 2] {
+    ["/S", "/R"]
+}
+
+/// Run the downloaded NSIS installer over this install and let it restart the
+/// agent. Windows cannot overwrite a running .exe, so the installer stops this
+/// process; we exit right after the spawn so it never has to kill us
+/// mid-write. The installer also rewrites the Run key, so every update
+/// repairs autostart.
+#[cfg(target_os = "windows")]
+fn install_windows_update(
+    bytes: &[u8],
+    expected_sha256: Option<&str>,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+
+    // Do not attach a console. `/S`, not this flag, is what makes the install
+    // silent; this only stops a console flashing when the agent itself was
+    // started from one.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // The caller refuses a missing checksum on Windows already; keep the gate
+    // here too so this function is safe on its own.
+    let expected = expected_sha256.ok_or("no checksum for the Windows update")?;
+
+    let dir = windows_update_dir(
+        &dirs::data_local_dir().ok_or("no local app data directory")?,
+    );
+    std::fs::create_dir_all(&dir).map_err(|e| format!("update dir: {}", e))?;
+    // A fixed name means at most one stale file, not one per update. Linux
+    // needs a pid suffix because it renames over a live target; we do not.
+    let staged = dir.join("KlaayGuard-update.exe");
+    let _ = std::fs::remove_file(&staged);
+
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&staged)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        // Never leave a partial installer behind.
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("stage installer: {}", e));
+    }
+
+    // Re-read and re-verify the bytes on disk. Until Authenticode signing is
+    // live this is the only check that happens after the bytes hit disk; it
+    // catches a short write and narrows the swap window.
+    let on_disk = std::fs::read(&staged).map_err(|e| format!("re-read installer: {}", e))?;
+    if !sha256_matches(&on_disk, expected) {
+        let _ = std::fs::remove_file(&staged);
+        let msg = "Staged Windows installer does not match its checksum".to_string();
+        log::error!("❌ {}", msg);
+        sentry::capture_message(&msg, Level::Error);
+        return Err(msg);
+    }
+
+    log::info!("🔄 Running installer {:?} silently", staged);
+    let spawn = std::process::Command::new(&staged)
+        .args(windows_installer_args())
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+    if let Err(e) = spawn {
+        // Nothing is installed yet, so the running agent stays as it is and
+        // the error is honest. This differs from the Linux relaunch rule,
+        // where the bytes were already in place.
+        let msg = format!("installer spawn failed: {}", e);
+        log::error!("❌ {}", msg);
+        sentry::capture_message(&format!("windows_update_spawn_failed: {}", e), Level::Error);
+        return Err(msg);
+    }
+    log::info!("✅ Installer started; exiting so it can replace this process");
     app.exit(0);
     Ok(())
 }
@@ -3103,10 +3493,11 @@ pub fn run() {
             }
 
             // Register the klaayguard:// handler for this user at run time.
-            // Package installs also register it system-wide through the
-            // bundler's desktop entry; the AppImage has only this path, since
-            // nothing installs its desktop entry for it.
-            #[cfg(target_os = "linux")]
+            // Linux package installs also register it through the desktop
+            // entry, and the AppImage has only this path. The Windows
+            // installer writes the same keys, but only this path repairs them
+            // when another program takes the scheme or the install moves.
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 if let Err(e) = app.deep_link().register_all() {
@@ -3116,7 +3507,10 @@ pub fn run() {
                         Level::Error,
                     );
                 }
+            }
 
+            #[cfg(target_os = "linux")]
+            {
                 // Start at login, like the macOS LaunchAgent. An agent that
                 // only runs when a human remembers to launch it leaves gaps
                 // the fleet dashboard cannot tell from an offline machine.
@@ -3374,7 +3768,8 @@ mod update_selection_tests {
             r#"[
               {"id":1,"name":"Linux (Debian/Ubuntu .deb)","original_name":"KlaayGuard_0.1.12_Linux_x86_64_production.deb","sha256":"aa"},
               {"id":2,"name":"MacOS (Apple silicon)","original_name":"KlaayGuard_0.1.12_macOS_arm64_production.dmg","sha256":"bb"},
-              {"id":3,"name":"MacOS (Intel)","original_name":"KlaayGuard_0.1.12_macOS_x64_production.dmg","sha256":"cc"}
+              {"id":3,"name":"MacOS (Intel)","original_name":"KlaayGuard_0.1.12_macOS_x64_production.dmg","sha256":"cc"},
+              {"id":4,"name":"Windows Installer","original_name":"KlaayGuard_0.1.12_Windows_x64_production.exe","sha256":"dd"}
             ]"#,
         )
         .unwrap()
@@ -3422,6 +3817,77 @@ mod update_selection_tests {
             9
         );
         assert!(select_dmg_asset(&assets, "macOS_arm64", "Apple silicon").is_none());
+    }
+
+    #[test]
+    fn selects_the_windows_installer_by_arch_tag() {
+        // One release carries macOS, Linux, and Windows artifacts; matching
+        // on the friendly label alone could return a .deb.
+        let assets = manifest();
+        let sel = select_windows_installer_asset(&assets, "x64").unwrap();
+        assert_eq!(sel.id, 4);
+        assert!(sel.original_name.as_deref().unwrap().ends_with(".exe"));
+    }
+
+    #[test]
+    fn windows_installer_never_matches_a_label_only_asset() {
+        // select_dmg_asset falls back to the label. The Windows selector must
+        // not: the label carries neither architecture nor file type.
+        let label_only: Vec<ReleaseAsset> =
+            serde_json::from_value(json!([{"id": 9, "name": "Windows Installer"}])).unwrap();
+        assert!(select_windows_installer_asset(&label_only, "x64").is_none());
+    }
+
+    #[test]
+    fn windows_installer_ignores_the_other_windows_artifacts() {
+        // Turning on updater artifacts, or shipping arm64 later, must not
+        // make an x64 host download the wrong file.
+        let assets: Vec<ReleaseAsset> = serde_json::from_value(json!([
+            {"id": 1, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_x64_production.nsis.zip"},
+            {"id": 2, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_x64_production.exe.sig"},
+            {"id": 3, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_arm64_production.exe"},
+            {"id": 4, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_x64_production.exe"}
+        ]))
+        .unwrap();
+        assert_eq!(select_windows_installer_asset(&assets, "x64").unwrap().id, 4);
+        assert_eq!(select_windows_installer_asset(&assets, "arm64").unwrap().id, 3);
+    }
+
+    #[test]
+    fn windows_arch_tag_maps_only_x64() {
+        // Windows artifacts use the short tag while Linux uses the Rust arch
+        // string. Passing ARCH straight through never matches, and the agent
+        // stops updating in silence.
+        assert_eq!(windows_arch_tag("x86_64"), Some("x64"));
+        assert_eq!(windows_arch_tag("aarch64"), None);
+        assert_eq!(windows_arch_tag("x86"), None);
+    }
+
+    #[test]
+    fn windows_installer_runs_silently_and_relaunches() {
+        // Without /S the NSIS template asks the user to close the running
+        // app; an unattended machine stalls there forever. Without /R nothing
+        // starts the new agent after the old one is stopped.
+        let args = windows_installer_args();
+        assert!(args.contains(&"/S"));
+        assert!(args.contains(&"/R"));
+    }
+
+    #[test]
+    fn update_requires_checksum_everywhere_but_macos() {
+        // macOS has codesign and Gatekeeper after the hash. Linux and Windows
+        // have nothing, so bytes with no server checksum must never run.
+        assert!(update_requires_checksum("linux"));
+        assert!(update_requires_checksum("windows"));
+        assert!(!update_requires_checksum("macos"));
+    }
+
+    #[test]
+    fn windows_update_dir_stays_under_the_local_app_data() {
+        // Staging in a per-user directory stops another user swapping the
+        // installer between our write and our run.
+        let dir = windows_update_dir(std::path::Path::new(r"C:\Users\u\AppData\Local"));
+        assert!(dir.ends_with(std::path::Path::new("com.klaay.app").join("updates")));
     }
 
     #[test]
@@ -3692,6 +4158,180 @@ zroot/ROOT/default / zfs rw 0 0
         );
         // Missing gsettings -> unknown, never a false "no".
         assert_eq!(screenlock_row_gnome(None, None)[0]["enabled"], "unknown");
+    }
+
+    fn saver(active: &str, secure: &str, timeout: &str) -> ScreenSaverValues {
+        ScreenSaverValues {
+            active: Some(active.to_string()),
+            secure: Some(secure.to_string()),
+            timeout_seconds: Some(timeout.to_string()),
+        }
+    }
+
+    #[test]
+    fn reg_sz_parsers_read_windows_text_values() {
+        // Windows stores these as REG_SZ text, not DWORDs. Treating an
+        // unreadable value as 0 or false invents a "no".
+        assert_eq!(parse_reg_sz_bool(Some("1")), Some(true));
+        assert_eq!(parse_reg_sz_bool(Some("0")), Some(false));
+        assert_eq!(parse_reg_sz_bool(Some(" 1 ")), Some(true));
+        assert_eq!(parse_reg_sz_bool(Some("")), None);
+        assert_eq!(parse_reg_sz_bool(Some("yes")), None);
+        assert_eq!(parse_reg_sz_bool(None), None);
+        assert_eq!(parse_reg_sz_u64(Some("600")), Some(600));
+        assert_eq!(parse_reg_sz_u64(Some("0")), Some(0));
+        assert_eq!(parse_reg_sz_u64(Some("")), None);
+        assert_eq!(parse_reg_sz_u64(Some("abc")), None);
+    }
+
+    #[test]
+    fn windows_screenlock_yes_from_the_machine_inactivity_limit() {
+        // The machine inactivity limit locks the console whatever the
+        // screensaver says. Reading only the screensaver reports "unknown" on
+        // a correctly hardened machine.
+        let inputs = WindowsScreenLockInputs {
+            inactivity_timeout_secs: Some("900".into()),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 900);
+        assert_eq!(row[0]["source"], "machine_inactivity_policy");
+    }
+
+    #[test]
+    fn windows_screenlock_ignores_a_zero_inactivity_limit() {
+        // Zero means "not configured", not a zero-second lock.
+        let inputs = WindowsScreenLockInputs {
+            inactivity_timeout_secs: Some("0".into()),
+            user_preference: saver("1", "1", "600"),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 600);
+        assert_eq!(row[0]["source"], "user");
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_the_saver_is_not_secure() {
+        // The most common false positive on Windows: the screensaver runs and
+        // never asks for a password.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: saver("1", "0", "600"),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_the_timeout_is_zero() {
+        // Mirrors the GNOME idle-delay=0 rule: a lock that never triggers is
+        // not a lock.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: saver("1", "1", "0"),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "no");
+        assert_eq!(row[0]["delay_seconds"], 0);
+    }
+
+    #[test]
+    fn windows_screenlock_machine_policy_overrides_the_user() {
+        // Group policy wins. Reporting the user value tells the dashboard a
+        // managed fleet is unlocked.
+        let inputs = WindowsScreenLockInputs {
+            machine_policy: saver("1", "1", "300"),
+            user_preference: saver("0", "0", "0"),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 300);
+        assert_eq!(row[0]["source"], "machine_policy");
+    }
+
+    #[test]
+    fn windows_screenlock_merges_policy_and_user_values() {
+        // Windows applies policy per value, not per key. A first-key-wins
+        // rule reports "unknown" on the most common managed setup.
+        let inputs = WindowsScreenLockInputs {
+            machine_policy: ScreenSaverValues {
+                secure: Some("1".into()),
+                ..Default::default()
+            },
+            user_preference: ScreenSaverValues {
+                active: Some("1".into()),
+                timeout_seconds: Some("600".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 600);
+        assert_eq!(row[0]["source"], "machine_policy");
+        let detail = row[0]["detail"].as_str().unwrap();
+        assert!(detail.contains("ScreenSaverIsSecure=true(machine_policy)"));
+        assert!(detail.contains("ScreenSaveTimeOut=600(user)"));
+    }
+
+    #[test]
+    fn windows_screenlock_user_policy_beats_the_user_preference() {
+        // Pins the middle rank of the three-level precedence.
+        let inputs = WindowsScreenLockInputs {
+            user_policy: ScreenSaverValues {
+                timeout_seconds: Some("300".into()),
+                ..Default::default()
+            },
+            user_preference: saver("1", "1", "1200"),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["delay_seconds"], 300);
+    }
+
+    #[test]
+    fn windows_screenlock_unknown_when_a_value_is_missing() {
+        // Guessing "yes" reports a machine compliant on two of three values.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: ScreenSaverValues {
+                active: Some("1".into()),
+                timeout_seconds: Some("600".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "unknown");
+        assert!(row[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ScreenSaverIsSecure=unset"));
+    }
+
+    #[test]
+    fn windows_screenlock_unknown_when_nothing_is_readable() {
+        // An empty registry read must never look like "no lock". Unknown and
+        // no are different answers on the dashboard.
+        let row = windows_screenlock_row(&WindowsScreenLockInputs::default());
+        assert_eq!(row[0]["enabled"], "unknown");
+        assert!(row[0]["delay_seconds"].is_null());
+        assert_eq!(row[0]["source"], "none");
+    }
+
+    #[test]
+    fn windows_screenlock_row_uses_the_shared_row_shape() {
+        // The backend reads one screenlock shape for every operating system.
+        let row = windows_screenlock_row(&WindowsScreenLockInputs::default());
+        let obj = row[0].as_object().unwrap();
+        let mut keys: Vec<_> = obj.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["delay_seconds", "desktop_environment", "detail", "enabled", "source"]
+        );
+        assert_eq!(row[0]["desktop_environment"], "windows");
     }
 
     #[test]

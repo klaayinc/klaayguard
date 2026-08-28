@@ -182,3 +182,45 @@ jobs:
           DEB=$(find src-tauri/target/release/bundle/deb -name "*.deb" | head -n1)
           test -n "$DEB"
           ./.github/scripts/validate-linux-deb.sh "$DEB"
+
+  # Build the Windows NSIS installer the way release does, then install it
+  # silently on the runner and assert on the result: the Run key, the
+  # klaayguard:// handler, the sidecar, and a clean uninstall. Every one of
+  # those is invisible to cargo build.
+  bundle-windows:
+    name: Bundle check (Windows NSIS)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: x86_64-pc-windows-msvc-bundle
+
+      - name: Fetch osquery sidecar
+        shell: pwsh
+        run: ./.github/scripts/fetch-osquery-windows.ps1
+
+      - name: Install tauri-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2.11.4
+
+      - name: Build NSIS installer
+        working-directory: src-tauri
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Validate installer
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "NSIS installer missing" }
+          $v = (Get-Content VERSION -Raw).Trim()
+          ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v

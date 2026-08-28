@@ -1,5 +1,14 @@
 name: "release-windows"
 
+# Windows x64 release job. Mirrors release-linux.yml: every step that can run
+# in bash does, so the version sync, the artifact gate, and the upload are the
+# same code on every platform. Only the osquery fetch and the installer check
+# need PowerShell.
+#
+# release.yml's publish job needs this job, so a failure here keeps the whole
+# release a draft. That is the intended safety: customers never see a release
+# that is missing a platform.
+
 on:
   workflow_call:
     inputs:
@@ -11,9 +20,157 @@ on:
         type: string
 
 jobs:
-  noop:
-    name: Windows builds disabled
+  build-upload-windows-x64:
+    name: Windows x64 (${{ matrix.build }})
     runs-on: windows-latest
+    permissions:
+      contents: write
+      # Only for the Azure OIDC login used by signing.
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [development, staging, production]
+        include:
+          - build: development
+            api_url: "http://localhost:3000"
+            frontend_url: "http://localhost:5173"
+          - build: staging
+            api_url: "https://api.klaay.dev"
+            frontend_url: "https://app.klaay.dev"
+          - build: production
+            api_url: "https://api.klaay.com"
+            frontend_url: "https://app.klaay.com"
     steps:
-      - name: No-op
-        run: echo "Windows builds are currently disabled"
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "=2.11.4" --locked
+
+      # The Rakefile and the PowerShell fetch script each pin an osquery
+      # version. Nothing links them; a bump to one ships two versions.
+      - name: Check the osquery version agrees across platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAKE_VER=$(grep -oP 'OSQUERY_VERSION\s*=\s*"\K[0-9.]+' Rakefile)
+          PS_VER=$(grep -oP '^\$version\s*=\s*"\K[0-9.]+' .github/scripts/fetch-osquery-windows.ps1)
+          [ "$RAKE_VER" = "$PS_VER" ] || { echo "osquery version split: Rakefile $RAKE_VER, PowerShell $PS_VER" >&2; exit 1; }
+
+      - name: Fetch osquery sidecar (Windows)
+        shell: pwsh
+        run: ./.github/scripts/fetch-osquery-windows.ps1
+
+      - name: Verify sidecar binary (Windows x64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIDECAR="src-tauri/vendor/klaayguard-osqueryi-x86_64-pc-windows-msvc.exe"
+          test -f "$SIDECAR" || { echo "Missing Windows sidecar: $SIDECAR" >&2; exit 1; }
+          # osqueryd.exe is about 30 MB. A short file is a truncated download
+          # or an HTML error page; a file that does not start with MZ is not
+          # a Windows executable.
+          SIZE=$(stat -c%s "$SIDECAR")
+          [ "$SIZE" -gt 5000000 ] || { echo "Sidecar is only $SIZE bytes" >&2; exit 1; }
+          [ "$(head -c 2 "$SIDECAR")" = "MZ" ] || { echo "Sidecar is not a PE executable" >&2; exit 1; }
+
+      # Same two sed lines as Linux, plus an assertion: this job is new, and a
+      # silent no-op here ships an installer that reports the wrong version.
+      - name: Set bundle version from release
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"; V="${V#v}"
+          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
+          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
+          grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
+
+      - name: Build Tauri (Windows x64)
+        env:
+          KLAAY_ENV: ${{ matrix.build }}
+          VITE_API_BASE_URL: ${{ matrix.api_url }}
+          VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      # --- Signing (gated) --------------------------------------------------
+      # Signing runs when the Azure Trusted Signing secrets exist. Without
+      # them the installer is unsigned. An unsigned release must be a visible,
+      # dated decision, so it needs the ALLOW_UNSIGNED_WINDOWS_RELEASE
+      # repository variable. Delete that variable the day the certificate
+      # lands and an unsigned installer can never ship again.
+      - name: Check signing configuration
+        id: sign
+        shell: bash
+        env:
+          TS_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          ALLOW_UNSIGNED: ${{ vars.ALLOW_UNSIGNED_WINDOWS_RELEASE }}
+        run: |
+          if [ -n "${TS_ENDPOINT:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif [ "${ALLOW_UNSIGNED:-}" = "true" ]; then
+            echo "::warning::No signing certificate. This installer is UNSIGNED and shows a SmartScreen warning."
+            echo "### :warning: Windows installer is UNSIGNED" >> "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::No signing certificate and ALLOW_UNSIGNED_WINDOWS_RELEASE is not 'true'. Refusing to ship." >&2
+            exit 1
+          fi
+
+      - name: Azure login (OIDC)
+        if: steps.sign.outputs.enabled == 'true'
+        uses: azure/login@v2
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign installer (Azure Trusted Signing)
+        if: steps.sign.outputs.enabled == 'true'
+        uses: azure/trusted-signing-action@v0
+        with:
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_PROFILE }}
+          files-folder: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Install, check, and uninstall on the runner. This is the same silent
+      # invocation the self-updater uses.
+      - name: Validate installer
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "NSIS installer missing" }
+          $v = "${{ inputs.version }}".TrimStart("v")
+          ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v
+
+      - name: Rename and upload artifacts (Windows x64)
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # --target puts the bundle under target/<triple>/, not target/release/.
+          BASE_DIR="src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          EXE=$(find "$BASE_DIR" -type f -name "*.exe" | head -n1)
+          # The installer must exist. A missing artifact must fail the job:
+          # a partial upload becomes a published release that customers see.
+          test -n "$EXE" || { echo "NSIS installer missing" >&2; exit 1; }
+
+          RENAMED="KlaayGuard_${VERSION}_Windows_x64_${{ matrix.build }}.exe"
+          cp "$EXE" "$RENAMED"
+          echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: $RENAMED"
+          gh release upload "$RELEASE_TAG" "$RENAMED" --repo "$GITHUB_REPOSITORY" --clobber

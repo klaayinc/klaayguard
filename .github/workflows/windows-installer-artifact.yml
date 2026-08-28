@@ -1,77 +1,102 @@
 name: Windows installer artifact
 
-# Manual build of the Windows NSIS installer for x64 and arm64, uploaded as
-# workflow artifacts for testing on real machines. Does NOT publish to customers
-# and does NOT touch the release pipeline. Signing runs only when the Azure
-# Trusted Signing secrets exist; without them the installer is UNSIGNED and must
-# not ship. Run via:
-#   gh workflow run windows-installer-artifact.yml --ref <branch>
+# Manual build of the Windows x64 NSIS installer, uploaded as a workflow
+# artifact for testing on real machines. Does NOT publish to customers and
+# does NOT touch the release pipeline. It runs the same steps as
+# release-windows.yml, so a green run here is the rehearsal for the release
+# job. Run via:
+#   gh workflow run windows-installer-artifact.yml --ref <branch> -f version=0.1.99
+#
+# arm64 is not built. The osquery fetch script is x64-only, and ci.yml never
+# builds aarch64-pc-windows-msvc. An arm64 leg built green once on 2026-08-12
+# from Git LFS sidecars; add it back when the fetch script takes a target.
 on:
   workflow_dispatch:
-  push:
-    branches: [enable-windows-builds]
+    inputs:
+      version:
+        description: "Version to stamp into the installer (x.y.z). Empty keeps the tree's version."
+        required: false
+        default: ""
+        type: string
 
-# id-token: write is needed only for the Azure OIDC login used by signing.
 permissions:
   contents: read
+  # Only for the Azure OIDC login used by signing.
   id-token: write
 
 jobs:
   build:
-    name: Windows ${{ matrix.arch }}
+    name: Windows x64 (${{ matrix.build }})
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
+        build: [development, staging, production]
         include:
-          # x64 builds natively on the standard Windows runner.
-          - arch: x64
-            runner: windows-latest
-            target: x86_64-pc-windows-msvc
-          # arm64 builds natively on an arm64 runner, so there is no cross-link
-          # step. If windows-11-arm is unavailable, switch this to windows-latest
-          # and cross-compile (the arm64 MSVC components must then be present).
-          - arch: arm64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.runner }}
+          - build: development
+            api_url: "http://localhost:3000"
+            frontend_url: "http://localhost:5173"
+          - build: staging
+            api_url: "https://api.klaay.dev"
+            frontend_url: "https://app.klaay.dev"
+          - build: production
+            api_url: "https://api.klaay.com"
+            frontend_url: "https://app.klaay.com"
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version "=2.11.4" --locked
+
+      - name: Check the osquery version agrees across platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAKE_VER=$(grep -oP 'OSQUERY_VERSION\s*=\s*"\K[0-9.]+' Rakefile)
+          PS_VER=$(grep -oP '^\$version\s*=\s*"\K[0-9.]+' .github/scripts/fetch-osquery-windows.ps1)
+          [ "$RAKE_VER" = "$PS_VER" ] || { echo "osquery version split: Rakefile $RAKE_VER, PowerShell $PS_VER" >&2; exit 1; }
 
       - name: Fetch osquery sidecar (Windows)
         shell: pwsh
         run: ./.github/scripts/fetch-osquery-windows.ps1
 
-      - name: Install tauri-cli
-        run: cargo install tauri-cli --version "=2.11.4" --locked
-
-      - name: Verify osquery sidecar exists (Windows ${{ matrix.arch }})
+      - name: Verify sidecar binary (Windows x64)
         shell: bash
         run: |
           set -euo pipefail
-          SIDECAR="src-tauri/vendor/klaayguard-osqueryi-${{ matrix.target }}.exe"
-          test -f "$SIDECAR" || { echo "Missing Windows sidecar: $SIDECAR"; exit 1; }
-          # A 133-byte Git LFS pointer means LFS did not resolve; fail loudly
-          # rather than bundle a text file as the osquery binary.
-          if head -c 128 "$SIDECAR" | grep -q "git-lfs"; then
-            echo "Sidecar is an unresolved Git LFS pointer: $SIDECAR"; exit 1
-          fi
+          SIDECAR="src-tauri/vendor/klaayguard-osqueryi-x86_64-pc-windows-msvc.exe"
+          test -f "$SIDECAR" || { echo "Missing Windows sidecar: $SIDECAR" >&2; exit 1; }
+          SIZE=$(stat -c%s "$SIDECAR")
+          [ "$SIZE" -gt 5000000 ] || { echo "Sidecar is only $SIZE bytes" >&2; exit 1; }
+          [ "$(head -c 2 "$SIDECAR")" = "MZ" ] || { echo "Sidecar is not a PE executable" >&2; exit 1; }
+
+      - name: Set bundle version
+        if: inputs.version != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"; V="${V#v}"
+          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
+          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
+          grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
 
       - name: Build Windows installer (NSIS)
         env:
-          KLAAY_ENV: production
-          VITE_API_BASE_URL: https://api.klaay.com
-          VITE_FRONTEND_URL: https://app.klaay.com
-        run: cargo tauri build --target ${{ matrix.target }} --bundles nsis
+          KLAAY_ENV: ${{ matrix.build }}
+          VITE_API_BASE_URL: ${{ matrix.api_url }}
+          VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
-      # --- Signing (gated) ------------------------------------------------------
-      # Signing runs only when AZURE_TRUSTED_SIGNING_ENDPOINT is set. Until the
-      # Klaay organization Trusted Signing account exists, these steps are skipped
-      # and the installer is UNSIGNED (fine for VM testing, never for customers).
+      # --- Signing (gated) --------------------------------------------------
+      # Signing runs only when AZURE_TRUSTED_SIGNING_ENDPOINT is set. Without
+      # it the installer is UNSIGNED, which is fine for a test machine.
       - name: Check signing configuration
         id: sign
         shell: bash
@@ -79,7 +104,7 @@ jobs:
           TS_ENDPOINT: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
         run: |
           if [ -z "${TS_ENDPOINT:-}" ]; then
-            echo "::warning::AZURE_TRUSTED_SIGNING_ENDPOINT not set — installer is UNSIGNED (test only)."
+            echo "::warning::AZURE_TRUSTED_SIGNING_ENDPOINT not set; installer is UNSIGNED (test only)."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
@@ -100,15 +125,24 @@ jobs:
           endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_PROFILE }}
-          files-folder: src-tauri/target/${{ matrix.target }}/release/bundle/nsis
+          files-folder: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
           files-folder-filter: exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      - name: Validate installer
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "NSIS installer missing" }
+          $v = "${{ inputs.version }}"
+          if ($v -eq "") { $v = (Get-Content VERSION -Raw).Trim() }
+          ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v.TrimStart("v")
+
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: klaayguard-windows-${{ matrix.arch }}
-          path: src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+          name: klaayguard-windows-x64-${{ matrix.build }}
+          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
           if-no-files-found: error
