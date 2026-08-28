@@ -905,7 +905,8 @@ fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
 
 #[cfg(any(target_os = "windows", test))]
 fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map(|x| x.to_string()).unwrap_or_else(|| "unset".to_string())
+    v.map(|x| x.to_string())
+        .unwrap_or_else(|| "unset".to_string())
 }
 
 /// Read one registry value as text. REG_SZ comes back as is; a REG_DWORD is
@@ -3005,9 +3006,7 @@ fn install_windows_update(
     // here too so this function is safe on its own.
     let expected = expected_sha256.ok_or("no checksum for the Windows update")?;
 
-    let dir = windows_update_dir(
-        &dirs::data_local_dir().ok_or("no local app data directory")?,
-    );
+    let dir = windows_update_dir(&dirs::data_local_dir().ok_or("no local app data directory")?);
     std::fs::create_dir_all(&dir).map_err(|e| format!("update dir: {}", e))?;
     // A fixed name means at most one stale file, not one per update. Linux
     // needs a pid suffix because it renames over a live target; we do not.
@@ -3849,8 +3848,14 @@ mod update_selection_tests {
             {"id": 4, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_x64_production.exe"}
         ]))
         .unwrap();
-        assert_eq!(select_windows_installer_asset(&assets, "x64").unwrap().id, 4);
-        assert_eq!(select_windows_installer_asset(&assets, "arm64").unwrap().id, 3);
+        assert_eq!(
+            select_windows_installer_asset(&assets, "x64").unwrap().id,
+            4
+        );
+        assert_eq!(
+            select_windows_installer_asset(&assets, "arm64").unwrap().id,
+            3
+        );
     }
 
     #[test]
@@ -4329,7 +4334,13 @@ zroot/ROOT/default / zfs rw 0 0
         keys.sort();
         assert_eq!(
             keys,
-            ["delay_seconds", "desktop_environment", "detail", "enabled", "source"]
+            [
+                "delay_seconds",
+                "desktop_environment",
+                "detail",
+                "enabled",
+                "source"
+            ]
         );
         assert_eq!(row[0]["desktop_environment"], "windows");
     }
