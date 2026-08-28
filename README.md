@@ -68,14 +68,15 @@ Each release carries three variants — `development`, `staging`, `production` �
 that differ only in their baked-in URLs. Asset naming:
 
 ```
-KlaayGuard_<version>_<macOS_arm64|macOS_x64|Linux_x86_64>_<variant>.<ext>
+KlaayGuard_<version>_<macOS_arm64|macOS_x64|Linux_x86_64|Windows_x64>_<variant>.<ext>
 ```
 
 - **macOS:** `.dmg` (drag to Applications) and `.pkg` installer (preferred,
   see below). Apple Silicon and Intel are separate builds.
 - **Linux:** `.deb`, `.rpm`, and `.AppImage`.
-- **Windows:** the NSIS installer is configured, but the release job is
-  currently disabled. No Windows build is distributed.
+- **Windows:** an `.exe` installer (NSIS), x64 only. It needs no
+  administrator rights. Klaay does not sign it yet, so Windows shows a
+  SmartScreen warning at the first run.
 
 ## Build from source
 
@@ -182,7 +183,7 @@ All variables are optional.
 | `VITE_FRONTEND_URL` | per environment | Klaay Frontend URL for sign-in and Employee Hub |
 | `VITE_SENTRY_DSN` | empty (Sentry off) | Sentry DSN; CI injects it for releases |
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `900` | Collection loop interval |
-| `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS) |
+| `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS, Windows, Linux AppImage) |
 | `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` | `60` | Minimum gap between sign-in nudges |
 
 ### API endpoints
@@ -193,7 +194,7 @@ All variables are optional.
 | `GET /klaayguard/config` | Fetch the query set | Bearer |
 | `POST /klaayguard/data` | Send collected rows | Bearer |
 | `GET /klaayguard/updates/latest` | Update manifest | none |
-| `GET /klaayguard/download/{asset_id}` | Update DMG | none |
+| `GET /klaayguard/download/{asset_id}` | Update file | none |
 
 ## Automatic startup on macOS
 
@@ -208,19 +209,41 @@ running with `KeepAlive`.
 - The `bootstrap` step is skipped when the app is not under `/Applications`.
   Launch from `/Applications`, not from Downloads.
 
-## Automatic updates (macOS)
+## Automatic startup on Windows
+
+The installer writes a `Run` value under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Windows starts the
+agent at each logon.
+
+- The value is per-user, so the installer needs no administrator rights.
+- The agent runs only while that user is signed in.
+- The uninstaller removes the value.
+- `src-tauri/windows/hooks.nsi` holds the write and the removal.
+
+## Automatic updates
 
 The agent checks `GET /klaayguard/updates/latest` at startup and then every
-6 hours. Before it installs a newer version, it verifies the download three
-ways:
+6 hours. Before it installs a newer version, it verifies the download.
+
+On macOS, three ways:
 
 1. SHA-256 hash against the release manifest.
 2. `codesign --verify` plus the Klaay Apple Team ID on the leaf certificate.
 3. `spctl --assess` (Gatekeeper / notarization).
 
-If any check fails, the running agent stays untouched. On success the agent
-replaces `/Applications/KlaayGuard.app` and restarts itself. Updates never
-change the data-collection scope; the server config governs that.
+On Windows and the Linux AppImage, the SHA-256 hash is the only gate, so the
+agent refuses an update that carries no hash. On Windows it also re-reads the
+staged installer and checks the hash again before it runs it.
+
+If any check fails, the running agent stays untouched. On success:
+
+- macOS replaces `/Applications/KlaayGuard.app` and restarts the agent.
+- Linux replaces the AppImage file and restarts the agent.
+- Windows runs the new installer with `/S /R`. The installer stops the old
+  agent, installs over it, and starts the new one.
+
+Updates never change the data-collection scope; the server config governs
+that.
 
 ## Version management and releases
 
@@ -246,6 +269,7 @@ so Sentry is off in production — see the note in
 
 - App log (macOS): `~/Library/Logs/com.klaay.app/KlaayGuard.log`
 - App log (Linux): `~/.local/share/com.klaay.app/logs/KlaayGuard.log`
+- App log (Windows): `%LOCALAPPDATA%\com.klaay.app\logs\KlaayGuard.log`
 - launchd stdout/stderr (macOS): `~/Library/Logs/KlaayGuard/klaayguard.log` and
   `klaayguard.error.log`
 
