@@ -17,8 +17,11 @@ PLIST="$HOME/Library/LaunchAgents/com.klaay.klaayguard.plist"
 echo "==> Building debug binary"
 cargo build --bin KlaayGuard >/dev/null
 
-# Remove any pre-existing plist so its presence is attributable to this run.
+# Remove any pre-existing plist so its presence is attributable to this run,
+# and the one this run writes on exit: launchd would otherwise load it at the
+# next login.
 rm -f "$PLIST"
+trap 'rm -f "$PLIST"' EXIT
 
 # Portable 10s timeout (macOS has no GNU `timeout`): run in background, poll,
 # then kill if it's still alive. A killed process yields code 124.

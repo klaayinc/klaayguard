@@ -14,9 +14,9 @@
         <string>__APP_PATH__</string>
     </array>
     <key>RunAtLoad</key>
-    <true/>
+    __RUN_AT_LOAD__
     <key>KeepAlive</key>
-    <true/>
+    __KEEP_ALIVE__
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>LimitLoadToSessionType</key>

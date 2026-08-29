@@ -41,8 +41,11 @@ log "postinstall: registering LaunchAgent for $CONSOLE_USER (uid $CONSOLE_UID)"
 # Step 1 — render + write the plist as the user. The seam also tries to bootstrap,
 # but that inner bootstrap runs behind `sudo -u`, which drops the Aqua-session Mach
 # bootstrap port and fails with EIO. We ignore that; step 2 does the bootstrap right.
-/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -u "$CONSOLE_USER" "$BIN" --install-agent \
-  || log "postinstall: plist written; deferring activation to step 2"
+# -H: macOS sudoers keeps the caller's HOME (env_keep), and the seam resolves
+# the LaunchAgents path through HOME, so without it a root or admin HOME
+# would send the plist to the wrong user.
+/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -H -u "$CONSOLE_USER" "$BIN" --install-agent \
+  || log "postinstall: install-agent seam did not finish cleanly; trying launchctl directly"
 
 # Step 2 — enable, then bootstrap. `enable` is the critical step: if the label was
 # ever left `disabled` in launchd's override DB, both bootstrap AND RunAtLoad-at-login

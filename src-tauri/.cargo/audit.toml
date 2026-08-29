@@ -1,10 +1,6 @@
 [advisories]
-ignore = [
-    # rkyv 0.7.46 pulled in only as an optional, unactivated dependency of
-    # rust_decimal (via byte-unit -> tauri-plugin-log). `cargo tree -i rkyv
-    # --target all` shows zero reverse edges: no build target actually links
-    # it in. rust_decimal 1.42.1 is the latest release and still lists rkyv
-    # ^0.7.46 in Cargo.lock; drop this ignore once rust_decimal ships a
-    # version that resolves to rkyv >=0.8.17.
-    "RUSTSEC-2026-0235",
-]
+# Keep this list empty unless an advisory is genuinely unfixable. Every entry
+# must name the crate path that pulls the vulnerable version in and the
+# condition under which it can be dropped, and must be re-checked whenever
+# Cargo.lock changes: a stale ignore silently masks a future regression.
+ignore = []
