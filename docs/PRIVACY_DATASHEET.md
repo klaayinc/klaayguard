@@ -20,7 +20,7 @@ The agent runs only the queries the Klaay server instructs it to. The current pr
 |---|---|---|---|
 | `system_info` | Hostname, CPU model, physical/virtual memory, hardware UUID/serial | Device inventory | System inventory (CTRL-033) |
 | `os_version` | OS name, version, major/minor/patch, build, platform, architecture | Patch-level verification | Security patches (CTRL-084) |
-| `users` | Local account username, UID, GID, home directory, shell, description, password-status flags, password last-changed and expiry dates | Local-account inventory | Access controls (CTRL-033) |
+| `users` | Local account username, UID, GID, home directory, shell, description | Local-account inventory | Access controls (CTRL-033) |
 | `startup_items` | Login items / launch agents: name, path, args, type, status | Detect persistence and unauthorized auto-start software | Endpoint integrity (CTRL-152) |
 | `disk_encryption` | Per-volume name, encrypted flag, encryption type (FileVault / BitLocker / LUKS), encryption status | Verify data-at-rest encryption | Data at rest (CTRL-165), BYOD (CTRL-098) |
 | `screenlock` | Screen-lock enabled flag and delay. macOS: grace period. Linux: the desktop's own lock setting. Windows: `InactivityTimeoutSecs` under the machine policy key, and `ScreenSaveActive`, `ScreenSaverIsSecure`, `ScreenSaveTimeOut` under the machine policy, user policy, and `HKEY_CURRENT_USER\Control Panel\Desktop` keys | Verify auto screen lock | Auto screen lock (CTRL-097) |
@@ -33,7 +33,7 @@ The agent runs only the queries the Klaay server instructs it to. The current pr
 | `screenlock_registry` (Windows only) | The raw `ScreenSaveActive`, `ScreenSaverIsSecure`, and `ScreenSaveTimeOut` values under `HKEY_CURRENT_USER\Control Panel\Desktop` | Raw evidence behind the `screenlock` verdict | Auto screen lock (CTRL-097) |
 | `preferences` (scoped) | Two specific macOS keys only: `askForPassword` and `askForPasswordDelay` under `com.apple.screensaver` | Verify screensaver password requirement | Auto screen lock (CTRL-097) |
 
-No password values, hashes, or password contents of any kind are collected — only metadata flags such as "password set", "last changed date", and "expires date" exposed by the operating system.
+No password values, hashes, or password contents of any kind are collected. On Windows the `password_policy` row carries the local policy (lengths, ages, lockout counts), never a password.
 
 ## 3. Data Explicitly NOT Collected
 
