@@ -49,8 +49,12 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # Prebuilt binary, as ci.yml does. cargo install compiles the CLI for
+      # ten minutes on every run and the cargo cache does not cover it.
       - name: Install tauri-cli
-        run: cargo install tauri-cli --version "=2.11.4" --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2.11.4
 
       # The Rakefile and the PowerShell fetch script each pin an osquery
       # version. Nothing links them; a bump to one ships two versions.
