@@ -29,6 +29,7 @@ The agent runs only the queries the Klaay server instructs it to. The current pr
 | `windows_security_center` (Windows only) | Windows Security Center verdicts: firewall, antivirus, antispyware, automatic updates, user account control, internet settings, security center service | Verify firewall, antivirus, and update posture | Antivirus (CTRL-152), Endpoint (CTRL-151), Security patches (CTRL-084) |
 | `windows_security_products` (Windows only) | Each registered security product: name, type, state, state timestamp, signatures-up-to-date flag | Verify antivirus and firewall products are on and current | Antivirus (CTRL-152) |
 | `patches` (Windows only) | Installed hotfix ID, description, install date | Patch-level verification | Security patches (CTRL-084) |
+| `password_policy` (Windows only) | The local account policy from `NetUserModalsGet`: minimum password length, maximum and minimum password age, password history size, lockout threshold, lockout duration and window | Verify password and lockout configuration | Password configuration (CTRL-103) |
 | `screenlock_registry` (Windows only) | The raw `ScreenSaveActive`, `ScreenSaverIsSecure`, and `ScreenSaveTimeOut` values under `HKEY_CURRENT_USER\Control Panel\Desktop` | Raw evidence behind the `screenlock` verdict | Auto screen lock (CTRL-097) |
 | `preferences` (scoped) | Two specific macOS keys only: `askForPassword` and `askForPasswordDelay` under `com.apple.screensaver` | Verify screensaver password requirement | Auto screen lock (CTRL-097) |
 

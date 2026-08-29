@@ -226,6 +226,8 @@ fn run_builtin_check(check: &str) -> Value {
         "screenlock" => collect_screenlock_windows(),
         #[cfg(target_os = "windows")]
         "disk_encryption" => collect_disk_encryption_windows(),
+        #[cfg(target_os = "windows")]
+        "password_policy" => collect_password_policy_windows(),
         other => {
             log::warn!("unknown or unsupported builtin check '{}'", other);
             add_breadcrumb(
@@ -888,6 +890,113 @@ fn collect_disk_encryption_windows() -> Value {
     let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
     let raw = read_bitlocker_protection(&drive);
     windows_disk_encryption_rows(&drive, parse_bitlocker_protection(raw.as_deref()))
+}
+
+/// The local account password and lockout policy, as `NetUserModalsGet`
+/// returns it (levels 0 and 3). Ages and durations are seconds; the API
+/// uses u32::MAX (TIMEQ_FOREVER) for "never".
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PasswordPolicy {
+    min_password_len: u32,
+    max_password_age_secs: u32,
+    min_password_age_secs: u32,
+    password_history_len: u32,
+    lockout_threshold: u32,
+    lockout_duration_secs: u32,
+    lockout_window_secs: u32,
+}
+
+#[cfg(any(target_os = "windows", test))]
+const TIMEQ_FOREVER: u32 = u32::MAX;
+
+/// Seconds to whole days, or None for "never" (TIMEQ_FOREVER).
+#[cfg(any(target_os = "windows", test))]
+fn policy_days(secs: u32) -> Option<u64> {
+    if secs == TIMEQ_FOREVER {
+        None
+    } else {
+        Some(u64::from(secs) / 86_400)
+    }
+}
+
+/// Seconds to whole minutes, or None for "never".
+#[cfg(any(target_os = "windows", test))]
+fn policy_minutes(secs: u32) -> Option<u64> {
+    if secs == TIMEQ_FOREVER {
+        None
+    } else {
+        Some(u64::from(secs) / 60)
+    }
+}
+
+/// One row describing the local password and lockout policy. A lockout
+/// threshold of 0 means accounts never lock; a null maximum age means
+/// passwords never expire. An unreadable policy is one "unknown" row, never a
+/// row of zeros that reads as "no policy".
+#[cfg(any(target_os = "windows", test))]
+fn password_policy_rows(policy: Option<PasswordPolicy>) -> Value {
+    match policy {
+        Some(p) => json!([{
+            "minimum_password_length": p.min_password_len,
+            "maximum_password_age_days": policy_days(p.max_password_age_secs),
+            "minimum_password_age_days": policy_days(p.min_password_age_secs),
+            "password_history_size": p.password_history_len,
+            "lockout_threshold": p.lockout_threshold,
+            "lockout_duration_minutes": policy_minutes(p.lockout_duration_secs),
+            "lockout_window_minutes": policy_minutes(p.lockout_window_secs),
+            "status": "ok",
+            "source": "NetUserModalsGet"
+        }]),
+        None => json!([{
+            "status": "unknown",
+            "source": "NetUserModalsGet",
+            "detail": "NetUserModalsGet failed"
+        }]),
+    }
+}
+
+/// Read the local password and lockout policy. `NetUserModalsGet` levels 0
+/// and 3 need no elevation. Every failure path returns None.
+#[cfg(target_os = "windows")]
+fn read_password_policy() -> Option<PasswordPolicy> {
+    use windows_sys::Win32::NetworkManagement::NetManagement::{
+        NetApiBufferFree, NetUserModalsGet, USER_MODALS_INFO_0, USER_MODALS_INFO_3,
+    };
+    // SAFETY: NetUserModalsGet allocates the buffer; it is read once as the
+    // struct the requested level documents, then released with
+    // NetApiBufferFree. A non-zero status leaves the pointer untouched.
+    unsafe {
+        let mut p0: *mut u8 = std::ptr::null_mut();
+        if NetUserModalsGet(std::ptr::null(), 0, &mut p0) != 0 || p0.is_null() {
+            return None;
+        }
+        let m0 = *(p0 as *const USER_MODALS_INFO_0);
+        NetApiBufferFree(p0 as *const std::ffi::c_void);
+
+        let mut p3: *mut u8 = std::ptr::null_mut();
+        if NetUserModalsGet(std::ptr::null(), 3, &mut p3) != 0 || p3.is_null() {
+            return None;
+        }
+        let m3 = *(p3 as *const USER_MODALS_INFO_3);
+        NetApiBufferFree(p3 as *const std::ffi::c_void);
+
+        Some(PasswordPolicy {
+            min_password_len: m0.usrmod0_min_passwd_len,
+            max_password_age_secs: m0.usrmod0_max_passwd_age,
+            min_password_age_secs: m0.usrmod0_min_passwd_age,
+            password_history_len: m0.usrmod0_password_hist_len,
+            lockout_threshold: m3.usrmod3_lockout_threshold,
+            lockout_duration_secs: m3.usrmod3_lockout_duration,
+            lockout_window_secs: m3.usrmod3_lockout_observation_window,
+        })
+    }
+}
+
+/// Collect the Windows password and lockout policy, unprivileged.
+#[cfg(target_os = "windows")]
+fn collect_password_policy_windows() -> Value {
+    password_policy_rows(read_password_policy())
 }
 
 /// The three screensaver values one registry key can carry, as raw REG_SZ
@@ -4573,6 +4682,57 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(summary["root_encrypted"], "yes");
         assert_eq!(summary["mechanisms"], json!(["bitlocker"]));
         assert_eq!(summary["source"], "aggregate");
+    }
+
+    #[test]
+    fn password_policy_row_converts_the_api_units() {
+        // NetUserModalsGet returns seconds and uses u32::MAX for "never".
+        // The row must say days and minutes, and null for never, or a
+        // 42-day maximum age reads as 3.6 million.
+        let p = PasswordPolicy {
+            min_password_len: 0,
+            max_password_age_secs: 42 * 86_400,
+            min_password_age_secs: 0,
+            password_history_len: 0,
+            lockout_threshold: 10,
+            lockout_duration_secs: 600,
+            lockout_window_secs: 600,
+        };
+        let row = &password_policy_rows(Some(p))[0];
+        assert_eq!(row["maximum_password_age_days"], 42);
+        assert_eq!(row["minimum_password_age_days"], 0);
+        assert_eq!(row["lockout_threshold"], 10);
+        assert_eq!(row["lockout_duration_minutes"], 10);
+        assert_eq!(row["lockout_window_minutes"], 10);
+        assert_eq!(row["status"], "ok");
+    }
+
+    #[test]
+    fn password_policy_row_reports_never_as_null() {
+        // A password that never expires must not look like a 49710-day one.
+        let p = PasswordPolicy {
+            min_password_len: 12,
+            max_password_age_secs: TIMEQ_FOREVER,
+            min_password_age_secs: 86_400,
+            password_history_len: 24,
+            lockout_threshold: 0,
+            lockout_duration_secs: TIMEQ_FOREVER,
+            lockout_window_secs: 1800,
+        };
+        let row = &password_policy_rows(Some(p))[0];
+        assert!(row["maximum_password_age_days"].is_null());
+        assert!(row["lockout_duration_minutes"].is_null());
+        assert_eq!(row["minimum_password_length"], 12);
+        assert_eq!(row["password_history_size"], 24);
+        assert_eq!(row["lockout_threshold"], 0);
+    }
+
+    #[test]
+    fn password_policy_unknown_when_the_api_fails() {
+        // Never emit zeros for an unreadable policy; zeros mean "no policy".
+        let row = &password_policy_rows(None)[0];
+        assert_eq!(row["status"], "unknown");
+        assert!(row.get("minimum_password_length").is_none());
     }
 
     #[test]

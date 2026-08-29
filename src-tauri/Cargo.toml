@@ -77,6 +77,9 @@ zbus = "5"
 # already brings into Cargo.lock, so this adds no new crate and no new
 # cargo-audit surface.
 winreg = "0.55"
+# Password and lockout policy through NetUserModalsGet, which any user may
+# call; `net accounts` wraps the same call but prints localized labels.
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_NetworkManagement_NetManagement"] }
 
 
 #[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
