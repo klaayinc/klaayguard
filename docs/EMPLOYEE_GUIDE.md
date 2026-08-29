@@ -58,7 +58,8 @@ Almost nothing:
 
 ## How do I install it on Linux?
 
-Pick the file for your system from the link your IT team sends:
+Open the Klaay Employee Hub, choose the **KlaayGuard** card, and pick the
+file for your system:
 
 - Ubuntu or Debian: the `.deb` file.
 - Fedora or RHEL: the `.rpm` file.
@@ -90,10 +91,9 @@ do not need the terminal again.
 
 ## How do I install it on Windows?
 
-Your IT team sends you a link to a file named
-`KlaayGuard_<version>_Windows_x64_<variant>.exe`.
-
-1. Download the file.
+1. Open the Klaay Employee Hub and choose the **KlaayGuard** card. It gives
+   you the file for Windows, named
+   `KlaayGuard_<version>_Windows_x64_<variant>.exe`.
 2. Double-click the file.
 3. Windows shows a blue **Windows protected your PC** box. This is expected.
    Klaay does not sign the installer yet.
