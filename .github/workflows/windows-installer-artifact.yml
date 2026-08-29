@@ -1,7 +1,8 @@
-name: Windows installer artifact
+name: Installer artifacts
 
-# Manual build of the Windows x64 NSIS installer, uploaded as a workflow
-# artifact for testing on real machines. Does NOT publish to customers and
+# Manual build of the Windows x64 NSIS installer and the signed, notarized
+# macOS installers, uploaded as workflow artifacts for testing on real
+# machines. Pick the platform with the `platform` input. Does NOT publish to customers and
 # does NOT touch the release pipeline. It runs the same steps as
 # release-windows.yml, so a green run here is the rehearsal for the release
 # job. Run via:
@@ -18,6 +19,16 @@ on:
         required: false
         default: ""
         type: string
+      platform:
+        description: "windows, macos, or both"
+        required: false
+        default: "windows"
+        type: string
+      arch:
+        description: "macOS arch: arm64, x64, or both"
+        required: false
+        default: "arm64"
+        type: string
 
 permissions:
   contents: read
@@ -25,7 +36,8 @@ permissions:
   id-token: write
 
 jobs:
-  build:
+  windows:
+    if: inputs.platform == 'windows' || inputs.platform == 'both'
     name: Windows x64 (${{ matrix.build }})
     runs-on: windows-latest
     strategy:
@@ -149,4 +161,152 @@ jobs:
         with:
           name: klaayguard-windows-x64-${{ matrix.build }}
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  macos:
+    if: inputs.platform == 'macos' || inputs.platform == 'both'
+    name: macOS ${{ matrix.arch }} (${{ matrix.build }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [development, staging, production]
+        arch: [arm64, x64]
+        include:
+          - build: development
+            api_url: "http://localhost:3000"
+            frontend_url: "http://localhost:5173"
+          - build: staging
+            api_url: "https://api.klaay.dev"
+            frontend_url: "https://app.klaay.dev"
+          - build: production
+            api_url: "https://api.klaay.com"
+            frontend_url: "https://app.klaay.com"
+          - arch: arm64
+            target: aarch64-apple-darwin
+            bundle_dir: src-tauri/target/aarch64-apple-darwin
+            artifact_suffix: macOS_arm64
+          - arch: x64
+            target: x86_64-apple-darwin
+            bundle_dir: src-tauri/target/x86_64-apple-darwin
+            artifact_suffix: macOS_x64
+    steps:
+      - name: Skip arch not requested
+        id: want
+        shell: bash
+        run: |
+          case "${{ inputs.arch }}" in
+            both) echo "run=true" >> "$GITHUB_OUTPUT" ;;
+            "${{ matrix.arch }}") echo "run=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "run=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: actions/checkout@v4
+        if: steps.want.outputs.run == 'true'
+
+      - name: Install Rust stable
+        if: steps.want.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo build
+        if: steps.want.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ${{ matrix.target }}-${{ matrix.build }}
+
+      - name: Install tauri-cli
+        if: steps.want.outputs.run == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2.11.4
+
+      - name: Fetch osquery sidecars (macOS)
+        if: steps.want.outputs.run == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: rake
+
+      - name: Set bundle version
+        if: steps.want.outputs.run == 'true' && inputs.version != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"; V="${V#v}"
+          sed -i '' -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
+          sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
+          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
+          grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
+
+      - name: Import Apple Developer certificate
+        if: steps.want.outputs.run == 'true'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo $APPLE_CERTIFICATE | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain | grep -q "Developer ID Application"
+
+      - name: Build Tauri (signed, notarized app + dmg)
+        if: steps.want.outputs.run == 'true'
+        env:
+          KLAAY_ENV: ${{ matrix.build }}
+          VITE_API_BASE_URL: ${{ matrix.api_url }}
+          VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: cargo tauri build --target ${{ matrix.target }}
+
+      - name: Build, sign, and notarize the .pkg installer
+        if: steps.want.outputs.run == 'true'
+        env:
+          APPLE_INSTALLER_CERTIFICATE: ${{ secrets.APPLE_INSTALLER_CERTIFICATE }}
+          APPLE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(cat VERSION)
+          mkdir -p out
+          APP_PATH=$(find ${{ matrix.bundle_dir }} -path "*/bundle/macos/KlaayGuard.app" -type d | head -n1)
+          test -n "$APP_PATH" || { echo "KlaayGuard.app missing" >&2; exit 1; }
+          DMG=$(find ${{ matrix.bundle_dir }} -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1)
+          test -n "$DMG" || { echo "dmg missing" >&2; exit 1; }
+          cp "$DMG" "out/KlaayGuard_${V}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.dmg"
+
+          echo "$APPLE_INSTALLER_CERTIFICATE" | base64 --decode > installer_certificate.p12
+          security import installer_certificate.p12 -k build.keychain \
+            -P "$APPLE_INSTALLER_CERTIFICATE_PASSWORD" -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign:,productbuild: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain >/dev/null
+          INSTALLER_ID=$(security find-identity -v build.keychain | grep "Developer ID Installer" | head -n1 | awk -F'"' '{print $2}')
+          test -n "$INSTALLER_ID" || { echo "No Developer ID Installer identity" >&2; exit 1; }
+          PKG="out/KlaayGuard_${V}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.pkg"
+          INSTALLER_SIGNING_IDENTITY="$INSTALLER_ID" \
+            bash src-tauri/scripts/build-macos-pkg.sh "$APP_PATH" "$V" "$PKG"
+          xcrun notarytool submit "$PKG" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$PKG"
+          ls -l out
+
+      - name: Upload installers
+        if: steps.want.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: klaayguard-macos-${{ matrix.arch }}-${{ matrix.build }}
+          path: out/*
           if-no-files-found: error
