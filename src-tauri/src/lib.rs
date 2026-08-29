@@ -784,6 +784,15 @@ fn screenlock_row_kde(autolock: Option<bool>, timeout_min: Option<u64>) -> Value
 #[cfg(any(target_os = "linux", test))]
 fn screenlock_row_hyprland(lock_timeout: Option<u64>) -> Value {
     match lock_timeout {
+        // Same rule as GNOME and Windows: a lock with a zero timeout never
+        // fires, so it is not an enabled lock.
+        Some(0) => screenlock_row(
+            "hyprland",
+            "no",
+            Some(0),
+            "hypridle",
+            "lock listener has timeout 0",
+        ),
         Some(t) => screenlock_row(
             "hyprland",
             "yes",
@@ -5254,6 +5263,11 @@ listener {
         let dpms = "listener {\n timeout = 600\n on-timeout = hyprctl dispatch dpms off\n}\n";
         assert_eq!(parse_hypridle_config(dpms), None);
         assert_eq!(screenlock_row_hyprland(None)[0]["enabled"], "unknown");
+        // A zero timeout never fires. Seen on 2026-08-29: it reported "yes".
+        let zero = screenlock_row_hyprland(Some(0));
+        assert_eq!(zero[0]["enabled"], "no");
+        assert_eq!(zero[0]["delay_seconds"], 0);
+        assert_eq!(screenlock_row_hyprland(Some(300))[0]["enabled"], "yes");
     }
 
     #[test]
