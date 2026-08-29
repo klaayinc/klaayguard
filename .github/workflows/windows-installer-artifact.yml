@@ -20,7 +20,7 @@ on:
         default: ""
         type: string
       platform:
-        description: "windows, macos, or both"
+        description: "windows, macos, linux, or all"
         required: false
         default: "windows"
         type: string
@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   windows:
-    if: inputs.platform == 'windows' || inputs.platform == 'both'
+    if: inputs.platform == 'windows' || inputs.platform == 'both' || inputs.platform == 'all'
     name: Windows x64 (${{ matrix.build }})
     runs-on: windows-latest
     strategy:
@@ -164,7 +164,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    if: inputs.platform == 'macos' || inputs.platform == 'both'
+    if: inputs.platform == 'macos' || inputs.platform == 'both' || inputs.platform == 'all'
     name: macOS ${{ matrix.arch }} (${{ matrix.build }})
     runs-on: macos-latest
     strategy:
@@ -308,5 +308,92 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: klaayguard-macos-${{ matrix.arch }}-${{ matrix.build }}
+          path: out/*
+          if-no-files-found: error
+
+  linux:
+    if: inputs.platform == 'linux' || inputs.platform == 'all'
+    name: Linux x86_64 (${{ matrix.build }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [development, staging, production]
+        include:
+          - build: development
+            api_url: "http://localhost:3000"
+            frontend_url: "http://localhost:5173"
+          - build: staging
+            api_url: "https://api.klaay.dev"
+            frontend_url: "https://app.klaay.dev"
+          - build: production
+            api_url: "https://api.klaay.com"
+            frontend_url: "https://app.klaay.com"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: x86_64-unknown-linux-gnu-${{ matrix.build }}
+
+      - name: Install tauri-cli
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2.11.4
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+
+      - name: Fetch osquery sidecar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: rake
+
+      - name: Set bundle version
+        if: inputs.version != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"; V="${V#v}"
+          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
+          sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
+          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
+          grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
+
+      - name: Build Tauri (Linux x86_64)
+        env:
+          KLAAY_ENV: ${{ matrix.build }}
+          VITE_API_BASE_URL: ${{ matrix.api_url }}
+          VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
+          VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+        run: cargo tauri build --bundles deb rpm appimage
+
+      - name: Validate and collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(cat VERSION)
+          BASE_DIR="src-tauri/target/release/bundle"
+          APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1); test -n "$APPIMAGE"
+          DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1); test -n "$DEB"
+          RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1); test -n "$RPM"
+          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          mkdir -p out
+          cp "$APPIMAGE" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.AppImage"
+          cp "$DEB" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.deb"
+          cp "$RPM" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.rpm"
+          ls -l out
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: klaayguard-linux-x86_64-${{ matrix.build }}
           path: out/*
           if-no-files-found: error
