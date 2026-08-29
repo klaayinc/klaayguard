@@ -758,8 +758,10 @@ fn collect_screenlock() -> Value {
 /// `System.Volume.BitLockerProtection` (PKEY {2d15a9a1-a556-4189-91ad-027458f11a07} 1717).
 /// Unlike `Win32_EncryptableVolume`, `manage-bde`, and `Get-BitLockerVolume`,
 /// this needs no elevation; it is what draws the padlock in File Explorer.
-/// Verified at Medium integrity on Windows 11 22621: an unencrypted drive
-/// reads 2.
+/// Verified on Windows 11 22621 against Get-BitLockerVolume: 2 = fully
+/// decrypted, 7 = encryption pending a restart, 3 = encrypting (protection
+/// still off), 1 = fully encrypted and on, 5 = suspended (encrypted, key in
+/// the clear). 4 and 6 follow the same numbering and are not yet observed.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BitLockerProtection {
@@ -775,6 +777,8 @@ enum BitLockerProtection {
     Suspended,
     /// 6: encrypted and locked (no key available in this session).
     Locked,
+    /// 7: encryption chosen, waiting for the restart that starts it.
+    PendingRestart,
     Other(i64),
 }
 
@@ -788,6 +792,7 @@ fn parse_bitlocker_protection(raw: Option<&str>) -> Option<BitLockerProtection> 
         4 => BitLockerProtection::Decrypting,
         5 => BitLockerProtection::Suspended,
         6 => BitLockerProtection::Locked,
+        7 => BitLockerProtection::PendingRestart,
         other => BitLockerProtection::Other(other),
     })
 }
@@ -813,6 +818,9 @@ fn windows_disk_encryption_rows(drive: &str, status: Option<BitLockerProtection>
         }
         Some(BitLockerProtection::Decrypting) => {
             ("no", "bitlocker", "decryption in progress".to_string())
+        }
+        Some(BitLockerProtection::PendingRestart) => {
+            ("no", "none", "encryption pending a restart".to_string())
         }
         Some(BitLockerProtection::Other(n)) => (
             "unknown",
@@ -4495,6 +4503,10 @@ zroot/ROOT/default / zfs rw 0 0
             parse_bitlocker_protection(Some("9")),
             Some(BitLockerProtection::Other(9))
         );
+        assert_eq!(
+            parse_bitlocker_protection(Some("7")),
+            Some(BitLockerProtection::PendingRestart)
+        );
         assert_eq!(parse_bitlocker_protection(Some("")), None);
         assert_eq!(parse_bitlocker_protection(None), None);
     }
@@ -4511,6 +4523,7 @@ zroot/ROOT/default / zfs rw 0 0
         assert!(!yes(BitLockerProtection::Suspended));
         assert!(!yes(BitLockerProtection::Encrypting));
         assert!(!yes(BitLockerProtection::Decrypting));
+        assert!(!yes(BitLockerProtection::PendingRestart));
     }
 
     #[test]
