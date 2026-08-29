@@ -164,11 +164,14 @@ fn parse_config_items(cfg: &Value, os: &str) -> Vec<CollectionItem> {
                     if !platform_matches(platform, os) {
                         return None;
                     }
-                    let source = item
-                        .get("source")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("osquery");
-                    if source == "builtin" {
+                    // kiln marks a native check with `type: "builtin"`. The
+                    // agent once read `source` instead, so every builtin ran
+                    // as `SELECT * FROM <id>` through osquery and the native
+                    // Linux checks never executed in the field. Accept both.
+                    let is_builtin = ["type", "source"]
+                        .iter()
+                        .any(|k| item.get(k).and_then(|v| v.as_str()) == Some("builtin"));
+                    if is_builtin {
                         return match item.get("check").and_then(|v| v.as_str()) {
                             Some(check) => Some(CollectionItem::Builtin {
                                 id: id.to_string(),
@@ -4205,6 +4208,23 @@ mod happy_path_tests {
         assert!(!items
             .iter()
             .any(|i| matches!(i, CollectionItem::Builtin { id, .. } if id == "broken")));
+        assert_eq!(osquery_pairs(&items).len(), 1);
+    }
+
+    #[test]
+    fn config_items_dispatch_builtin_type() {
+        // kiln's contract is `type: "builtin"`. Reading only `source` sent
+        // the Linux disk_encryption and screenlock builtins to osquery,
+        // where one misreports LUKS and the other has no table.
+        let cfg = json!({"data": [
+            {"type": "builtin", "id": "screenlock", "platform": "linux", "check": "screenlock"},
+            {"type": "osquery-table", "id": "system_info"}
+        ]});
+        let items = parse_config_items(&cfg, "linux");
+        assert!(items.contains(&CollectionItem::Builtin {
+            id: "screenlock".to_string(),
+            check: "screenlock".to_string(),
+        }));
         assert_eq!(osquery_pairs(&items).len(), 1);
     }
 
