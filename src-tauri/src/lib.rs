@@ -221,6 +221,8 @@ fn run_builtin_check(check: &str) -> Value {
         "screenlock" => collect_screenlock(),
         #[cfg(target_os = "windows")]
         "screenlock" => collect_screenlock_windows(),
+        #[cfg(target_os = "windows")]
+        "disk_encryption" => collect_disk_encryption_windows(),
         other => {
             log::warn!("unknown or unsupported builtin check '{}'", other);
             add_breadcrumb(
@@ -750,6 +752,131 @@ fn collect_screenlock() -> Value {
             "no recognized XDG_CURRENT_DESKTOP",
         ),
     }
+}
+
+/// The BitLocker state of one volume as Explorer reads it: the shell property
+/// `System.Volume.BitLockerProtection` (PKEY {2d15a9a1-a556-4189-91ad-027458f11a07} 1717).
+/// Unlike `Win32_EncryptableVolume`, `manage-bde`, and `Get-BitLockerVolume`,
+/// this needs no elevation; it is what draws the padlock in File Explorer.
+/// Verified at Medium integrity on Windows 11 22621: an unencrypted drive
+/// reads 2.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BitLockerProtection {
+    /// 1: fully encrypted and protection on.
+    On,
+    /// 2: not encrypted.
+    Off,
+    /// 3: encryption in progress.
+    Encrypting,
+    /// 4: decryption in progress.
+    Decrypting,
+    /// 5: encrypted but protection suspended; the key is in the clear.
+    Suspended,
+    /// 6: encrypted and locked (no key available in this session).
+    Locked,
+    Other(i64),
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_bitlocker_protection(raw: Option<&str>) -> Option<BitLockerProtection> {
+    let n = raw?.trim().parse::<i64>().ok()?;
+    Some(match n {
+        1 => BitLockerProtection::On,
+        2 => BitLockerProtection::Off,
+        3 => BitLockerProtection::Encrypting,
+        4 => BitLockerProtection::Decrypting,
+        5 => BitLockerProtection::Suspended,
+        6 => BitLockerProtection::Locked,
+        other => BitLockerProtection::Other(other),
+    })
+}
+
+/// Windows disk-encryption summary row, in the shape the Linux builtin emits
+/// so the backend reads one shape. Only a fully protected volume is "yes":
+/// a suspended volume has its key in the clear, and a volume still
+/// encrypting is not yet protected. An unreadable property is "unknown",
+/// never a false "no".
+#[cfg(any(target_os = "windows", test))]
+fn windows_disk_encryption_rows(drive: &str, status: Option<BitLockerProtection>) -> Value {
+    let (root_encrypted, mechanism, detail) = match status {
+        Some(BitLockerProtection::On) => ("yes", "bitlocker", "protection on".to_string()),
+        Some(BitLockerProtection::Locked) => ("yes", "bitlocker", "encrypted, locked".to_string()),
+        Some(BitLockerProtection::Off) => ("no", "none", "not encrypted".to_string()),
+        Some(BitLockerProtection::Suspended) => (
+            "no",
+            "bitlocker",
+            "protection suspended; key in the clear".to_string(),
+        ),
+        Some(BitLockerProtection::Encrypting) => {
+            ("no", "bitlocker", "encryption in progress".to_string())
+        }
+        Some(BitLockerProtection::Decrypting) => {
+            ("no", "bitlocker", "decryption in progress".to_string())
+        }
+        Some(BitLockerProtection::Other(n)) => (
+            "unknown",
+            "bitlocker",
+            format!("unrecognised BitLockerProtection value {}", n),
+        ),
+        None => (
+            "unknown",
+            "none",
+            "System.Volume.BitLockerProtection not readable".to_string(),
+        ),
+    };
+    json!([
+        {
+            "kind": "volume",
+            "name": drive,
+            "root_encrypted": root_encrypted,
+            "mechanism": mechanism,
+            "detail": detail,
+            "source": "shell_property"
+        },
+        {
+            "kind": "summary",
+            "root_encrypted": root_encrypted,
+            "home_encrypted": root_encrypted,
+            "mechanisms": if mechanism == "none" { json!([]) } else { json!([mechanism]) },
+            "source": "aggregate"
+        }
+    ])
+}
+
+/// Read the shell property for the system drive through PowerShell. The
+/// Shell COM object is the same path Explorer uses and needs no elevation.
+/// A spawn every 15 minutes is cheap; a COM binding in Rust is not worth it.
+#[cfg(target_os = "windows")]
+fn read_bitlocker_protection(drive: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = format!(
+        "(New-Object -ComObject Shell.Application).NameSpace('{}').Self.ExtendedProperty('System.Volume.BitLockerProtection')",
+        drive
+    );
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Collect Windows disk-encryption posture for the system drive, unprivileged.
+#[cfg(target_os = "windows")]
+fn collect_disk_encryption_windows() -> Value {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    let raw = read_bitlocker_protection(&drive);
+    windows_disk_encryption_rows(&drive, parse_bitlocker_protection(raw.as_deref()))
 }
 
 /// The three screensaver values one registry key can carry, as raw REG_SZ
@@ -3044,15 +3171,30 @@ fn install_windows_update(
         return Err(msg);
     }
 
+    // Leave any job object the agent was started in. A launcher that puts
+    // its children in a kill-on-close job (an SSH session does; some
+    // management tools do) would otherwise take the installer down with the
+    // agent when it exits. Breakaway is refused when the job forbids it, so
+    // fall back to a plain spawn rather than fail the update.
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     log::info!("🔄 Running installer {:?} silently", staged);
-    let spawn = std::process::Command::new(&staged)
-        .args(windows_installer_args())
-        .current_dir(&dir)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
+    let launch = |flags: u32| {
+        std::process::Command::new(&staged)
+            .args(windows_installer_args())
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    let spawn = launch(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB).or_else(|e| {
+        log::warn!(
+            "installer spawn with job breakaway failed ({}); retrying without",
+            e
+        );
+        launch(CREATE_NO_WINDOW)
+    });
     if let Err(e) = spawn {
         // Nothing is installed yet, so the running agent stays as it is and
         // the error is honest. This differs from the Linux relaunch rule,
@@ -4331,6 +4473,73 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(row[0]["enabled"], "unknown");
         assert!(row[0]["delay_seconds"].is_null());
         assert_eq!(row[0]["source"], "none");
+    }
+
+    #[test]
+    fn bitlocker_protection_parses_the_shell_property_values() {
+        // The shell property is an integer as text. Only 1 and 6 mean the
+        // data is protected right now; an unparseable value is None.
+        assert_eq!(
+            parse_bitlocker_protection(Some("1")),
+            Some(BitLockerProtection::On)
+        );
+        assert_eq!(
+            parse_bitlocker_protection(Some("2")),
+            Some(BitLockerProtection::Off)
+        );
+        assert_eq!(
+            parse_bitlocker_protection(Some(" 5 ")),
+            Some(BitLockerProtection::Suspended)
+        );
+        assert_eq!(
+            parse_bitlocker_protection(Some("9")),
+            Some(BitLockerProtection::Other(9))
+        );
+        assert_eq!(parse_bitlocker_protection(Some("")), None);
+        assert_eq!(parse_bitlocker_protection(None), None);
+    }
+
+    #[test]
+    fn windows_disk_encryption_only_a_protected_volume_is_yes() {
+        // A suspended volume has its key in the clear and an encrypting one
+        // is not yet protected. Reporting either as "yes" tells the
+        // dashboard a laptop is safe to lose when it is not.
+        let yes = |s| windows_disk_encryption_rows("C:", Some(s))[1]["root_encrypted"] == "yes";
+        assert!(yes(BitLockerProtection::On));
+        assert!(yes(BitLockerProtection::Locked));
+        assert!(!yes(BitLockerProtection::Off));
+        assert!(!yes(BitLockerProtection::Suspended));
+        assert!(!yes(BitLockerProtection::Encrypting));
+        assert!(!yes(BitLockerProtection::Decrypting));
+    }
+
+    #[test]
+    fn windows_disk_encryption_unknown_when_the_property_is_unreadable() {
+        // Unknown and no are different answers on the dashboard.
+        let rows = windows_disk_encryption_rows("C:", None);
+        assert_eq!(rows[1]["root_encrypted"], "unknown");
+        assert_eq!(rows[0]["source"], "shell_property");
+        assert_eq!(
+            windows_disk_encryption_rows("C:", Some(BitLockerProtection::Other(42)))[1]
+                ["root_encrypted"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn windows_disk_encryption_uses_the_linux_summary_shape() {
+        // kiln's encryption_status_from_rows reads root_encrypted off the
+        // summary row; the Windows builtin must emit the same shape.
+        let rows = windows_disk_encryption_rows("C:", Some(BitLockerProtection::On));
+        let summary = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "summary")
+            .unwrap();
+        assert_eq!(summary["root_encrypted"], "yes");
+        assert_eq!(summary["mechanisms"], json!(["bitlocker"]));
+        assert_eq!(summary["source"], "aggregate");
     }
 
     #[test]
