@@ -579,6 +579,8 @@ enum Desktop {
     Gnome,
     Kde,
     Hyprland,
+    Cinnamon,
+    Mate,
     Unknown,
 }
 
@@ -593,6 +595,9 @@ fn detect_desktop(xdg_current_desktop: Option<&str>) -> Desktop {
             "gnome" | "unity" | "ubuntu" => return Desktop::Gnome,
             "kde" => return Desktop::Kde,
             "hyprland" => return Desktop::Hyprland,
+            // Mint sets exactly "X-Cinnamon".
+            "x-cinnamon" | "cinnamon" => return Desktop::Cinnamon,
+            "mate" => return Desktop::Mate,
             _ => {}
         }
     }
@@ -618,12 +623,14 @@ fn parse_gsettings_uint(out: &str) -> Option<u64> {
         .and_then(|n| n.parse::<u64>().ok())
 }
 
-/// Parse the `[Daemon]` section of kscreenlockerrc: (autolock, timeout minutes).
+/// Parse the `[Daemon]` section of kscreenlockerrc: (autolock, timeout in
+/// seconds). The file stores minutes; since Plasma 6.3 as a double, so "0.5"
+/// is thirty seconds and must not round to a minute.
 #[cfg(any(target_os = "linux", test))]
 fn parse_kscreenlockerrc(text: &str) -> (Option<bool>, Option<u64>) {
     let mut in_daemon = false;
     let mut autolock = None;
-    let mut timeout_min = None;
+    let mut timeout_secs = None;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -636,20 +643,19 @@ fn parse_kscreenlockerrc(text: &str) -> (Option<bool>, Option<u64>) {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim().to_ascii_lowercase().as_str() {
                 "autolock" => autolock = parse_gsettings_bool(&v.trim().to_ascii_lowercase()),
-                // A double since Plasma 6.3 ("0.5" is thirty seconds).
                 "timeout" => {
-                    timeout_min = v
+                    timeout_secs = v
                         .trim()
                         .parse::<f64>()
                         .ok()
                         .filter(|m| m.is_finite() && *m >= 0.0)
-                        .map(|m| m.round() as u64)
+                        .map(|m| (m * 60.0).round() as u64)
                 }
                 _ => {}
             }
         }
     }
-    (autolock, timeout_min)
+    (autolock, timeout_secs)
 }
 
 /// Parse a hypridle config for the first lock listener's timeout (seconds). A
@@ -720,30 +726,37 @@ fn screenlock_row(
     }])
 }
 
-/// GNOME screenlock row from the two gsettings values. Lock engages only when
-/// it is enabled AND the idle delay is non-zero (delay 0 = never triggers).
+/// Screen-lock row for the gsettings desktops, GNOME and Cinnamon, which
+/// share one schema shape. Lock engages only when it is enabled AND the idle
+/// delay is non-zero (0 = never triggers). The time to a locked screen is
+/// idle-delay plus lock-delay, both in seconds; reporting idle-delay alone
+/// under-reports a user who set a one-hour lock delay.
 #[cfg(any(target_os = "linux", test))]
-fn screenlock_row_gnome(lock_enabled: Option<bool>, idle_delay: Option<u64>) -> Value {
+fn screenlock_row_gsettings(
+    de: &str,
+    lock_enabled: Option<bool>,
+    idle_delay: Option<u64>,
+    lock_delay: Option<u64>,
+) -> Value {
+    let extra = lock_delay.unwrap_or(0);
     match (lock_enabled, idle_delay) {
         (Some(true), Some(d)) if d > 0 => screenlock_row(
-            "gnome",
+            de,
             "yes",
-            Some(d),
+            Some(d + extra),
             "gsettings",
-            &format!("lock-enabled=true, idle-delay={}", d),
+            &format!("lock-enabled=true, idle-delay={}, lock-delay={}", d, extra),
         ),
         (Some(true), Some(0)) => screenlock_row(
-            "gnome",
+            de,
             "no",
             Some(0),
             "gsettings",
             "lock enabled but idle-delay=0, so it never triggers",
         ),
-        (Some(false), _) => {
-            screenlock_row("gnome", "no", idle_delay, "gsettings", "lock-enabled=false")
-        }
+        (Some(false), _) => screenlock_row(de, "no", idle_delay, "gsettings", "lock-enabled=false"),
         _ => screenlock_row(
-            "gnome",
+            de,
             "unknown",
             idle_delay,
             "gsettings",
@@ -752,31 +765,96 @@ fn screenlock_row_gnome(lock_enabled: Option<bool>, idle_delay: Option<u64>) -> 
     }
 }
 
-/// KDE screenlock row from kscreenlockerrc. An absent file/key is unknown.
 #[cfg(any(target_os = "linux", test))]
-fn screenlock_row_kde(autolock: Option<bool>, timeout_min: Option<u64>) -> Value {
-    match autolock {
-        Some(true) => screenlock_row(
-            "kde",
+fn screenlock_row_gnome(
+    lock_enabled: Option<bool>,
+    idle_delay: Option<u64>,
+    lock_delay: Option<u64>,
+) -> Value {
+    screenlock_row_gsettings("gnome", lock_enabled, idle_delay, lock_delay)
+}
+
+/// MATE screen-lock row. Its units are MINUTES (org.mate.session idle-delay,
+/// org.mate.screensaver lock-delay), unlike GNOME and Cinnamon, and the
+/// saver must be both idle-activated and set to lock.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_mate(
+    idle_activation: Option<bool>,
+    lock_enabled: Option<bool>,
+    idle_delay_min: Option<u64>,
+    lock_delay_min: Option<u64>,
+) -> Value {
+    let extra = lock_delay_min.unwrap_or(0);
+    let secs = idle_delay_min.map(|m| m * 60);
+    match (idle_activation, lock_enabled, idle_delay_min) {
+        (Some(true), Some(true), Some(d)) if d > 0 => screenlock_row(
+            "mate",
             "yes",
-            timeout_min.map(|m| m * 60),
-            "kscreenlockerrc",
-            "Autolock=true",
+            Some((d + extra) * 60),
+            "gsettings",
+            &format!(
+                "idle-activation-enabled=true, lock-enabled=true, idle-delay={}min, lock-delay={}min",
+                d, extra
+            ),
         ),
-        Some(false) => screenlock_row(
+        (Some(true), Some(true), Some(0)) => screenlock_row(
+            "mate",
+            "no",
+            Some(0),
+            "gsettings",
+            "lock enabled but idle-delay=0, so it never triggers",
+        ),
+        (Some(false), _, _) => screenlock_row(
+            "mate",
+            "no",
+            secs,
+            "gsettings",
+            "idle-activation-enabled=false",
+        ),
+        (_, Some(false), _) => screenlock_row("mate", "no", secs, "gsettings", "lock-enabled=false"),
+        _ => screenlock_row("mate", "unknown", secs, "gsettings", "gsettings unavailable"),
+    }
+}
+
+/// Plasma's shipped defaults (kscreenlockersettings.kcfg): Autolock=true,
+/// Timeout=5 minutes. KConfig writes only values that differ from the
+/// schema, so an untouched, compliant machine has no key at all.
+#[cfg(any(target_os = "linux", test))]
+const KDE_DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// KDE screenlock row from kscreenlockerrc. An absent key means the Plasma
+/// default applies; it is not unknown. Reporting it as unknown left the
+/// secure majority blank and only the users who turned the lock off visible.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_kde(autolock: Option<bool>, timeout_secs: Option<u64>) -> Value {
+    let autolock_src = if autolock.is_some() {
+        "file"
+    } else {
+        "Plasma default"
+    };
+    let timeout_src = if timeout_secs.is_some() {
+        "file"
+    } else {
+        "Plasma default"
+    };
+    let timeout = timeout_secs.unwrap_or(KDE_DEFAULT_TIMEOUT_SECS);
+    let detail = format!(
+        "Autolock={} ({}), Timeout={}s ({})",
+        autolock.unwrap_or(true),
+        autolock_src,
+        timeout,
+        timeout_src
+    );
+    match (autolock.unwrap_or(true), timeout) {
+        (true, 0) => screenlock_row(
             "kde",
             "no",
-            timeout_min.map(|m| m * 60),
+            Some(0),
             "kscreenlockerrc",
-            "Autolock=false",
+            &format!("{}; a zero timeout never triggers", detail),
         ),
-        None => screenlock_row(
-            "kde",
-            "unknown",
-            None,
-            "kscreenlockerrc",
-            "no kscreenlockerrc Autolock key",
-        ),
+        (true, t) => screenlock_row("kde", "yes", Some(t), "kscreenlockerrc", &detail),
+        (false, t) => screenlock_row("kde", "no", Some(t), "kscreenlockerrc", &detail),
     }
 }
 
@@ -810,36 +888,93 @@ fn screenlock_row_hyprland(lock_timeout: Option<u64>) -> Value {
     }
 }
 
+/// `gsettings get <schema> <key>` as the desktop sees it. gsettings is a GLib
+/// program. From an AppImage it must not load the bundled libgio, whose
+/// module directory holds no dconf backend: it then answers with schema
+/// defaults, a false "yes".
+#[cfg(target_os = "linux")]
+fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("gsettings");
+    cmd.args(["get", schema, key]);
+    apply_appimage_sanitization(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_bool(schema: &str, key: &str) -> Option<bool> {
+    gsettings_get(schema, key).and_then(|s| parse_gsettings_bool(&s))
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_uint(schema: &str, key: &str) -> Option<u64> {
+    gsettings_get(schema, key).and_then(|s| parse_gsettings_uint(&s))
+}
+
+/// Hyprland and sway run no XDG autostart: the entry is written, nothing
+/// reads it, the agent starts once and the device goes quiet, which the
+/// dashboard cannot tell from a laptop in a drawer. GNOME, KDE, Cinnamon and
+/// MATE run the entries themselves; on the rest, an inactive
+/// xdg-desktop-autostart.target means no session component will either.
+#[cfg(target_os = "linux")]
+fn warn_if_autostart_unserved() {
+    let desktop = detect_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref());
+    if !matches!(desktop, Desktop::Hyprland | Desktop::Unknown) {
+        return;
+    }
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(["--user", "is-active", "xdg-desktop-autostart.target"]);
+    apply_appimage_sanitization(&mut cmd);
+    let active = cmd
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
+    if !active {
+        log::warn!(
+            "autostart: desktop {:?} runs no XDG autostart and xdg-desktop-autostart.target is inactive; \
+             the agent will not start at next login unless the session runs ~/.config/autostart (uwsm, dex, exec-once)",
+            desktop
+        );
+        sentry::capture_message("autostart_unserved", Level::Warning);
+    }
+}
+
 /// Collect Linux screen-lock posture (unprivileged) for the current desktop.
+/// Dispatch is on XDG_CURRENT_DESKTOP, never on which schemas exist: Mint
+/// installs the Cinnamon schemas on its MATE and XFCE editions too, so a
+/// Cinnamon query answers there with a meaningless "true".
 #[cfg(target_os = "linux")]
 fn collect_screenlock() -> Value {
     match detect_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref()) {
-        Desktop::Gnome => {
-            // gsettings is a GLib program. From an AppImage it must not load
-            // the bundled libgio, whose module directory holds no dconf
-            // backend: it then answers with schema defaults, a false "yes".
-            let gsettings = |schema: &str, key: &str| -> Option<String> {
-                let mut cmd = std::process::Command::new("gsettings");
-                cmd.args(["get", schema, key]);
-                apply_appimage_sanitization(&mut cmd);
-                cmd.output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .and_then(|o| String::from_utf8(o.stdout).ok())
-            };
-            let lock = gsettings("org.gnome.desktop.screensaver", "lock-enabled")
-                .and_then(|s| parse_gsettings_bool(&s));
-            let delay = gsettings("org.gnome.desktop.session", "idle-delay")
-                .and_then(|s| parse_gsettings_uint(&s));
-            screenlock_row_gnome(lock, delay)
-        }
+        Desktop::Gnome => screenlock_row_gnome(
+            gsettings_bool("org.gnome.desktop.screensaver", "lock-enabled"),
+            gsettings_uint("org.gnome.desktop.session", "idle-delay"),
+            gsettings_uint("org.gnome.desktop.screensaver", "lock-delay"),
+        ),
+        Desktop::Cinnamon => screenlock_row_gsettings(
+            "cinnamon",
+            gsettings_bool("org.cinnamon.desktop.screensaver", "lock-enabled"),
+            gsettings_uint("org.cinnamon.desktop.session", "idle-delay"),
+            gsettings_uint("org.cinnamon.desktop.screensaver", "lock-delay"),
+        ),
+        Desktop::Mate => screenlock_row_mate(
+            gsettings_bool("org.mate.screensaver", "idle-activation-enabled"),
+            gsettings_bool("org.mate.screensaver", "lock-enabled"),
+            gsettings_uint("org.mate.session", "idle-delay"),
+            gsettings_uint("org.mate.screensaver", "lock-delay"),
+        ),
         Desktop::Kde => {
-            let text = dirs::config_dir()
-                .map(|c| c.join("kscreenlockerrc"))
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .unwrap_or_default();
-            let (autolock, timeout_min) = parse_kscreenlockerrc(&text);
-            screenlock_row_kde(autolock, timeout_min)
+            // Admin policy in /etc/xdg applies under the user's file.
+            let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+            let (sys_autolock, sys_timeout) =
+                parse_kscreenlockerrc(&read("/etc/xdg/kscreenlockerrc".into()));
+            let (autolock, timeout_secs) = dirs::config_dir()
+                .map(|c| parse_kscreenlockerrc(&read(c.join("kscreenlockerrc"))))
+                .unwrap_or((None, None));
+            screenlock_row_kde(autolock.or(sys_autolock), timeout_secs.or(sys_timeout))
         }
         Desktop::Hyprland => {
             let text = dirs::config_dir()
@@ -4048,9 +4183,12 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
     // cannot tell from an offline machine.
     #[cfg(target_os = "linux")]
     {
-        if let Err(e) = install_autostart_entry() {
-            log::error!("autostart install failed: {}", e);
-            sentry::capture_message(&format!("autostart_install_failed: {}", e), Level::Error);
+        match install_autostart_entry() {
+            Ok(()) => warn_if_autostart_unserved(),
+            Err(e) => {
+                log::error!("autostart install failed: {}", e);
+                sentry::capture_message(&format!("autostart_install_failed: {}", e), Level::Error);
+            }
         }
     }
     #[cfg(target_os = "windows")]
@@ -4846,6 +4984,10 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(detect_desktop(Some("GNOME")), Desktop::Gnome);
         assert_eq!(detect_desktop(Some("KDE")), Desktop::Kde);
         assert_eq!(detect_desktop(Some("Hyprland")), Desktop::Hyprland);
+        assert_eq!(detect_desktop(Some("X-Cinnamon")), Desktop::Cinnamon);
+        assert_eq!(detect_desktop(Some("MATE")), Desktop::Mate);
+        // XFCE stays unknown until light-locker parsing exists; a false
+        // "yes" from the Cinnamon schemas Mint ships there would be worse.
         assert_eq!(detect_desktop(Some("XFCE")), Desktop::Unknown);
         assert_eq!(detect_desktop(None), Desktop::Unknown);
     }
@@ -4862,20 +5004,23 @@ zroot/ROOT/default / zfs rw 0 0
     #[test]
     fn gnome_lock_needs_enabled_and_nonzero_delay() {
         assert_eq!(
-            screenlock_row_gnome(Some(true), Some(300))[0]["enabled"],
+            screenlock_row_gnome(Some(true), Some(300), None)[0]["enabled"],
             "yes"
         );
         // Enabled but idle-delay 0 never triggers.
         assert_eq!(
-            screenlock_row_gnome(Some(true), Some(0))[0]["enabled"],
+            screenlock_row_gnome(Some(true), Some(0), None)[0]["enabled"],
             "no"
         );
         assert_eq!(
-            screenlock_row_gnome(Some(false), Some(300))[0]["enabled"],
+            screenlock_row_gnome(Some(false), Some(300), None)[0]["enabled"],
             "no"
         );
         // Missing gsettings -> unknown, never a false "no".
-        assert_eq!(screenlock_row_gnome(None, None)[0]["enabled"], "unknown");
+        assert_eq!(
+            screenlock_row_gnome(None, None, None)[0]["enabled"],
+            "unknown"
+        );
     }
 
     fn saver(active: &str, secure: &str, timeout: &str) -> ScreenSaverValues {
@@ -5228,17 +5373,18 @@ zroot/ROOT/default / zfs rw 0 0
         let text = "[Daemon]\nAutolock=false\nTimeout=5\n[Greeter]\nAutolock=true\n";
         let (autolock, timeout) = parse_kscreenlockerrc(text);
         assert_eq!(autolock, Some(false));
-        assert_eq!(timeout, Some(5));
-        // Plasma 6.3 stores the timeout as a double.
-        assert_eq!(parse_kscreenlockerrc("[Daemon]\nTimeout=0.5\n").1, Some(1));
+        assert_eq!(timeout, Some(300));
+        // Plasma 6.3 stores the timeout as a double: 0.5 is thirty seconds,
+        // and it must not round up to a minute.
+        assert_eq!(parse_kscreenlockerrc("[Daemon]\nTimeout=0.5\n").1, Some(30));
         assert_eq!(
             parse_kscreenlockerrc("[Daemon]\nTimeout=10.0\n").1,
-            Some(10)
+            Some(600)
         );
-        // Missing file/keys -> unknown enabled.
-        assert_eq!(screenlock_row_kde(None, None)[0]["enabled"], "unknown");
+        // Missing file/keys -> the Plasma default, which locks.
+        assert_eq!(screenlock_row_kde(None, None)[0]["enabled"], "yes");
         assert_eq!(
-            screenlock_row_kde(Some(true), Some(5))[0]["delay_seconds"],
+            screenlock_row_kde(Some(true), Some(300))[0]["delay_seconds"],
             300
         );
     }
@@ -5268,6 +5414,63 @@ listener {
         assert_eq!(zero[0]["enabled"], "no");
         assert_eq!(zero[0]["delay_seconds"], 0);
         assert_eq!(screenlock_row_hyprland(Some(300))[0]["enabled"], "yes");
+    }
+
+    #[test]
+    fn kde_absent_keys_mean_plasma_defaults() {
+        // An untouched Plasma install writes no kscreenlockerrc. That is the
+        // secure default (Autolock=true, 5 min), not unknown.
+        let row = screenlock_row_kde(None, None);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 300);
+        assert!(row[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Plasma default"));
+        // File values win over the defaults.
+        assert_eq!(
+            screenlock_row_kde(Some(false), Some(120))[0]["enabled"],
+            "no"
+        );
+        assert_eq!(
+            screenlock_row_kde(Some(true), Some(30))[0]["delay_seconds"],
+            30
+        );
+        // A zero timeout never fires, as on every other platform.
+        assert_eq!(screenlock_row_kde(None, Some(0))[0]["enabled"], "no");
+    }
+
+    #[test]
+    fn gsettings_desktops_add_lock_delay_and_mate_counts_minutes() {
+        // GNOME/Cinnamon: idle-delay 300 + lock-delay 3600 is a 65-minute
+        // lock, not a 5-minute one.
+        let g = screenlock_row_gnome(Some(true), Some(300), Some(3600));
+        assert_eq!(g[0]["enabled"], "yes");
+        assert_eq!(g[0]["delay_seconds"], 3900);
+        let c = screenlock_row_gsettings("cinnamon", Some(true), Some(900), None);
+        assert_eq!(c[0]["desktop_environment"], "cinnamon");
+        assert_eq!(c[0]["delay_seconds"], 900);
+        // idle-delay 0 never triggers, whatever lock-delay says.
+        assert_eq!(
+            screenlock_row_gsettings("cinnamon", Some(true), Some(0), Some(60))[0]["enabled"],
+            "no"
+        );
+        // MATE stores minutes: 5 + 1 minutes is 360 seconds.
+        let m = screenlock_row_mate(Some(true), Some(true), Some(5), Some(1));
+        assert_eq!(m[0]["enabled"], "yes");
+        assert_eq!(m[0]["delay_seconds"], 360);
+        assert_eq!(
+            screenlock_row_mate(Some(false), Some(true), Some(5), None)[0]["enabled"],
+            "no"
+        );
+        assert_eq!(
+            screenlock_row_mate(Some(true), Some(false), Some(5), None)[0]["enabled"],
+            "no"
+        );
+        assert_eq!(
+            screenlock_row_mate(None, None, None, None)[0]["enabled"],
+            "unknown"
+        );
     }
 
     #[test]

@@ -87,6 +87,13 @@ jobs:
           # a partial upload becomes a published release that customers see.
           APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1)
           test -n "$APPIMAGE" || { echo "AppImage missing" >&2; exit 1; }
+          # tauri-bundler downloads its AppImage plugin at build time and, if
+          # that fails, silently falls back to the legacy runtime, which needs
+          # libfuse.so.2. Stock Ubuntu, Debian and Fedora no longer ship it,
+          # so that build starts nowhere. Only the static type2 runtime ships.
+          chmod +x "$APPIMAGE"
+          "$APPIMAGE" --appimage-version 2>&1 | grep -q 'type2-runtime' \
+            || { echo "AppImage was built with the legacy fuse2 runtime" >&2; exit 1; }
           DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1)
           test -n "$DEB" || { echo "deb missing" >&2; exit 1; }
           RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1)
