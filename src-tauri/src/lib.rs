@@ -43,6 +43,11 @@ pub struct AppState {
     pub device_identity: RwLock<Option<String>>,
     /// Woken when a token is (re)acquired, so a collection runs at once.
     pub token_acquired: tokio::sync::Notify,
+    /// Linux: whether the tray icon built, and whether a StatusNotifier host
+    /// is on the bus to show it. Setup writes both; the sign-in nudge reads
+    /// them to decide whether it must open the fallback window instead.
+    pub tray_built: std::sync::atomic::AtomicBool,
+    pub tray_watcher_present: std::sync::atomic::AtomicBool,
 }
 
 /// Read an AppState lock. A poisoned lock cannot hold a half-updated value
@@ -581,6 +586,7 @@ enum Desktop {
     Hyprland,
     Cinnamon,
     Mate,
+    Xfce,
     Unknown,
 }
 
@@ -598,6 +604,8 @@ fn detect_desktop(xdg_current_desktop: Option<&str>) -> Desktop {
             // Mint sets exactly "X-Cinnamon".
             "x-cinnamon" | "cinnamon" => return Desktop::Cinnamon,
             "mate" => return Desktop::Mate,
+            // Xubuntu sets "xubuntu:XFCE"; a plain XFCE session sets "XFCE".
+            "xfce" => return Desktop::Xfce,
             _ => {}
         }
     }
@@ -888,6 +896,121 @@ fn screenlock_row_hyprland(lock_timeout: Option<u64>) -> Value {
     }
 }
 
+/// Read the X screensaver blank delay (seconds) from `xset q` output. The
+/// line reads "  timeout:  600    cycle:  600". light-locker locks when X
+/// blanks, so this delay is the first half of its lock time.
+#[cfg(any(target_os = "linux", test))]
+fn parse_xset_timeout(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("timeout:") {
+            return rest.split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// XFCE screen-lock row from the xfce4-screensaver xfconf channel, which
+/// XFCE 4.16 and later ship. Both delays are in MINUTES. A lock engages only
+/// when the saver activates on idle AND the lock is on AND the idle delay is
+/// non-zero. The reported delay is idle plus the post-activation grace.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_xfce_screensaver(
+    idle_activation: Option<bool>,
+    idle_delay_min: Option<u64>,
+    lock_enabled: Option<bool>,
+    lock_delay_min: Option<u64>,
+) -> Value {
+    let extra = lock_delay_min.unwrap_or(0);
+    let secs = idle_delay_min.map(|m| m * 60);
+    match (idle_activation, lock_enabled, idle_delay_min) {
+        (Some(true), Some(true), Some(d)) if d > 0 => screenlock_row(
+            "xfce",
+            "yes",
+            Some((d + extra) * 60),
+            "xfce4-screensaver",
+            &format!(
+                "idle-activation=true, lock=true, idle-delay={}min, lock-delay={}min",
+                d, extra
+            ),
+        ),
+        (Some(true), Some(true), Some(0)) => screenlock_row(
+            "xfce",
+            "no",
+            Some(0),
+            "xfce4-screensaver",
+            "lock enabled but idle-delay=0, so it never triggers",
+        ),
+        (Some(false), _, _) => screenlock_row(
+            "xfce",
+            "no",
+            secs,
+            "xfce4-screensaver",
+            "idle-activation=false",
+        ),
+        (_, Some(false), _) => {
+            screenlock_row("xfce", "no", secs, "xfce4-screensaver", "lock=false")
+        }
+        _ => screenlock_row(
+            "xfce",
+            "unknown",
+            secs,
+            "xfce4-screensaver",
+            "xfce4-screensaver settings unreadable",
+        ),
+    }
+}
+
+/// XFCE screen-lock row for light-locker, the locker XFCE 4.12 to 4.14 ship
+/// and Debian still installs. light-locker holds no idle timer of its own:
+/// it locks when the X screensaver blanks, `lock-after-screensaver` seconds
+/// later. A zero X timeout means X never blanks, so the lock never fires;
+/// a zero `lock-after-screensaver` turns the post-blank lock off.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_light_locker(
+    lock_after_screensaver: Option<u64>,
+    blank_timeout: Option<u64>,
+) -> Value {
+    let detail = format!(
+        "lock-after-screensaver={}, X blank timeout={}",
+        fmt_opt(lock_after_screensaver),
+        fmt_opt(blank_timeout)
+    );
+    match (lock_after_screensaver, blank_timeout) {
+        (_, None) => screenlock_row(
+            "xfce",
+            "unknown",
+            None,
+            "light-locker",
+            &format!("{}; xset gave no timeout", detail),
+        ),
+        (_, Some(0)) => screenlock_row(
+            "xfce",
+            "no",
+            Some(0),
+            "light-locker",
+            &format!("{}; X never blanks, so the lock never fires", detail),
+        ),
+        (Some(0), Some(_)) => screenlock_row(
+            "xfce",
+            "no",
+            Some(0),
+            "light-locker",
+            &format!("{}; lock after the screensaver is off", detail),
+        ),
+        (Some(after), Some(blank)) => {
+            screenlock_row("xfce", "yes", Some(blank + after), "light-locker", &detail)
+        }
+        (None, Some(_)) => screenlock_row(
+            "xfce",
+            "unknown",
+            blank_timeout,
+            "light-locker",
+            &format!("{}; light-locker settings unreadable", detail),
+        ),
+    }
+}
+
 /// `gsettings get <schema> <key>` as the desktop sees it. gsettings is a GLib
 /// program. From an AppImage it must not load the bundled libgio, whose
 /// module directory holds no dconf backend: it then answers with schema
@@ -911,6 +1034,129 @@ fn gsettings_bool(schema: &str, key: &str) -> Option<bool> {
 #[cfg(target_os = "linux")]
 fn gsettings_uint(schema: &str, key: &str) -> Option<u64> {
     gsettings_get(schema, key).and_then(|s| parse_gsettings_uint(&s))
+}
+
+/// The .desktop file the deep-link plugin writes for the scheme handler. It
+/// names the file after the running executable, so we must build the same
+/// name to repeat its `xdg-mime default` step.
+#[cfg(any(target_os = "linux", test))]
+fn deep_link_handler_desktop_file(exe_file_name: &str) -> String {
+    format!("{}-handler.desktop", exe_file_name)
+}
+
+/// Point `x-scheme-handler/klaayguard` at our .desktop file again, with the
+/// AppImage library paths stripped.
+///
+/// The deep-link plugin writes the .desktop file itself, then spawns
+/// `update-desktop-database` and `xdg-mime` with our environment. From an
+/// AppImage those inherit the bundled `LD_LIBRARY_PATH`, and `xdg-mime` is a
+/// shell script that runs more system binaries: they fail to start, the
+/// scheme stays unregistered, and sign-in never returns to the app. The
+/// plugin gives no way to set a child environment, so repeat its two
+/// commands here. Both are idempotent.
+#[cfg(target_os = "linux")]
+fn repair_deep_link_registration(app: &tauri::AppHandle) {
+    if std::env::var("APPDIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return; // Not an AppImage: the plugin's own spawns are already clean.
+    }
+    let Ok(exe) = tauri::utils::platform::current_exe() else {
+        log::warn!("deep_link repair: no current_exe");
+        return;
+    };
+    let Some(file_name) = exe
+        .file_name()
+        .map(|n| deep_link_handler_desktop_file(&n.to_string_lossy()))
+    else {
+        return;
+    };
+    let Ok(target) = app.path().data_dir().map(|d| d.join("applications")) else {
+        log::warn!("deep_link repair: no data dir");
+        return;
+    };
+    let mut update = std::process::Command::new("update-desktop-database");
+    update.arg(&target);
+    apply_appimage_sanitization(&mut update);
+    if let Err(e) = update.status() {
+        log::warn!("deep_link repair: update-desktop-database failed: {}", e);
+    }
+    let mut mime = std::process::Command::new("xdg-mime");
+    mime.args(["default", &file_name, "x-scheme-handler/klaayguard"]);
+    apply_appimage_sanitization(&mut mime);
+    match mime.status() {
+        Ok(s) if s.success() => log::info!("deep_link repair: {} is the handler", file_name),
+        Ok(s) => {
+            log::error!("deep_link repair: xdg-mime exited {}", s);
+            sentry::capture_message("deep_link_repair_xdg_mime_failed", Level::Error);
+        }
+        Err(e) => {
+            log::error!("deep_link repair: xdg-mime failed: {}", e);
+            sentry::capture_message("deep_link_repair_xdg_mime_failed", Level::Error);
+        }
+    }
+}
+
+/// `xfconf-query -c <channel> -p <property>` as the desktop sees it. It
+/// prints "true"/"false" for bools and a bare number for ints, so the
+/// gsettings parsers read both. An unset property exits non-zero, which the
+/// success filter turns into None.
+#[cfg(target_os = "linux")]
+fn xfconf_get(channel: &str, property: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("xfconf-query");
+    cmd.args(["-c", channel, "-p", property]);
+    apply_appimage_sanitization(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+#[cfg(target_os = "linux")]
+fn xfconf_bool(channel: &str, property: &str) -> Option<bool> {
+    xfconf_get(channel, property).and_then(|s| parse_gsettings_bool(&s))
+}
+
+#[cfg(target_os = "linux")]
+fn xfconf_uint(channel: &str, property: &str) -> Option<u64> {
+    xfconf_get(channel, property).and_then(|s| parse_gsettings_uint(&s))
+}
+
+/// The X screensaver blank delay in seconds, from `xset q`.
+#[cfg(target_os = "linux")]
+fn xset_blank_timeout() -> Option<u64> {
+    let mut cmd = std::process::Command::new("xset");
+    cmd.arg("q");
+    apply_appimage_sanitization(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| parse_xset_timeout(&s))
+}
+
+/// XFCE screen-lock posture. XFCE ships two lockers and only one runs: XFCE
+/// 4.16 and later use xfce4-screensaver, XFCE 4.12 to 4.14 use light-locker.
+/// Read xfce4-screensaver first, because when it is installed it owns the
+/// lock; fall back to light-locker.
+#[cfg(target_os = "linux")]
+fn collect_screenlock_xfce() -> Value {
+    let idle_activation = xfconf_bool("xfce4-screensaver", "/saver/idle-activation/enabled");
+    let lock_enabled = xfconf_bool("xfce4-screensaver", "/lock/enabled");
+    if idle_activation.is_some() || lock_enabled.is_some() {
+        return screenlock_row_xfce_screensaver(
+            idle_activation,
+            xfconf_uint("xfce4-screensaver", "/saver/idle-activation/delay"),
+            lock_enabled,
+            xfconf_uint("xfce4-screensaver", "/lock/saver-activation/delay"),
+        );
+    }
+    screenlock_row_light_locker(
+        xfconf_uint("light-locker", "/light-locker/lock-after-screensaver"),
+        xset_blank_timeout(),
+    )
 }
 
 /// Hyprland and sway run no XDG autostart: the entry is written, nothing
@@ -983,6 +1229,7 @@ fn collect_screenlock() -> Value {
                 .unwrap_or_default();
             screenlock_row_hyprland(parse_hypridle_config(&text))
         }
+        Desktop::Xfce => collect_screenlock_xfce(),
         Desktop::Unknown => screenlock_row(
             "unknown",
             "unknown",
@@ -1483,7 +1730,7 @@ fn parse_reg_sz_path(raw: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map(|x| x.to_string())
         .unwrap_or_else(|| "unset".to_string())
@@ -1853,6 +2100,20 @@ fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
     add_breadcrumb("ui", "signin_required_notification", Level::Info);
     open_sign_in(app);
     notify_user("KlaayGuard", "Open KlaayGuard in the menu bar to sign in.");
+    // Stock GNOME shows the tray to nobody. Without a tray the user has no
+    // way back to sign-in after a token expires, so open the window here,
+    // when it is needed, instead of at every login.
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::atomic::Ordering;
+        if fallback_window_needed(
+            state.tray_built.load(Ordering::Relaxed),
+            state.tray_watcher_present.load(Ordering::Relaxed),
+            false,
+        ) {
+            open_fallback_window(app);
+        }
+    }
 }
 
 /// Emit a collection error to UI listeners, the log, and Sentry (error level).
@@ -2125,12 +2386,38 @@ fn desktop_exec_field(path: &str) -> String {
     out
 }
 
-/// A fallback window is needed when the tray cannot serve as the UI: the
-/// tray failed to build, or no StatusNotifier host is on the bus to show it
-/// (stock GNOME without the AppIndicator extension).
+/// A fallback window is needed when the tray cannot serve as the UI.
+///
+/// A tray that failed to build leaves no UI at all, so the window opens
+/// whatever the sign-in state. A tray that built but has no StatusNotifier
+/// host to show it (stock GNOME without the AppIndicator extension) is the
+/// normal case on Fedora, Debian and Arch: there the window is only worth
+/// opening when the user must sign in. A signed-in agent needs no UI, and a
+/// window at every login is noise.
 #[cfg(any(target_os = "linux", test))]
-fn fallback_window_needed(tray_built: bool, watcher_present: bool) -> bool {
-    !tray_built || !watcher_present
+fn fallback_window_needed(tray_built: bool, watcher_present: bool, signed_in: bool) -> bool {
+    !tray_built || (!watcher_present && !signed_in)
+}
+
+/// Open the sign-in fallback window, once. A second call while the window
+/// lives is a no-op, so startup and a later sign-out cannot stack windows.
+#[cfg(target_os = "linux")]
+fn open_fallback_window(app: &tauri::AppHandle) {
+    if app.get_webview_window("fallback").is_some() {
+        return;
+    }
+    if let Err(e) = tauri::WebviewWindowBuilder::new(
+        app,
+        "fallback",
+        tauri::WebviewUrl::App("fallback.html".into()),
+    )
+    .title("KlaayGuard")
+    .inner_size(440.0, 340.0)
+    .build()
+    {
+        log::error!("fallback window failed: {}", e);
+        sentry::capture_message(&format!("fallback_window_failed: {}", e), Level::Error);
+    }
 }
 
 /// Whether a StatusNotifier host listens on the session bus. Errors and a
@@ -4177,6 +4464,10 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
             sentry::capture_message(&format!("deep_link_register_failed: {}", e), Level::Error);
         }
     }
+    // From an AppImage the plugin's own xdg-mime call runs with the bundled
+    // library paths and fails, so repeat it with a clean environment.
+    #[cfg(target_os = "linux")]
+    repair_deep_link_registration(&app);
 
     // Start at login, like the macOS LaunchAgent. An agent that only runs
     // when a human remembers to launch it leaves gaps the fleet dashboard
@@ -4316,6 +4607,10 @@ pub fn run() {
         pending_auth_state: RwLock::new(None),
         device_identity: RwLock::new(None),
         token_acquired: tokio::sync::Notify::new(),
+        // Assume a usable tray until setup proves otherwise, so a nudge that
+        // somehow runs first does not open a window on a healthy desktop.
+        tray_built: std::sync::atomic::AtomicBool::new(true),
+        tray_watcher_present: std::sync::atomic::AtomicBool::new(true),
     });
 
     let app = tauri::Builder::default()
@@ -4454,32 +4749,26 @@ pub fn run() {
                 sentry::capture_message(&format!("tray_build_failed: {}", e), Level::Error);
             }
 
-            // Stock GNOME shows no AppIndicator tray. When the tray cannot
-            // be the UI, open a small window so the user can still sign in.
+            // Stock GNOME shows no AppIndicator tray. Record both facts here;
+            // the sign-in nudge opens the fallback window when it needs one.
+            // Only a tray that failed to build leaves no UI at all, so only
+            // that case opens a window before the stored token is read.
             #[cfg(target_os = "linux")]
             {
                 let watcher = status_notifier_watcher_present();
-                if fallback_window_needed(tray_built.is_ok(), watcher) {
+                state
+                    .tray_built
+                    .store(tray_built.is_ok(), std::sync::atomic::Ordering::Relaxed);
+                state
+                    .tray_watcher_present
+                    .store(watcher, std::sync::atomic::Ordering::Relaxed);
+                if fallback_window_needed(tray_built.is_ok(), watcher, true) {
                     log::warn!(
                         "tray unusable (built={}, watcher={}); opening fallback window",
                         tray_built.is_ok(),
                         watcher
                     );
-                    if let Err(e) = tauri::WebviewWindowBuilder::new(
-                        app,
-                        "fallback",
-                        tauri::WebviewUrl::App("fallback.html".into()),
-                    )
-                    .title("KlaayGuard")
-                    .inner_size(440.0, 340.0)
-                    .build()
-                    {
-                        log::error!("fallback window failed: {}", e);
-                        sentry::capture_message(
-                            &format!("fallback_window_failed: {}", e),
-                            Level::Error,
-                        );
-                    }
+                    open_fallback_window(app.handle());
                 }
             }
             #[cfg(not(target_os = "linux"))]
@@ -4986,10 +5275,82 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(detect_desktop(Some("Hyprland")), Desktop::Hyprland);
         assert_eq!(detect_desktop(Some("X-Cinnamon")), Desktop::Cinnamon);
         assert_eq!(detect_desktop(Some("MATE")), Desktop::Mate);
-        // XFCE stays unknown until light-locker parsing exists; a false
-        // "yes" from the Cinnamon schemas Mint ships there would be worse.
-        assert_eq!(detect_desktop(Some("XFCE")), Desktop::Unknown);
+        assert_eq!(detect_desktop(Some("XFCE")), Desktop::Xfce);
+        assert_eq!(detect_desktop(Some("xubuntu:XFCE")), Desktop::Xfce);
         assert_eq!(detect_desktop(None), Desktop::Unknown);
+    }
+
+    #[test]
+    fn xset_timeout_reads_the_x_screensaver_blank_delay() {
+        let out = "Keyboard Control:\n  auto repeat:  on\nScreen Saver:\n  \
+                   prefer blanking:  yes    allow exposures:  yes\n  \
+                   timeout:  600    cycle:  600\nColors:\n";
+        assert_eq!(parse_xset_timeout(out), Some(600));
+        // A zero timeout means X never blanks, so light-locker never fires.
+        assert_eq!(
+            parse_xset_timeout("Screen Saver:\n  timeout:  0    cycle:  0\n"),
+            Some(0)
+        );
+        assert_eq!(parse_xset_timeout("no screen saver section"), None);
+    }
+
+    #[test]
+    fn xfce4_screensaver_lock_needs_activation_lock_and_a_delay() {
+        // Idle activation on, lock on, 10 min idle + 1 min grace = 660 s.
+        let row = screenlock_row_xfce_screensaver(Some(true), Some(10), Some(true), Some(1));
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 660);
+        assert_eq!(row[0]["desktop_environment"], "xfce");
+        assert_eq!(row[0]["source"], "xfce4-screensaver");
+
+        // Lock off: the saver blanks but never locks.
+        assert_eq!(
+            screenlock_row_xfce_screensaver(Some(true), Some(10), Some(false), Some(0))[0]
+                ["enabled"],
+            "no"
+        );
+        // Idle activation off: the saver never starts, so the lock never runs.
+        assert_eq!(
+            screenlock_row_xfce_screensaver(Some(false), Some(10), Some(true), Some(0))[0]
+                ["enabled"],
+            "no"
+        );
+        // A zero idle delay never triggers, as on every other desktop.
+        let zero = screenlock_row_xfce_screensaver(Some(true), Some(0), Some(true), Some(0));
+        assert_eq!(zero[0]["enabled"], "no");
+        assert_eq!(zero[0]["delay_seconds"], 0);
+        // Nothing readable stays unknown.
+        assert_eq!(
+            screenlock_row_xfce_screensaver(None, None, None, None)[0]["enabled"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn light_locker_locks_only_when_x_blanks() {
+        // X blanks after 600 s, light-locker locks 5 s later.
+        let row = screenlock_row_light_locker(Some(5), Some(600));
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 605);
+        assert_eq!(row[0]["desktop_environment"], "xfce");
+        assert_eq!(row[0]["source"], "light-locker");
+
+        // X never blanks, so light-locker never fires.
+        let never = screenlock_row_light_locker(Some(5), Some(0));
+        assert_eq!(never[0]["enabled"], "no");
+        assert_eq!(never[0]["delay_seconds"], 0);
+
+        // lock-after-screensaver=0 turns the post-blank lock off.
+        assert_eq!(
+            screenlock_row_light_locker(Some(0), Some(600))[0]["enabled"],
+            "no"
+        );
+
+        // No xset answer: unknown, never a false "yes".
+        assert_eq!(
+            screenlock_row_light_locker(Some(5), None)[0]["enabled"],
+            "unknown"
+        );
     }
 
     #[test]
@@ -5801,12 +6162,32 @@ listener {
     #[test]
     fn fallback_window_shown_only_when_tray_unusable() {
         // Tray built and a StatusNotifier host answers: no window.
-        assert!(!fallback_window_needed(true, true));
-        // Tray failed to build: window.
-        assert!(fallback_window_needed(false, true));
-        // Tray built but nothing shows it (stock GNOME): window.
-        assert!(fallback_window_needed(true, false));
-        assert!(fallback_window_needed(false, false));
+        assert!(!fallback_window_needed(true, true, false));
+        assert!(!fallback_window_needed(true, true, true));
+        // Tray failed to build: no UI exists at all, so a window either way.
+        assert!(fallback_window_needed(false, true, true));
+        assert!(fallback_window_needed(false, false, true));
+        assert!(fallback_window_needed(false, true, false));
+        // Tray built but nothing shows it (stock GNOME). A signed-out user
+        // needs the window to sign in.
+        assert!(fallback_window_needed(true, false, false));
+        // A signed-in agent needs no UI: a window at every login is noise.
+        assert!(!fallback_window_needed(true, false, true));
+    }
+
+    #[test]
+    fn deep_link_handler_desktop_file_matches_the_plugin() {
+        // The plugin names the file after the running executable. We re-run
+        // its xdg-mime step with a sanitised environment, so the name must
+        // match exactly or we point the scheme at a file that does not exist.
+        assert_eq!(
+            deep_link_handler_desktop_file("klaay-guard"),
+            "klaay-guard-handler.desktop"
+        );
+        assert_eq!(
+            deep_link_handler_desktop_file("KlaayGuard"),
+            "KlaayGuard-handler.desktop"
+        );
     }
 
     #[test]
