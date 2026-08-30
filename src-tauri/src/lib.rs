@@ -910,62 +910,98 @@ fn parse_xset_timeout(text: &str) -> Option<u64> {
     None
 }
 
+/// xfce4-screensaver's own schema defaults (src/gs-prefs.h). xfconf keeps
+/// only values that differ from them, so an untouched machine answers
+/// nothing at all and every default below applies. Every one of them locks.
+#[cfg(any(target_os = "linux", test))]
+mod xfce_defaults {
+    pub const SAVER_ENABLED: bool = true;
+    pub const IDLE_ACTIVATION_ENABLED: bool = true;
+    pub const IDLE_DELAY_MIN: u64 = 5;
+    pub const LOCK_ENABLED: bool = true;
+    pub const LOCK_WITH_SAVER_ENABLED: bool = true;
+    pub const LOCK_WITH_SAVER_DELAY_MIN: u64 = 0;
+}
+
 /// XFCE screen-lock row from the xfce4-screensaver xfconf channel, which
-/// XFCE 4.16 and later ship. Both delays are in MINUTES. A lock engages only
-/// when the saver activates on idle AND the lock is on AND the idle delay is
-/// non-zero. The reported delay is idle plus the post-activation grace.
+/// XFCE 4.16 and later ship. Four switches must all be on for an idle lock:
+/// `gs_listener` starts the saver only when `/saver/enabled` and
+/// `/saver/idle-activation/enabled` are true, and `add_lock_timer` schedules
+/// the lock only when `/lock/enabled` and `/lock/saver-activation/enabled`
+/// are true. Both delays are in MINUTES. An absent key means the shipped
+/// default, not unknown: reporting unknown would leave every compliant
+/// machine blank, the defect the KDE row already had.
 #[cfg(any(target_os = "linux", test))]
 fn screenlock_row_xfce_screensaver(
+    saver_enabled: Option<bool>,
     idle_activation: Option<bool>,
     idle_delay_min: Option<u64>,
     lock_enabled: Option<bool>,
+    lock_with_saver: Option<bool>,
     lock_delay_min: Option<u64>,
 ) -> Value {
-    let extra = lock_delay_min.unwrap_or(0);
-    let secs = idle_delay_min.map(|m| m * 60);
-    match (idle_activation, lock_enabled, idle_delay_min) {
-        (Some(true), Some(true), Some(d)) if d > 0 => screenlock_row(
-            "xfce",
-            "yes",
-            Some((d + extra) * 60),
-            "xfce4-screensaver",
-            &format!(
-                "idle-activation=true, lock=true, idle-delay={}min, lock-delay={}min",
-                d, extra
-            ),
-        ),
-        (Some(true), Some(true), Some(0)) => screenlock_row(
+    let saver = saver_enabled.unwrap_or(xfce_defaults::SAVER_ENABLED);
+    let idle_act = idle_activation.unwrap_or(xfce_defaults::IDLE_ACTIVATION_ENABLED);
+    let idle = idle_delay_min.unwrap_or(xfce_defaults::IDLE_DELAY_MIN);
+    let lock = lock_enabled.unwrap_or(xfce_defaults::LOCK_ENABLED);
+    let lock_saver = lock_with_saver.unwrap_or(xfce_defaults::LOCK_WITH_SAVER_ENABLED);
+    let grace = lock_delay_min.unwrap_or(xfce_defaults::LOCK_WITH_SAVER_DELAY_MIN);
+    let detail = format!(
+        "saver={}, idle-activation={}, idle-delay={}min, lock={}, \
+         lock-on-saver={}, lock-delay={}min",
+        saver, idle_act, idle, lock, lock_saver, grace
+    );
+    let total = (idle + grace) * 60;
+    if !saver || !idle_act || !lock || !lock_saver {
+        return screenlock_row("xfce", "no", Some(total), "xfce4-screensaver", &detail);
+    }
+    if idle == 0 {
+        return screenlock_row(
             "xfce",
             "no",
             Some(0),
             "xfce4-screensaver",
-            "lock enabled but idle-delay=0, so it never triggers",
-        ),
-        (Some(false), _, _) => screenlock_row(
-            "xfce",
-            "no",
-            secs,
-            "xfce4-screensaver",
-            "idle-activation=false",
-        ),
-        (_, Some(false), _) => {
-            screenlock_row("xfce", "no", secs, "xfce4-screensaver", "lock=false")
-        }
-        _ => screenlock_row(
-            "xfce",
-            "unknown",
-            secs,
-            "xfce4-screensaver",
-            "xfce4-screensaver settings unreadable",
-        ),
+            &format!("{}; idle-delay=0, so it never triggers", detail),
+        );
     }
+    screenlock_row("xfce", "yes", Some(total), "xfce4-screensaver", &detail)
+}
+
+/// light-locker's own default when the flag is absent (src/gs-monitor.c).
+#[cfg(any(target_os = "linux", test))]
+const LIGHT_LOCKER_DEFAULT_LOCK_AFTER: u64 = 5;
+
+/// Read light-locker's lock delay (SECONDS) from its autostart entry, or
+/// None when the entry is disabled. light-locker keeps no settings file: it
+/// takes `--lock-after-screensaver=S` on the command line, and
+/// light-locker-settings writes that flag into the autostart entry.
+#[cfg(any(target_os = "linux", test))]
+fn parse_light_locker_autostart(text: &str) -> Option<u64> {
+    let mut exec = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("Hidden=") {
+            if v.trim().eq_ignore_ascii_case("true") {
+                return None;
+            }
+        }
+        if let Some(v) = line.strip_prefix("Exec=") {
+            exec = Some(v.trim().to_string());
+        }
+    }
+    let exec = exec?;
+    Some(
+        exec.split_whitespace()
+            .find_map(|a| a.strip_prefix("--lock-after-screensaver="))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(LIGHT_LOCKER_DEFAULT_LOCK_AFTER),
+    )
 }
 
 /// XFCE screen-lock row for light-locker, the locker XFCE 4.12 to 4.14 ship
 /// and Debian still installs. light-locker holds no idle timer of its own:
-/// it locks when the X screensaver blanks, `lock-after-screensaver` seconds
-/// later. A zero X timeout means X never blanks, so the lock never fires;
-/// a zero `lock-after-screensaver` turns the post-blank lock off.
+/// it locks `lock-after-screensaver` seconds after the X screensaver blanks.
+/// A zero X timeout means X never blanks, so the lock never fires.
 #[cfg(any(target_os = "linux", test))]
 fn screenlock_row_light_locker(
     lock_after_screensaver: Option<u64>,
@@ -977,6 +1013,13 @@ fn screenlock_row_light_locker(
         fmt_opt(blank_timeout)
     );
     match (lock_after_screensaver, blank_timeout) {
+        (None, _) => screenlock_row(
+            "xfce",
+            "no",
+            None,
+            "light-locker",
+            &format!("{}; the autostart entry is disabled", detail),
+        ),
         (_, None) => screenlock_row(
             "xfce",
             "unknown",
@@ -991,23 +1034,9 @@ fn screenlock_row_light_locker(
             "light-locker",
             &format!("{}; X never blanks, so the lock never fires", detail),
         ),
-        (Some(0), Some(_)) => screenlock_row(
-            "xfce",
-            "no",
-            Some(0),
-            "light-locker",
-            &format!("{}; lock after the screensaver is off", detail),
-        ),
         (Some(after), Some(blank)) => {
             screenlock_row("xfce", "yes", Some(blank + after), "light-locker", &detail)
         }
-        (None, Some(_)) => screenlock_row(
-            "xfce",
-            "unknown",
-            blank_timeout,
-            "light-locker",
-            &format!("{}; light-locker settings unreadable", detail),
-        ),
     }
 }
 
@@ -1137,25 +1166,57 @@ fn xset_blank_timeout() -> Option<u64> {
         .and_then(|s| parse_xset_timeout(&s))
 }
 
+/// Whether a program is on this session's PATH.
+#[cfg(target_os = "linux")]
+fn binary_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// The first readable autostart entry for `file_name`: the user's copy in
+/// ~/.config/autostart hides the system one in /etc/xdg/autostart.
+#[cfg(target_os = "linux")]
+fn read_autostart_entry(file_name: &str) -> Option<String> {
+    dirs::config_dir()
+        .map(|c| c.join("autostart").join(file_name))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .or_else(|| {
+            std::fs::read_to_string(std::path::Path::new("/etc/xdg/autostart").join(file_name)).ok()
+        })
+}
+
 /// XFCE screen-lock posture. XFCE ships two lockers and only one runs: XFCE
 /// 4.16 and later use xfce4-screensaver, XFCE 4.12 to 4.14 use light-locker.
-/// Read xfce4-screensaver first, because when it is installed it owns the
-/// lock; fall back to light-locker.
+/// Dispatch on which binary is installed, never on which xfconf keys answer:
+/// on an untouched machine xfce4-screensaver has written no key at all, so a
+/// key probe would send every compliant desktop down the light-locker path.
 #[cfg(target_os = "linux")]
 fn collect_screenlock_xfce() -> Value {
-    let idle_activation = xfconf_bool("xfce4-screensaver", "/saver/idle-activation/enabled");
-    let lock_enabled = xfconf_bool("xfce4-screensaver", "/lock/enabled");
-    if idle_activation.is_some() || lock_enabled.is_some() {
+    if binary_on_path("xfce4-screensaver") {
         return screenlock_row_xfce_screensaver(
-            idle_activation,
+            xfconf_bool("xfce4-screensaver", "/saver/enabled"),
+            xfconf_bool("xfce4-screensaver", "/saver/idle-activation/enabled"),
             xfconf_uint("xfce4-screensaver", "/saver/idle-activation/delay"),
-            lock_enabled,
+            xfconf_bool("xfce4-screensaver", "/lock/enabled"),
+            xfconf_bool("xfce4-screensaver", "/lock/saver-activation/enabled"),
             xfconf_uint("xfce4-screensaver", "/lock/saver-activation/delay"),
         );
     }
-    screenlock_row_light_locker(
-        xfconf_uint("light-locker", "/light-locker/lock-after-screensaver"),
-        xset_blank_timeout(),
+    if binary_on_path("light-locker") {
+        return screenlock_row_light_locker(
+            read_autostart_entry("light-locker.desktop")
+                .as_deref()
+                .and_then(parse_light_locker_autostart),
+            xset_blank_timeout(),
+        );
+    }
+    screenlock_row(
+        "xfce",
+        "unknown",
+        None,
+        "none",
+        "neither xfce4-screensaver nor light-locker is installed",
     )
 }
 
@@ -5295,34 +5356,81 @@ zroot/ROOT/default / zfs rw 0 0
     }
 
     #[test]
-    fn xfce4_screensaver_lock_needs_activation_lock_and_a_delay() {
-        // Idle activation on, lock on, 10 min idle + 1 min grace = 660 s.
-        let row = screenlock_row_xfce_screensaver(Some(true), Some(10), Some(true), Some(1));
+    fn xfce4_screensaver_needs_all_four_switches_and_a_delay() {
+        // All four switches on, 10 min idle + 1 min grace = 660 s.
+        let row = screenlock_row_xfce_screensaver(
+            Some(true),
+            Some(true),
+            Some(10),
+            Some(true),
+            Some(true),
+            Some(1),
+        );
         assert_eq!(row[0]["enabled"], "yes");
         assert_eq!(row[0]["delay_seconds"], 660);
         assert_eq!(row[0]["desktop_environment"], "xfce");
         assert_eq!(row[0]["source"], "xfce4-screensaver");
 
-        // Lock off: the saver blanks but never locks.
-        assert_eq!(
-            screenlock_row_xfce_screensaver(Some(true), Some(10), Some(false), Some(0))[0]
-                ["enabled"],
-            "no"
-        );
-        // Idle activation off: the saver never starts, so the lock never runs.
-        assert_eq!(
-            screenlock_row_xfce_screensaver(Some(false), Some(10), Some(true), Some(0))[0]
-                ["enabled"],
-            "no"
-        );
+        // Each switch alone turns the lock off. gs-listener requires
+        // saver-enabled AND idle-activation; add_lock_timer requires
+        // lock-enabled AND lock/saver-activation/enabled.
+        for (saver, idle_act, lock, lock_saver) in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
+        ] {
+            let off = screenlock_row_xfce_screensaver(
+                Some(saver),
+                Some(idle_act),
+                Some(10),
+                Some(lock),
+                Some(lock_saver),
+                Some(0),
+            );
+            assert_eq!(off[0]["enabled"], "no", "{:?}", off);
+        }
+
         // A zero idle delay never triggers, as on every other desktop.
-        let zero = screenlock_row_xfce_screensaver(Some(true), Some(0), Some(true), Some(0));
+        let zero = screenlock_row_xfce_screensaver(
+            Some(true),
+            Some(true),
+            Some(0),
+            Some(true),
+            Some(true),
+            Some(0),
+        );
         assert_eq!(zero[0]["enabled"], "no");
         assert_eq!(zero[0]["delay_seconds"], 0);
-        // Nothing readable stays unknown.
+
+        // xfconf stores only values that differ from the schema, so an
+        // untouched machine has no keys at all. Every default is a locking
+        // one (5 min idle, 0 grace); reporting it unknown left the compliant
+        // majority blank, the same defect the KDE row had.
+        let untouched = screenlock_row_xfce_screensaver(None, None, None, None, None, None);
+        assert_eq!(untouched[0]["enabled"], "yes");
+        assert_eq!(untouched[0]["delay_seconds"], 300);
+    }
+
+    #[test]
+    fn light_locker_reads_its_autostart_flags() {
+        // light-locker takes seconds on the command line, not xfconf.
         assert_eq!(
-            screenlock_row_xfce_screensaver(None, None, None, None)[0]["enabled"],
-            "unknown"
+            parse_light_locker_autostart(
+                "[Desktop Entry]\nType=Application\n\
+                 Exec=light-locker --lock-after-screensaver=30 --late-locking\n"
+            ),
+            Some(30)
+        );
+        // No flag: light-locker's own default is 5 seconds.
+        assert_eq!(
+            parse_light_locker_autostart("[Desktop Entry]\nExec=light-locker\n"),
+            Some(5)
+        );
+        // The user disabled the entry, so nothing locks.
+        assert_eq!(
+            parse_light_locker_autostart("[Desktop Entry]\nExec=light-locker\nHidden=true\n"),
+            None
         );
     }
 
@@ -5340,9 +5448,9 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(never[0]["enabled"], "no");
         assert_eq!(never[0]["delay_seconds"], 0);
 
-        // lock-after-screensaver=0 turns the post-blank lock off.
+        // The autostart entry is disabled: light-locker never runs.
         assert_eq!(
-            screenlock_row_light_locker(Some(0), Some(600))[0]["enabled"],
+            screenlock_row_light_locker(None, Some(600))[0]["enabled"],
             "no"
         );
 
