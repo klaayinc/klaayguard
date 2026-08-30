@@ -1,7 +1,7 @@
 # What is KlaayGuard?
 
 **Product:** KlaayGuard desktop agent
-**Version of this document:** 2026-08-06
+**Version of this document:** 2026-08-28
 **Audience:** Anyone who wants the full picture of what the agent does. For a
 short, non-technical version, see the [Employee Guide](./EMPLOYEE_GUIDE.md).
 
@@ -46,22 +46,25 @@ running:
 
 - **Sign-in.** The agent opens the Klaay login page in your browser. After
   login, the browser returns a token to the agent. The agent stores the token
-  in the operating system credential store (macOS Keychain, for example).
+  in the operating system credential store: macOS Keychain, Windows
+  Credential Manager, or the Linux secret service.
 - **Menu bar icon.** The agent shows a small icon in the menu bar. A green dot
   means signed in. A red dot means signed out. The menu shows the time until
   the next report and a link to the Klaay Employee Hub. There is no other user
   interface and no window.
 - **Sign-in reminders.** If the agent is signed out, it opens the login page
   and shows one system notification. It repeats this at most once per minute.
-- **Automatic updates (macOS).** Every 6 hours, the agent asks Klaay for a new
-  version. Before it installs an update, it makes three checks:
-  - the file hash matches the release record;
-  - Apple has notarized the file;
-  - Klaay signed the file.
-  If any check fails, the agent keeps the current version.
-- **Start at login (macOS).** The installer registers the agent so that it
-  starts when you log in. The system restarts the agent if it stops. This
-  keeps posture reports continuous.
+- **Automatic updates.** Every 6 hours, the agent asks Klaay for a new
+  version. Before it installs an update, it checks that the file hash
+  matches the release record. On macOS it also checks that Apple notarized
+  the file and that Klaay signed it. If any check fails, the agent keeps the
+  current version. The Linux `.deb` and `.rpm` installs update through the
+  package manager instead.
+- **Start at login.** The installer registers the agent so that it starts
+  when you log in. On macOS the system restarts the agent if it stops. On
+  Windows a registry entry starts it at each logon. On Linux the app writes
+  an autostart entry at its first start. This keeps posture reports
+  continuous.
 - **Logs.** The agent writes its own status messages to log files in your
   user folder. It can send crash reports to Sentry when Klaay turns that on.
   Crash reports contain no collected posture data.
@@ -92,11 +95,11 @@ the OS permissions that the agent does not request.
 Klaay distributes installers from the
 [GitHub releases page](https://github.com/klaayinc/klaayguard/releases).
 You can also build the agent from source. See the [README](../README.md).
-The macOS installers are signed and notarized. The Linux packages are
-not signed yet.
+The macOS installers are signed and notarized. The Linux packages and the
+Windows installer are not signed yet.
 macOS installs use a `.pkg` or `.dmg` file. Linux installs use a `.deb`
 (Ubuntu, Debian), an `.rpm` (Fedora, RHEL), or an `.AppImage` (any
-distribution). A Windows build is planned but not yet available.
+distribution). Windows installs use an `.exe` installer, x64 only.
 
 Platform differences on Linux:
 
@@ -104,6 +107,12 @@ Platform differences on Linux:
   each new version through the package manager.
 - On a plain GNOME desktop the tray icon needs the "AppIndicator and
   KStatusNotifierItem Support" extension. Ubuntu includes it.
+
+Platform differences on Windows:
+
+- The installer needs no administrator rights.
+- Windows shows a SmartScreen warning at the first run, because Klaay does
+  not sign the installer yet. Choose **More info**, then **Run anyway**.
 
 ## 6. Questions
 

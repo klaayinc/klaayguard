@@ -1,7 +1,7 @@
 # KlaayGuard Privacy Datasheet
 
 **Product:** KlaayGuard desktop agent
-**Version of this document:** 2026-08-06
+**Version of this document:** 2026-08-28
 **Audience:** Customer security and privacy reviewers (incl. BYOD deployments)
 
 ## 1. Overview
@@ -20,13 +20,20 @@ The agent runs only the queries the Klaay server instructs it to. The current pr
 |---|---|---|---|
 | `system_info` | Hostname, CPU model, physical/virtual memory, hardware UUID/serial | Device inventory | System inventory (CTRL-033) |
 | `os_version` | OS name, version, major/minor/patch, build, platform, architecture | Patch-level verification | Security patches (CTRL-084) |
-| `users` | Local account username, UID, GID, home directory, shell, description, password-status flags, password last-changed and expiry dates | Local-account inventory | Access controls (CTRL-033) |
+| `users` | Local account username, UID, GID, home directory, shell, description | Local-account inventory | Access controls (CTRL-033) |
 | `startup_items` | Login items / launch agents: name, path, args, type, status | Detect persistence and unauthorized auto-start software | Endpoint integrity (CTRL-152) |
 | `disk_encryption` | Per-volume name, encrypted flag, encryption type (FileVault / BitLocker / LUKS), encryption status | Verify data-at-rest encryption | Data at rest (CTRL-165), BYOD (CTRL-098) |
-| `screenlock` | Screen-lock enabled flag, grace period (macOS) | Verify auto screen lock | Auto screen lock (CTRL-097) |
+| `screenlock` | Screen-lock enabled flag and delay. macOS: grace period. Linux: the desktop's own lock setting. Windows: `InactivityTimeoutSecs` under the machine policy key, and `ScreenSaveActive`, `ScreenSaverIsSecure`, `ScreenSaveTimeOut` under the machine policy, user policy, and `HKEY_CURRENT_USER\Control Panel\Desktop` keys | Verify auto screen lock | Auto screen lock (CTRL-097) |
+| `disk_encryption` (Windows) | System drive only: the BitLocker protection state File Explorer shows (`System.Volume.BitLockerProtection`), reduced to encrypted yes / no / unknown | Verify data-at-rest encryption without elevation | Data at rest (CTRL-165) |
+| `bitlocker_info` (Windows only) | Per-volume drive letter, protection status, conversion status, encryption method. Readable only when the agent runs elevated; a standard install sends no rows | Raw evidence behind the `disk_encryption` verdict | Data at rest (CTRL-165) |
+| `windows_security_center` (Windows only) | Windows Security Center verdicts: firewall, antivirus, antispyware, automatic updates, user account control, internet settings, security center service | Verify firewall, antivirus, and update posture | Antivirus (CTRL-152), Endpoint (CTRL-151), Security patches (CTRL-084) |
+| `windows_security_products` (Windows only) | Each registered security product: name, type, state, state timestamp, signatures-up-to-date flag | Verify antivirus and firewall products are on and current | Antivirus (CTRL-152) |
+| `patches` (Windows only) | Installed hotfix ID, description, install date | Patch-level verification | Security patches (CTRL-084) |
+| `password_policy` (Windows only) | The local account policy from `NetUserModalsGet`: minimum password length, maximum and minimum password age, password history size, lockout threshold, lockout duration and window | Verify password and lockout configuration | Password configuration (CTRL-103) |
+| `screenlock_registry` (Windows only) | The raw `ScreenSaveActive`, `ScreenSaverIsSecure`, and `ScreenSaveTimeOut` values under `HKEY_CURRENT_USER\Control Panel\Desktop` | Raw evidence behind the `screenlock` verdict | Auto screen lock (CTRL-097) |
 | `preferences` (scoped) | Two specific macOS keys only: `askForPassword` and `askForPasswordDelay` under `com.apple.screensaver` | Verify screensaver password requirement | Auto screen lock (CTRL-097) |
 
-No password values, hashes, or password contents of any kind are collected — only metadata flags such as "password set", "last changed date", and "expires date" exposed by the operating system.
+No password values, hashes, or password contents of any kind are collected. On Windows the `password_policy` row carries the local policy (lengths, ages, lockout counts), never a password.
 
 ## 3. Data Explicitly NOT Collected
 
@@ -61,8 +68,8 @@ KlaayGuard does **not** request:
 What it does install:
 
 - **macOS:** a user-level LaunchAgent at `~/Library/LaunchAgents/com.klaay.klaayguard.plist` so the agent runs in the user's session at login. This is per-user, not system-wide. The application bundle includes its own copy of osquery; no separate osquery installation is performed and operation does not require admin.
-- **Linux:** no startup entry is installed. The user or administrator starts the agent.
-- **Windows:** no Windows build is currently distributed.
+- **Linux:** the app writes a per-user autostart entry at `~/.config/autostart/klaayguard.desktop` on its first start. It honours a user who disables that entry.
+- **Windows:** the installer writes one `Run` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, so the agent starts at logon. The value is per-user. The installer needs no administrator rights and installs no service and no driver.
 
 The agent runs as the logged-in user, not as root/Administrator, and therefore can only see what that user can see.
 
@@ -83,14 +90,14 @@ The agent runs as the logged-in user, not as root/Administrator, and therefore c
 
 ## 7. Updates
 
-KlaayGuard updates are distributed as signed installers. Updates do not change the data-collection scope on their own — the data scope is governed by the server-side configuration documented in §2.
+Klaay signs and notarizes the macOS installers. Klaay does not sign the Linux packages or the Windows installer yet; on those platforms the agent accepts an update only when its SHA-256 hash matches the release record. Updates do not change the data-collection scope on their own. The server-side configuration in §2 governs the data scope.
 
 ## 8. BYOD Considerations
 
 KlaayGuard is suitable for personal-device deployment because the data scope is restricted to security posture, not user activity. Two items worth highlighting to end users on personal devices:
 
 - The `users` query enumerates **all local user accounts** on the device (usernames, UIDs, home directory paths). It does not access those accounts' files or activity. On a single-user personal device this is typically a non-issue; on a shared family device, other account names will appear in the inventory.
-- The agent runs only while the user it is installed under is logged in. It has no visibility into other macOS user profiles on the same machine.
+- The agent runs only while the user it is installed under is logged in. It has no visibility into other user profiles on the same machine.
 
 Customers preferring stricter isolation may install KlaayGuard inside a dedicated work-purpose macOS user profile rather than the user's primary profile. This is supported but is generally not necessary given the limited data scope.
 

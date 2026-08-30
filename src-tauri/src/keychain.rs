@@ -75,6 +75,11 @@ fn file_save_at(path: &Path, value: &str) -> Result<(), String> {
             .map_err(|e| format!("credential create: {}", e))?;
         f.write_all(value.as_bytes())
             .map_err(|e| format!("credential write: {}", e))?;
+        // Flush before the rename. On a first save the target does not exist
+        // yet, so no rename-over-existing heuristic protects it, and a power
+        // loss could leave an empty file that reads as "no token".
+        f.sync_all()
+            .map_err(|e| format!("credential sync: {}", e))?;
     }
     fs::rename(&tmp, path).map_err(|e| format!("credential rename: {}", e))
 }
@@ -124,34 +129,47 @@ pub fn save_token(token: &str) -> Result<CredentialStore, String> {
     }
 }
 
-pub fn load_token() -> Result<Option<String>, String> {
-    match keyring_get(KEYCHAIN_ACCOUNT) {
-        Ok(Some(t)) => Ok(Some(t)),
-        // Keyring empty: a fallback file may still hold the token.
-        Ok(None) => Ok(file_load(KEYCHAIN_ACCOUNT)),
-        Err(e) => {
-            log::warn!(
-                "secret service read failed ({}); reading token from file",
-                e
-            );
-            Ok(file_load(KEYCHAIN_ACCOUNT))
-        }
+/// Load a credential: the fallback file first, then the keyring. A file is
+/// written only when a keyring write failed, and a later successful keyring
+/// write deletes it, so a present file always holds the newest value; reading
+/// the keyring first would resurrect a stale entry (an invalidated token that
+/// `invalidate_auth` deliberately leaves in place). A keyring read error with
+/// no file is returned to the caller, so a locked or absent store is reported
+/// instead of looking like "not signed in".
+fn load(account: &str) -> Result<Option<String>, String> {
+    if let Some(v) = file_load(account) {
+        return Ok(Some(v));
     }
+    keyring_get(account)
+}
+
+pub fn load_token() -> Result<Option<String>, String> {
+    load(KEYCHAIN_ACCOUNT)
 }
 
 /// Remove the stored auth token from both stores. An explicit sign out must
-/// leave no token behind. Clear the file fallback, then clear the keyring
-/// best-effort: a missing entry or an unavailable keyring is success once the
-/// file is gone (the token may only ever have lived in the file).
+/// leave no token behind. Clear the file fallback, then the keyring. A missing
+/// entry is success. A refused keyring delete is a failure only when the token
+/// is provably still stored: on a host with no usable keyring the token only
+/// ever lived in the file, and that is gone.
 pub fn delete_token() -> Result<(), String> {
     file_delete(KEYCHAIN_ACCOUNT);
-    if let Ok(entry) = entry_for(KEYCHAIN_ACCOUNT) {
-        match entry.delete_password() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
-            Err(e) => log::warn!("sign out: keyring delete failed ({}); file cleared", e),
-        }
+    let Ok(entry) = entry_for(KEYCHAIN_ACCOUNT) else {
+        return Ok(());
+    };
+    match entry.delete_password() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => match keyring_get(KEYCHAIN_ACCOUNT) {
+            Ok(Some(_)) => Err(format!(
+                "keyring delete failed ({}); the token is still stored",
+                e
+            )),
+            _ => {
+                log::warn!("sign out: keyring delete failed ({}); file cleared", e);
+                Ok(())
+            }
+        },
     }
-    Ok(())
 }
 
 pub fn save_device_identity(id: &str) -> Result<(), String> {
@@ -172,17 +190,7 @@ pub fn save_device_identity(id: &str) -> Result<(), String> {
 }
 
 pub fn load_device_identity() -> Result<Option<String>, String> {
-    match keyring_get(DEVICE_ID_ACCOUNT) {
-        Ok(Some(v)) => Ok(Some(v)),
-        Ok(None) => Ok(file_load(DEVICE_ID_ACCOUNT)),
-        Err(e) => {
-            log::warn!(
-                "secret service read failed ({}); reading device identity from file",
-                e
-            );
-            Ok(file_load(DEVICE_ID_ACCOUNT))
-        }
-    }
+    load(DEVICE_ID_ACCOUNT)
 }
 
 #[cfg(test)]

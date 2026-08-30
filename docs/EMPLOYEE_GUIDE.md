@@ -5,7 +5,7 @@ it is, what it can see, and what it cannot see.
 
 ## What is KlaayGuard?
 
-KlaayGuard is a small app that runs in your menu bar (on Linux: your system tray). It checks that your
+KlaayGuard is a small app that runs in your menu bar (on Windows and Linux: your system tray). It checks that your
 computer meets the company's security rules, and reports the result to Klaay.
 That is all it does.
 
@@ -52,13 +52,14 @@ Almost nothing:
   GNOME desktop, install the "AppIndicator and KStatusNotifierItem
   Support" extension. Ubuntu includes it.
 - One sign-in in your browser after you install it.
-- Nothing else. It has no window and uses almost no battery. On macOS and on the
-  Linux AppImage it updates itself. For .deb or .rpm installs, install new
-  versions when your IT team asks.
+- Nothing else. It has no window and uses almost no battery. On macOS, on
+  Windows, and on the Linux AppImage it updates itself. For .deb or .rpm
+  installs, install new versions when your IT team asks.
 
 ## How do I install it on Linux?
 
-Pick the file for your system from the link your IT team sends:
+Open the Klaay Employee Hub, choose the **KlaayGuard** card, and pick the
+file for your system:
 
 - Ubuntu or Debian: the `.deb` file.
 - Fedora or RHEL: the `.rpm` file.
@@ -87,6 +88,20 @@ the terminal.
 On that first start the app registers itself to start at login and to receive
 the sign-in link. After that, the app starts by itself each time you log in. You
 do not need the terminal again.
+
+## How do I install it on Windows?
+
+1. Open the Klaay Employee Hub and choose the **KlaayGuard** card. It gives
+   you the file for Windows, named
+   `KlaayGuard_<version>_Windows_x64_<variant>.exe`.
+2. Double-click the file.
+3. Windows shows a blue **Windows protected your PC** box. This is expected.
+   Klaay does not sign the installer yet.
+4. Choose **More info**, then choose **Run anyway**.
+5. Follow the installer.
+
+You do not need administrator rights. The installer starts the agent, and the
+agent starts again at each logon.
 
 ## What do I need to do?
 

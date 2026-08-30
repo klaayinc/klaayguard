@@ -17,24 +17,49 @@ mod keychain;
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::{Duration, Instant},
+};
 use tauri::{Emitter, Manager};
-// removed autostart plugin; using manual LaunchAgent management
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::ShellExt;
-// use tauri_plugin_log::LogTarget; // use defaults
-use tokio::sync::RwLock;
 
-// Re-introduced minimal osquery commands used by the UI.
-
-/// Shared application state for background operations
+/// Shared application state for background operations. The locks are
+/// `std::sync`: every critical section is one clone, take, or assignment,
+/// never held across an `.await`, so the main thread, plugin callbacks, and
+/// tokio tasks all use the same plain API. (An async lock forced `block_on`
+/// calls, which panic inside a tokio task.)
 pub struct AppState {
     pub auth_token: RwLock<Option<String>>,
-    pub api_base_url: RwLock<String>,
-    pub last_run_at: RwLock<Option<std::time::Instant>>,
-    pub last_attempt_at: RwLock<Option<std::time::Instant>>,
-    pub last_focus_at: RwLock<Option<std::time::Instant>>, // debounce for focus-on-failure
-    pub pending_auth_state: RwLock<Option<String>>, // single-use nonce for the sign-in round-trip
+    pub api_base_url: String,
+    pub last_attempt_at: RwLock<Option<Instant>>,
+    pub last_focus_at: RwLock<Option<Instant>>, // debounce for the sign-in nudge
+    /// The sign-in nonce and when it was minted. Reused while fresh, so the
+    /// app's own extra sign-in tabs all carry a state the callback accepts.
+    pub pending_auth_state: RwLock<Option<(String, Instant)>>,
+    /// The device identity, resolved once per process (persisted by keychain).
+    pub device_identity: RwLock<Option<String>>,
+    /// Woken when a token is (re)acquired, so a collection runs at once.
+    pub token_acquired: tokio::sync::Notify,
+    /// Linux: whether the tray icon built, and whether a StatusNotifier host
+    /// is on the bus to show it. Setup writes both; the sign-in nudge reads
+    /// them to decide whether it must open the fallback window instead.
+    pub tray_built: std::sync::atomic::AtomicBool,
+    pub tray_watcher_present: std::sync::atomic::AtomicBool,
+}
+
+/// Read an AppState lock. A poisoned lock cannot hold a half-updated value
+/// here (each section is one assignment or clone), so recover the guard
+/// instead of propagating another thread's panic.
+fn lock_read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write an AppState lock; see `lock_read`.
+fn lock_write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
 }
 
 // Keychain access is centralized in src-tauri/src/keychain.rs
@@ -55,21 +80,27 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
     });
 }
 
-/// Read a query-string value from a klaayguard:// deep link, with the same minimal
-/// space-decoding the token parser has always used. Returns None for a non-klaayguard
-/// URL or a missing key.
+/// Read a query-string value from a klaayguard:// deep link, fully
+/// percent-decoded (the Klaay Frontend passes the token and state through
+/// encodeURIComponent). Returns None for a non-klaayguard URL or a missing key.
 fn deep_link_query_value(url: &str, key: &str) -> Option<String> {
-    if !url.starts_with("klaayguard://") {
+    let parsed = tauri::Url::parse(url).ok()?;
+    if parsed.scheme() != "klaayguard" {
         return None;
     }
-    let qs = url.split_once('?').map(|(_, q)| q).unwrap_or("");
-    qs.split('&').find_map(|pair| {
-        let mut it = pair.splitn(2, '=');
-        match (it.next(), it.next()) {
-            (Some(k), Some(v)) if k == key => Some(v.replace("%20", " ").replace('+', " ")),
-            _ => None,
-        }
-    })
+    parsed
+        .query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
+}
+
+/// A deep link with its query removed, for logs. The query carries the bearer
+/// token, and the log file is not a credential store.
+fn redact_deep_link(url: &str) -> String {
+    match url.split_once('?') {
+        Some((head, _)) => format!("{}?<redacted>", head),
+        None => url.to_string(),
+    }
 }
 
 /// Extract and shape-validate the JWT from a `klaayguard://...?token=...` deep link.
@@ -81,9 +112,11 @@ fn parse_deep_link_token(url: &str) -> Option<String> {
 }
 
 /// When true, a sign-in callback MUST carry a `state` that matches the nonce we issued.
-/// Left false until Klaay Frontend echoes `state` in the klaayguard:// redirect; flip to
-/// true once that ships to fully close the deep-link confused-deputy. A *mismatch* is
-/// rejected regardless of this flag — only a *missing* state is tolerated during rollout.
+/// The Klaay Frontend echoes `state` in the klaayguard:// redirect (since July 2026), so
+/// this can flip to true, closing the deep-link confused-deputy, once the fleet runs an
+/// agent whose nonce survives its own second sign-in tab (see `open_sign_in`). A
+/// *mismatch* is rejected regardless of this flag — only a *missing* state is tolerated
+/// during rollout.
 const AUTH_STATE_STRICT: bool = false;
 
 /// Decide whether the callback's `state` clears the nonce check. A present-but-wrong
@@ -102,15 +135,21 @@ fn auth_state_ok(strict: bool, expected: Option<&str>, provided: Option<&str>) -
 fn generate_auth_nonce() -> Option<String> {
     let mut buf = [0u8; 32];
     getrandom::getrandom(&mut buf).ok()?;
-    Some(buf.iter().map(|b| format!("{:02x}", b)).collect())
+    Some(hex_lower(&buf))
+}
+
+/// Lower-case hex of a byte slice.
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// Defense-in-depth against a compromised/MITM'd config endpoint: only accept a
 /// single read-only osquery statement. osquery can still read arbitrary user-readable
 /// files via tables like `file`/`hash`, so this does not make the SQL harmless — but it
 /// refuses anything that isn't one plain `SELECT` (or a `WITH …` CTE), blocking stacked
-/// statements (`SELECT 1; ATTACH …`) and non-query verbs. A table-level allowlist, owned
-/// by the product, is the fuller control and should layer on top of this.
+/// statements (`SELECT 1; ATTACH …`), non-query verbs, and DML hidden behind a CTE.
+/// The engine-level control is the `--disable_tables` list passed to the sidecar in
+/// `execute_sql_batch`, which is what actually keeps a SELECT off the network.
 fn is_read_only_query(sql: &str) -> bool {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     // Any remaining ';' means a second statement was stacked on.
@@ -118,24 +157,40 @@ fn is_read_only_query(sql: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("select") || lower.starts_with("with")
+    if !(lower.starts_with("select") || lower.starts_with("with")) {
+        return false;
+    }
+    // SQLite accepts DML behind a CTE (`WITH t AS (...) DELETE FROM x`), so a
+    // `with` prefix alone is not read-only. osquery's tables refuse writes
+    // anyway; this keeps the guard honest about what it admits.
+    !lower
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|tok| matches!(tok, "insert" | "update" | "delete" | "replace"))
 }
 
 /// Whether a config item's `platform` tag matches this host's OS. Mirrors
-/// osquery query-pack semantics: absent / empty / "all" runs everywhere;
-/// "posix" runs on linux and macos; any other value must equal the OS string
-/// (`std::env::consts::OS`: "linux" / "macos" / "windows"). `os` is a parameter
-/// so tests pin every branch without cross-compiling. Backward compatible: an
-/// item with no tag always runs, so older configs behave as before.
+/// osquery query-pack semantics: absent / empty / "all" / "any" runs
+/// everywhere; a comma-separated list runs where any entry matches; "posix"
+/// runs on linux and macos; "ubuntu"/"centos" are linux; any other value must
+/// equal the OS string (`std::env::consts::OS`: "linux" / "macos" /
+/// "windows"). `os` is a parameter so tests pin every branch without
+/// cross-compiling. Backward compatible: an item with no tag always runs.
 fn platform_matches(tag: Option<&str>, os: &str) -> bool {
-    match tag.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        None | Some("") | Some("all") => true,
-        Some("posix") => os == "linux" || os == "macos",
-        // osquery names macOS "darwin"; Rust's OS string is "macos". Treat both
-        // as the same platform so the Klaay API's "darwin" tag matches a macOS host.
-        Some("darwin") | Some("macos") => os == "macos",
-        Some(other) => other == os,
+    let Some(tag) = tag else { return true };
+    if tag.trim().is_empty() {
+        return true;
     }
+    tag.split(',')
+        .map(|name| name.trim().to_ascii_lowercase())
+        .any(|name| match name.as_str() {
+            "" | "all" | "any" | "null" => true,
+            "posix" => os == "linux" || os == "macos",
+            "linux" | "ubuntu" | "centos" => os == "linux",
+            // osquery names macOS "darwin"; Rust's OS string is "macos". Treat both
+            // as the same platform so the Klaay API's "darwin" tag matches a macOS host.
+            "darwin" | "macos" => os == "macos",
+            other => other == os,
+        })
 }
 
 /// One resolved collection item from /klaayguard/config, after platform filter.
@@ -150,7 +205,7 @@ enum CollectionItem {
 
 /// Turn the /klaayguard/config payload into collection items for `os`. Items
 /// whose `platform` tag does not match `os` are skipped. An item with
-/// `source: "builtin"` (and a `check` name) resolves natively; otherwise it is
+/// `type: "builtin"` (and a `check` name) resolves natively; otherwise it is
 /// an osquery item — explicit `sql` or a default `SELECT * FROM <id>`, dropped
 /// if it is not a single read-only query (see `is_read_only_query`).
 fn parse_config_items(cfg: &Value, os: &str) -> Vec<CollectionItem> {
@@ -164,11 +219,13 @@ fn parse_config_items(cfg: &Value, os: &str) -> Vec<CollectionItem> {
                     if !platform_matches(platform, os) {
                         return None;
                     }
-                    let source = item
-                        .get("source")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("osquery");
-                    if source == "builtin" {
+                    // kiln marks a native check with `type: "builtin"` (its
+                    // config request spec pins the spelling). The agent once
+                    // read a `source` key nothing ever sent, so every builtin
+                    // ran as `SELECT * FROM <id>` through osquery and the
+                    // native Linux checks never executed in the field.
+                    let is_builtin = item.get("type").and_then(|v| v.as_str()) == Some("builtin");
+                    if is_builtin {
                         return match item.get("check").and_then(|v| v.as_str()) {
                             Some(check) => Some(CollectionItem::Builtin {
                                 id: id.to_string(),
@@ -219,6 +276,12 @@ fn run_builtin_check(check: &str) -> Value {
         "disk_encryption" => collect_disk_encryption(),
         #[cfg(target_os = "linux")]
         "screenlock" => collect_screenlock(),
+        #[cfg(target_os = "windows")]
+        "screenlock" => collect_screenlock_windows(),
+        #[cfg(target_os = "windows")]
+        "disk_encryption" => collect_disk_encryption_windows(),
+        #[cfg(target_os = "windows")]
+        "password_policy" => collect_password_policy_windows(),
         other => {
             log::warn!("unknown or unsupported builtin check '{}'", other);
             add_breadcrumb(
@@ -232,11 +295,12 @@ fn run_builtin_check(check: &str) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// Native Linux posture collectors (disk encryption, screen lock). osquery
-// cannot supply these unprivileged: disk_encryption needs root and mis-reports
-// LUKS, and there is no Linux screenlock table. Pure parsers are unit-tested;
-// thin IO wrappers are not. Every path degrades to "unknown", never a false
-// "no", when a mechanism cannot be seen without root.
+// Native Linux and Windows posture collectors (disk encryption, screen lock).
+// osquery cannot supply these unprivileged: disk_encryption needs root and
+// mis-reports LUKS, there is no Linux screenlock table, and the Windows
+// registry table needs anchored keys. Pure parsers are unit-tested; thin IO
+// wrappers are not. Every path degrades to "unknown", never a false "no",
+// when a mechanism cannot be seen without root.
 // ---------------------------------------------------------------------------
 
 /// One block device flattened from `lsblk -J`, with encryption context.
@@ -323,24 +387,28 @@ fn parse_proc_mounts(text: &str) -> Vec<MountEntry> {
     // /proc/mounts octal-escapes spaces and a few other chars in the path
     // (space = \040). Decode so a mountpoint with a space still matches.
     fn unescape(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
+        // Decode into bytes: an escape is one byte of a possibly multi-byte
+        // UTF-8 sequence (\303\251 is "é"), so pushing it as a char would
+        // produce Latin-1 garbage.
+        let mut out: Vec<u8> = Vec::with_capacity(s.len());
+        let mut chars = s.chars();
         while let Some(c) = chars.next() {
             if c == '\\' {
-                let oct: String = (0..3).filter_map(|_| chars.peek().copied()).collect();
+                let oct: String = chars.clone().take(3).collect();
                 if oct.len() == 3 && oct.chars().all(|d| ('0'..='7').contains(&d)) {
                     if let Ok(code) = u8::from_str_radix(&oct, 8) {
                         for _ in 0..3 {
                             chars.next();
                         }
-                        out.push(code as char);
+                        out.push(code);
                         continue;
                     }
                 }
             }
-            out.push(c);
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
         }
-        out
+        String::from_utf8_lossy(&out).into_owned()
     }
     text.lines()
         .filter_map(|line| {
@@ -446,12 +514,35 @@ fn build_disk_encryption_rows(
         }
     };
 
+    // A home directory is rarely a mountpoint itself: classify the mount it
+    // lives on, the longest mountpoint that is a path prefix of it.
+    let mount_of = |path: &str| -> String {
+        let p = std::path::Path::new(path);
+        mounts
+            .iter()
+            .map(|m| m.mountpoint.as_str())
+            .chain(
+                devs.iter()
+                    .flat_map(|d| d.mountpoints.iter().map(String::as_str)),
+            )
+            .filter(|mp| p.starts_with(mp))
+            .max_by_key(|mp| mp.len())
+            .unwrap_or(path)
+            .to_string()
+    };
+
     let root_encrypted = determine("/");
     let home_encrypted = match home {
-        Some(h) if !h.is_empty() && h != "/" => determine(h),
-        // Home on the root filesystem shares its determination.
-        Some(_) => root_encrypted,
-        None => "unknown",
+        Some(h) if !h.is_empty() => {
+            let mount = mount_of(h);
+            // Home on the root filesystem shares its determination.
+            if mount == "/" {
+                root_encrypted
+            } else {
+                determine(&mount)
+            }
+        }
+        _ => "unknown",
     };
 
     rows.push(json!({
@@ -469,12 +560,14 @@ fn build_disk_encryption_rows(
 /// lsblk is unavailable (root determination then degrades to "unknown").
 #[cfg(target_os = "linux")]
 fn collect_disk_encryption() -> Value {
-    let lsblk = std::process::Command::new("lsblk")
-        .args([
-            "-J",
-            "-o",
-            "NAME,KNAME,TYPE,FSTYPE,MOUNTPOINT,MOUNTPOINTS,PKNAME",
-        ])
+    let mut lsblk_cmd = std::process::Command::new("lsblk");
+    lsblk_cmd.args([
+        "-J",
+        "-o",
+        "NAME,KNAME,TYPE,FSTYPE,MOUNTPOINT,MOUNTPOINTS,PKNAME",
+    ]);
+    apply_appimage_sanitization(&mut lsblk_cmd);
+    let lsblk = lsblk_cmd
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -491,6 +584,9 @@ enum Desktop {
     Gnome,
     Kde,
     Hyprland,
+    Cinnamon,
+    Mate,
+    Xfce,
     Unknown,
 }
 
@@ -505,6 +601,11 @@ fn detect_desktop(xdg_current_desktop: Option<&str>) -> Desktop {
             "gnome" | "unity" | "ubuntu" => return Desktop::Gnome,
             "kde" => return Desktop::Kde,
             "hyprland" => return Desktop::Hyprland,
+            // Mint sets exactly "X-Cinnamon".
+            "x-cinnamon" | "cinnamon" => return Desktop::Cinnamon,
+            "mate" => return Desktop::Mate,
+            // Xubuntu sets "xubuntu:XFCE"; a plain XFCE session sets "XFCE".
+            "xfce" => return Desktop::Xfce,
             _ => {}
         }
     }
@@ -530,12 +631,14 @@ fn parse_gsettings_uint(out: &str) -> Option<u64> {
         .and_then(|n| n.parse::<u64>().ok())
 }
 
-/// Parse the `[Daemon]` section of kscreenlockerrc: (autolock, timeout minutes).
+/// Parse the `[Daemon]` section of kscreenlockerrc: (autolock, timeout in
+/// seconds). The file stores minutes; since Plasma 6.3 as a double, so "0.5"
+/// is thirty seconds and must not round to a minute.
 #[cfg(any(target_os = "linux", test))]
 fn parse_kscreenlockerrc(text: &str) -> (Option<bool>, Option<u64>) {
     let mut in_daemon = false;
     let mut autolock = None;
-    let mut timeout_min = None;
+    let mut timeout_secs = None;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -548,12 +651,19 @@ fn parse_kscreenlockerrc(text: &str) -> (Option<bool>, Option<u64>) {
         if let Some((k, v)) = line.split_once('=') {
             match k.trim().to_ascii_lowercase().as_str() {
                 "autolock" => autolock = parse_gsettings_bool(&v.trim().to_ascii_lowercase()),
-                "timeout" => timeout_min = v.trim().parse::<u64>().ok(),
+                "timeout" => {
+                    timeout_secs = v
+                        .trim()
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|m| m.is_finite() && *m >= 0.0)
+                        .map(|m| (m * 60.0).round() as u64)
+                }
                 _ => {}
             }
         }
     }
-    (autolock, timeout_min)
+    (autolock, timeout_secs)
 }
 
 /// Parse a hypridle config for the first lock listener's timeout (seconds). A
@@ -605,8 +715,9 @@ fn parse_hypridle_config(text: &str) -> Option<u64> {
     None
 }
 
-/// Assemble the single screenlock row.
-#[cfg(any(target_os = "linux", test))]
+/// Assemble the single screenlock row. One shape for every platform: the
+/// backend reads the same five fields whichever agent sent them.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn screenlock_row(
     de: &str,
     enabled: &str,
@@ -623,30 +734,37 @@ fn screenlock_row(
     }])
 }
 
-/// GNOME screenlock row from the two gsettings values. Lock engages only when
-/// it is enabled AND the idle delay is non-zero (delay 0 = never triggers).
+/// Screen-lock row for the gsettings desktops, GNOME and Cinnamon, which
+/// share one schema shape. Lock engages only when it is enabled AND the idle
+/// delay is non-zero (0 = never triggers). The time to a locked screen is
+/// idle-delay plus lock-delay, both in seconds; reporting idle-delay alone
+/// under-reports a user who set a one-hour lock delay.
 #[cfg(any(target_os = "linux", test))]
-fn screenlock_row_gnome(lock_enabled: Option<bool>, idle_delay: Option<u64>) -> Value {
+fn screenlock_row_gsettings(
+    de: &str,
+    lock_enabled: Option<bool>,
+    idle_delay: Option<u64>,
+    lock_delay: Option<u64>,
+) -> Value {
+    let extra = lock_delay.unwrap_or(0);
     match (lock_enabled, idle_delay) {
         (Some(true), Some(d)) if d > 0 => screenlock_row(
-            "gnome",
+            de,
             "yes",
-            Some(d),
+            Some(d + extra),
             "gsettings",
-            &format!("lock-enabled=true, idle-delay={}", d),
+            &format!("lock-enabled=true, idle-delay={}, lock-delay={}", d, extra),
         ),
         (Some(true), Some(0)) => screenlock_row(
-            "gnome",
+            de,
             "no",
             Some(0),
             "gsettings",
             "lock enabled but idle-delay=0, so it never triggers",
         ),
-        (Some(false), _) => {
-            screenlock_row("gnome", "no", idle_delay, "gsettings", "lock-enabled=false")
-        }
+        (Some(false), _) => screenlock_row(de, "no", idle_delay, "gsettings", "lock-enabled=false"),
         _ => screenlock_row(
-            "gnome",
+            de,
             "unknown",
             idle_delay,
             "gsettings",
@@ -655,31 +773,96 @@ fn screenlock_row_gnome(lock_enabled: Option<bool>, idle_delay: Option<u64>) -> 
     }
 }
 
-/// KDE screenlock row from kscreenlockerrc. An absent file/key is unknown.
 #[cfg(any(target_os = "linux", test))]
-fn screenlock_row_kde(autolock: Option<bool>, timeout_min: Option<u64>) -> Value {
-    match autolock {
-        Some(true) => screenlock_row(
-            "kde",
+fn screenlock_row_gnome(
+    lock_enabled: Option<bool>,
+    idle_delay: Option<u64>,
+    lock_delay: Option<u64>,
+) -> Value {
+    screenlock_row_gsettings("gnome", lock_enabled, idle_delay, lock_delay)
+}
+
+/// MATE screen-lock row. Its units are MINUTES (org.mate.session idle-delay,
+/// org.mate.screensaver lock-delay), unlike GNOME and Cinnamon, and the
+/// saver must be both idle-activated and set to lock.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_mate(
+    idle_activation: Option<bool>,
+    lock_enabled: Option<bool>,
+    idle_delay_min: Option<u64>,
+    lock_delay_min: Option<u64>,
+) -> Value {
+    let extra = lock_delay_min.unwrap_or(0);
+    let secs = idle_delay_min.map(|m| m * 60);
+    match (idle_activation, lock_enabled, idle_delay_min) {
+        (Some(true), Some(true), Some(d)) if d > 0 => screenlock_row(
+            "mate",
             "yes",
-            timeout_min.map(|m| m * 60),
-            "kscreenlockerrc",
-            "Autolock=true",
+            Some((d + extra) * 60),
+            "gsettings",
+            &format!(
+                "idle-activation-enabled=true, lock-enabled=true, idle-delay={}min, lock-delay={}min",
+                d, extra
+            ),
         ),
-        Some(false) => screenlock_row(
+        (Some(true), Some(true), Some(0)) => screenlock_row(
+            "mate",
+            "no",
+            Some(0),
+            "gsettings",
+            "lock enabled but idle-delay=0, so it never triggers",
+        ),
+        (Some(false), _, _) => screenlock_row(
+            "mate",
+            "no",
+            secs,
+            "gsettings",
+            "idle-activation-enabled=false",
+        ),
+        (_, Some(false), _) => screenlock_row("mate", "no", secs, "gsettings", "lock-enabled=false"),
+        _ => screenlock_row("mate", "unknown", secs, "gsettings", "gsettings unavailable"),
+    }
+}
+
+/// Plasma's shipped defaults (kscreenlockersettings.kcfg): Autolock=true,
+/// Timeout=5 minutes. KConfig writes only values that differ from the
+/// schema, so an untouched, compliant machine has no key at all.
+#[cfg(any(target_os = "linux", test))]
+const KDE_DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// KDE screenlock row from kscreenlockerrc. An absent key means the Plasma
+/// default applies; it is not unknown. Reporting it as unknown left the
+/// secure majority blank and only the users who turned the lock off visible.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_kde(autolock: Option<bool>, timeout_secs: Option<u64>) -> Value {
+    let autolock_src = if autolock.is_some() {
+        "file"
+    } else {
+        "Plasma default"
+    };
+    let timeout_src = if timeout_secs.is_some() {
+        "file"
+    } else {
+        "Plasma default"
+    };
+    let timeout = timeout_secs.unwrap_or(KDE_DEFAULT_TIMEOUT_SECS);
+    let detail = format!(
+        "Autolock={} ({}), Timeout={}s ({})",
+        autolock.unwrap_or(true),
+        autolock_src,
+        timeout,
+        timeout_src
+    );
+    match (autolock.unwrap_or(true), timeout) {
+        (true, 0) => screenlock_row(
             "kde",
             "no",
-            timeout_min.map(|m| m * 60),
+            Some(0),
             "kscreenlockerrc",
-            "Autolock=false",
+            &format!("{}; a zero timeout never triggers", detail),
         ),
-        None => screenlock_row(
-            "kde",
-            "unknown",
-            None,
-            "kscreenlockerrc",
-            "no kscreenlockerrc Autolock key",
-        ),
+        (true, t) => screenlock_row("kde", "yes", Some(t), "kscreenlockerrc", &detail),
+        (false, t) => screenlock_row("kde", "no", Some(t), "kscreenlockerrc", &detail),
     }
 }
 
@@ -687,6 +870,15 @@ fn screenlock_row_kde(autolock: Option<bool>, timeout_min: Option<u64>) -> Value
 #[cfg(any(target_os = "linux", test))]
 fn screenlock_row_hyprland(lock_timeout: Option<u64>) -> Value {
     match lock_timeout {
+        // Same rule as GNOME and Windows: a lock with a zero timeout never
+        // fires, so it is not an enabled lock.
+        Some(0) => screenlock_row(
+            "hyprland",
+            "no",
+            Some(0),
+            "hypridle",
+            "lock listener has timeout 0",
+        ),
         Some(t) => screenlock_row(
             "hyprland",
             "yes",
@@ -704,32 +896,392 @@ fn screenlock_row_hyprland(lock_timeout: Option<u64>) -> Value {
     }
 }
 
+/// Read the X screensaver blank delay (seconds) from `xset q` output. The
+/// line reads "  timeout:  600    cycle:  600". light-locker locks when X
+/// blanks, so this delay is the first half of its lock time.
+#[cfg(any(target_os = "linux", test))]
+fn parse_xset_timeout(text: &str) -> Option<u64> {
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("timeout:") {
+            return rest.split_whitespace().next()?.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+/// xfce4-screensaver's own schema defaults (src/gs-prefs.h). xfconf keeps
+/// only values that differ from them, so an untouched machine answers
+/// nothing at all and every default below applies. Every one of them locks.
+#[cfg(any(target_os = "linux", test))]
+mod xfce_defaults {
+    pub const SAVER_ENABLED: bool = true;
+    pub const IDLE_ACTIVATION_ENABLED: bool = true;
+    pub const IDLE_DELAY_MIN: u64 = 5;
+    pub const LOCK_ENABLED: bool = true;
+    pub const LOCK_WITH_SAVER_ENABLED: bool = true;
+    pub const LOCK_WITH_SAVER_DELAY_MIN: u64 = 0;
+}
+
+/// XFCE screen-lock row from the xfce4-screensaver xfconf channel, which
+/// XFCE 4.16 and later ship. Four switches must all be on for an idle lock:
+/// `gs_listener` starts the saver only when `/saver/enabled` and
+/// `/saver/idle-activation/enabled` are true, and `add_lock_timer` schedules
+/// the lock only when `/lock/enabled` and `/lock/saver-activation/enabled`
+/// are true. Both delays are in MINUTES. An absent key means the shipped
+/// default, not unknown: reporting unknown would leave every compliant
+/// machine blank, the defect the KDE row already had.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_xfce_screensaver(
+    saver_enabled: Option<bool>,
+    idle_activation: Option<bool>,
+    idle_delay_min: Option<u64>,
+    lock_enabled: Option<bool>,
+    lock_with_saver: Option<bool>,
+    lock_delay_min: Option<u64>,
+) -> Value {
+    let saver = saver_enabled.unwrap_or(xfce_defaults::SAVER_ENABLED);
+    let idle_act = idle_activation.unwrap_or(xfce_defaults::IDLE_ACTIVATION_ENABLED);
+    let idle = idle_delay_min.unwrap_or(xfce_defaults::IDLE_DELAY_MIN);
+    let lock = lock_enabled.unwrap_or(xfce_defaults::LOCK_ENABLED);
+    let lock_saver = lock_with_saver.unwrap_or(xfce_defaults::LOCK_WITH_SAVER_ENABLED);
+    let grace = lock_delay_min.unwrap_or(xfce_defaults::LOCK_WITH_SAVER_DELAY_MIN);
+    let detail = format!(
+        "saver={}, idle-activation={}, idle-delay={}min, lock={}, \
+         lock-on-saver={}, lock-delay={}min",
+        saver, idle_act, idle, lock, lock_saver, grace
+    );
+    let total = (idle + grace) * 60;
+    if !saver || !idle_act || !lock || !lock_saver {
+        return screenlock_row("xfce", "no", Some(total), "xfce4-screensaver", &detail);
+    }
+    if idle == 0 {
+        return screenlock_row(
+            "xfce",
+            "no",
+            Some(0),
+            "xfce4-screensaver",
+            &format!("{}; idle-delay=0, so it never triggers", detail),
+        );
+    }
+    screenlock_row("xfce", "yes", Some(total), "xfce4-screensaver", &detail)
+}
+
+/// light-locker's own default when the flag is absent (src/gs-monitor.c).
+#[cfg(any(target_os = "linux", test))]
+const LIGHT_LOCKER_DEFAULT_LOCK_AFTER: u64 = 5;
+
+/// Read light-locker's lock delay (SECONDS) from its autostart entry, or
+/// None when the entry is disabled. light-locker keeps no settings file: it
+/// takes `--lock-after-screensaver=S` on the command line, and
+/// light-locker-settings writes that flag into the autostart entry.
+#[cfg(any(target_os = "linux", test))]
+fn parse_light_locker_autostart(text: &str) -> Option<u64> {
+    let mut exec = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("Hidden=") {
+            if v.trim().eq_ignore_ascii_case("true") {
+                return None;
+            }
+        }
+        if let Some(v) = line.strip_prefix("Exec=") {
+            exec = Some(v.trim().to_string());
+        }
+    }
+    let exec = exec?;
+    Some(
+        exec.split_whitespace()
+            .find_map(|a| a.strip_prefix("--lock-after-screensaver="))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(LIGHT_LOCKER_DEFAULT_LOCK_AFTER),
+    )
+}
+
+/// XFCE screen-lock row for light-locker, the locker XFCE 4.12 to 4.14 ship
+/// and Debian still installs. light-locker holds no idle timer of its own:
+/// it locks `lock-after-screensaver` seconds after the X screensaver blanks.
+/// A zero X timeout means X never blanks, so the lock never fires.
+#[cfg(any(target_os = "linux", test))]
+fn screenlock_row_light_locker(
+    lock_after_screensaver: Option<u64>,
+    blank_timeout: Option<u64>,
+) -> Value {
+    let detail = format!(
+        "lock-after-screensaver={}, X blank timeout={}",
+        fmt_opt(lock_after_screensaver),
+        fmt_opt(blank_timeout)
+    );
+    match (lock_after_screensaver, blank_timeout) {
+        (None, _) => screenlock_row(
+            "xfce",
+            "no",
+            None,
+            "light-locker",
+            &format!("{}; the autostart entry is disabled", detail),
+        ),
+        (_, None) => screenlock_row(
+            "xfce",
+            "unknown",
+            None,
+            "light-locker",
+            &format!("{}; xset gave no timeout", detail),
+        ),
+        (_, Some(0)) => screenlock_row(
+            "xfce",
+            "no",
+            Some(0),
+            "light-locker",
+            &format!("{}; X never blanks, so the lock never fires", detail),
+        ),
+        (Some(after), Some(blank)) => {
+            screenlock_row("xfce", "yes", Some(blank + after), "light-locker", &detail)
+        }
+    }
+}
+
+/// `gsettings get <schema> <key>` as the desktop sees it. gsettings is a GLib
+/// program. From an AppImage it must not load the bundled libgio, whose
+/// module directory holds no dconf backend: it then answers with schema
+/// defaults, a false "yes".
+#[cfg(target_os = "linux")]
+fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("gsettings");
+    cmd.args(["get", schema, key]);
+    apply_appimage_sanitization(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_bool(schema: &str, key: &str) -> Option<bool> {
+    gsettings_get(schema, key).and_then(|s| parse_gsettings_bool(&s))
+}
+
+#[cfg(target_os = "linux")]
+fn gsettings_uint(schema: &str, key: &str) -> Option<u64> {
+    gsettings_get(schema, key).and_then(|s| parse_gsettings_uint(&s))
+}
+
+/// The .desktop file the deep-link plugin writes for the scheme handler. It
+/// names the file after the running executable, so we must build the same
+/// name to repeat its `xdg-mime default` step.
+#[cfg(any(target_os = "linux", test))]
+fn deep_link_handler_desktop_file(exe_file_name: &str) -> String {
+    format!("{}-handler.desktop", exe_file_name)
+}
+
+/// Point `x-scheme-handler/klaayguard` at our .desktop file again, with the
+/// AppImage library paths stripped.
+///
+/// The deep-link plugin writes the .desktop file itself, then spawns
+/// `update-desktop-database` and `xdg-mime` with our environment. From an
+/// AppImage those inherit the bundled `LD_LIBRARY_PATH`, and `xdg-mime` is a
+/// shell script that runs more system binaries: they fail to start, the
+/// scheme stays unregistered, and sign-in never returns to the app. The
+/// plugin gives no way to set a child environment, so repeat its two
+/// commands here. Both are idempotent.
+#[cfg(target_os = "linux")]
+fn repair_deep_link_registration(app: &tauri::AppHandle) {
+    if std::env::var("APPDIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return; // Not an AppImage: the plugin's own spawns are already clean.
+    }
+    let Ok(exe) = tauri::utils::platform::current_exe() else {
+        log::warn!("deep_link repair: no current_exe");
+        return;
+    };
+    let Some(file_name) = exe
+        .file_name()
+        .map(|n| deep_link_handler_desktop_file(&n.to_string_lossy()))
+    else {
+        return;
+    };
+    let Ok(target) = app.path().data_dir().map(|d| d.join("applications")) else {
+        log::warn!("deep_link repair: no data dir");
+        return;
+    };
+    let mut update = std::process::Command::new("update-desktop-database");
+    update.arg(&target);
+    apply_appimage_sanitization(&mut update);
+    if let Err(e) = update.status() {
+        log::warn!("deep_link repair: update-desktop-database failed: {}", e);
+    }
+    let mut mime = std::process::Command::new("xdg-mime");
+    mime.args(["default", &file_name, "x-scheme-handler/klaayguard"]);
+    apply_appimage_sanitization(&mut mime);
+    match mime.status() {
+        Ok(s) if s.success() => log::info!("deep_link repair: {} is the handler", file_name),
+        Ok(s) => {
+            log::error!("deep_link repair: xdg-mime exited {}", s);
+            sentry::capture_message("deep_link_repair_xdg_mime_failed", Level::Error);
+        }
+        Err(e) => {
+            log::error!("deep_link repair: xdg-mime failed: {}", e);
+            sentry::capture_message("deep_link_repair_xdg_mime_failed", Level::Error);
+        }
+    }
+}
+
+/// `xfconf-query -c <channel> -p <property>` as the desktop sees it. It
+/// prints "true"/"false" for bools and a bare number for ints, so the
+/// gsettings parsers read both. An unset property exits non-zero, which the
+/// success filter turns into None.
+#[cfg(target_os = "linux")]
+fn xfconf_get(channel: &str, property: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("xfconf-query");
+    cmd.args(["-c", channel, "-p", property]);
+    apply_appimage_sanitization(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+#[cfg(target_os = "linux")]
+fn xfconf_bool(channel: &str, property: &str) -> Option<bool> {
+    xfconf_get(channel, property).and_then(|s| parse_gsettings_bool(&s))
+}
+
+#[cfg(target_os = "linux")]
+fn xfconf_uint(channel: &str, property: &str) -> Option<u64> {
+    xfconf_get(channel, property).and_then(|s| parse_gsettings_uint(&s))
+}
+
+/// The X screensaver blank delay in seconds, from `xset q`.
+#[cfg(target_os = "linux")]
+fn xset_blank_timeout() -> Option<u64> {
+    let mut cmd = std::process::Command::new("xset");
+    cmd.arg("q");
+    apply_appimage_sanitization(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| parse_xset_timeout(&s))
+}
+
+/// Whether a program is on this session's PATH.
+#[cfg(target_os = "linux")]
+fn binary_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+/// The first readable autostart entry for `file_name`: the user's copy in
+/// ~/.config/autostart hides the system one in /etc/xdg/autostart.
+#[cfg(target_os = "linux")]
+fn read_autostart_entry(file_name: &str) -> Option<String> {
+    dirs::config_dir()
+        .map(|c| c.join("autostart").join(file_name))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .or_else(|| {
+            std::fs::read_to_string(std::path::Path::new("/etc/xdg/autostart").join(file_name)).ok()
+        })
+}
+
+/// XFCE screen-lock posture. XFCE ships two lockers and only one runs: XFCE
+/// 4.16 and later use xfce4-screensaver, XFCE 4.12 to 4.14 use light-locker.
+/// Dispatch on which binary is installed, never on which xfconf keys answer:
+/// on an untouched machine xfce4-screensaver has written no key at all, so a
+/// key probe would send every compliant desktop down the light-locker path.
+#[cfg(target_os = "linux")]
+fn collect_screenlock_xfce() -> Value {
+    if binary_on_path("xfce4-screensaver") {
+        return screenlock_row_xfce_screensaver(
+            xfconf_bool("xfce4-screensaver", "/saver/enabled"),
+            xfconf_bool("xfce4-screensaver", "/saver/idle-activation/enabled"),
+            xfconf_uint("xfce4-screensaver", "/saver/idle-activation/delay"),
+            xfconf_bool("xfce4-screensaver", "/lock/enabled"),
+            xfconf_bool("xfce4-screensaver", "/lock/saver-activation/enabled"),
+            xfconf_uint("xfce4-screensaver", "/lock/saver-activation/delay"),
+        );
+    }
+    if binary_on_path("light-locker") {
+        return screenlock_row_light_locker(
+            read_autostart_entry("light-locker.desktop")
+                .as_deref()
+                .and_then(parse_light_locker_autostart),
+            xset_blank_timeout(),
+        );
+    }
+    screenlock_row(
+        "xfce",
+        "unknown",
+        None,
+        "none",
+        "neither xfce4-screensaver nor light-locker is installed",
+    )
+}
+
+/// Hyprland and sway run no XDG autostart: the entry is written, nothing
+/// reads it, the agent starts once and the device goes quiet, which the
+/// dashboard cannot tell from a laptop in a drawer. GNOME, KDE, Cinnamon and
+/// MATE run the entries themselves; on the rest, an inactive
+/// xdg-desktop-autostart.target means no session component will either.
+#[cfg(target_os = "linux")]
+fn warn_if_autostart_unserved() {
+    let desktop = detect_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref());
+    if !matches!(desktop, Desktop::Hyprland | Desktop::Unknown) {
+        return;
+    }
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(["--user", "is-active", "xdg-desktop-autostart.target"]);
+    apply_appimage_sanitization(&mut cmd);
+    let active = cmd
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "active")
+        .unwrap_or(false);
+    if !active {
+        log::warn!(
+            "autostart: desktop {:?} runs no XDG autostart and xdg-desktop-autostart.target is inactive; \
+             the agent will not start at next login unless the session runs ~/.config/autostart (uwsm, dex, exec-once)",
+            desktop
+        );
+        sentry::capture_message("autostart_unserved", Level::Warning);
+    }
+}
+
 /// Collect Linux screen-lock posture (unprivileged) for the current desktop.
+/// Dispatch is on XDG_CURRENT_DESKTOP, never on which schemas exist: Mint
+/// installs the Cinnamon schemas on its MATE and XFCE editions too, so a
+/// Cinnamon query answers there with a meaningless "true".
 #[cfg(target_os = "linux")]
 fn collect_screenlock() -> Value {
     match detect_desktop(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref()) {
-        Desktop::Gnome => {
-            let lock = std::process::Command::new("gsettings")
-                .args(["get", "org.gnome.desktop.screensaver", "lock-enabled"])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|s| parse_gsettings_bool(&s));
-            let delay = std::process::Command::new("gsettings")
-                .args(["get", "org.gnome.desktop.session", "idle-delay"])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|s| parse_gsettings_uint(&s));
-            screenlock_row_gnome(lock, delay)
-        }
+        Desktop::Gnome => screenlock_row_gnome(
+            gsettings_bool("org.gnome.desktop.screensaver", "lock-enabled"),
+            gsettings_uint("org.gnome.desktop.session", "idle-delay"),
+            gsettings_uint("org.gnome.desktop.screensaver", "lock-delay"),
+        ),
+        Desktop::Cinnamon => screenlock_row_gsettings(
+            "cinnamon",
+            gsettings_bool("org.cinnamon.desktop.screensaver", "lock-enabled"),
+            gsettings_uint("org.cinnamon.desktop.session", "idle-delay"),
+            gsettings_uint("org.cinnamon.desktop.screensaver", "lock-delay"),
+        ),
+        Desktop::Mate => screenlock_row_mate(
+            gsettings_bool("org.mate.screensaver", "idle-activation-enabled"),
+            gsettings_bool("org.mate.screensaver", "lock-enabled"),
+            gsettings_uint("org.mate.session", "idle-delay"),
+            gsettings_uint("org.mate.screensaver", "lock-delay"),
+        ),
         Desktop::Kde => {
-            let text = dirs::config_dir()
-                .map(|c| c.join("kscreenlockerrc"))
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .unwrap_or_default();
-            let (autolock, timeout_min) = parse_kscreenlockerrc(&text);
-            screenlock_row_kde(autolock, timeout_min)
+            // Admin policy in /etc/xdg applies under the user's file.
+            let read = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap_or_default();
+            let (sys_autolock, sys_timeout) =
+                parse_kscreenlockerrc(&read("/etc/xdg/kscreenlockerrc".into()));
+            let (autolock, timeout_secs) = dirs::config_dir()
+                .map(|c| parse_kscreenlockerrc(&read(c.join("kscreenlockerrc"))))
+                .unwrap_or((None, None));
+            screenlock_row_kde(autolock.or(sys_autolock), timeout_secs.or(sys_timeout))
         }
         Desktop::Hyprland => {
             let text = dirs::config_dir()
@@ -738,6 +1290,7 @@ fn collect_screenlock() -> Value {
                 .unwrap_or_default();
             screenlock_row_hyprland(parse_hypridle_config(&text))
         }
+        Desktop::Xfce => collect_screenlock_xfce(),
         Desktop::Unknown => screenlock_row(
             "unknown",
             "unknown",
@@ -746,6 +1299,551 @@ fn collect_screenlock() -> Value {
             "no recognized XDG_CURRENT_DESKTOP",
         ),
     }
+}
+
+/// Spawn flag for a child of this windowless process: no console window.
+/// `/S`, not this flag, is what makes an installer silent; this only stops a
+/// console flashing when the agent itself was started from one.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The BitLocker state of one volume as Explorer reads it: the shell property
+/// `System.Volume.BitLockerProtection` (PKEY {2d15a9a1-a556-4189-91ad-027458f11a07} 1717).
+/// Unlike `Win32_EncryptableVolume`, `manage-bde`, and `Get-BitLockerVolume`,
+/// this needs no elevation; it is what draws the padlock in File Explorer.
+/// Verified on Windows 11 22621 against Get-BitLockerVolume: 2 = fully
+/// decrypted, 7 = encryption pending a restart, 3 = encrypting (protection
+/// still off), 1 = fully encrypted and on, 5 = suspended (encrypted, key in
+/// the clear). 4 and 6 follow the same numbering and are not yet observed.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BitLockerProtection {
+    /// 1: fully encrypted and protection on.
+    On,
+    /// 2: not encrypted.
+    Off,
+    /// 3: encryption in progress.
+    Encrypting,
+    /// 4: decryption in progress.
+    Decrypting,
+    /// 5: encrypted but protection suspended; the key is in the clear.
+    Suspended,
+    /// 6: encrypted and locked (no key available in this session).
+    Locked,
+    /// 7: encryption chosen, waiting for the restart that starts it.
+    PendingRestart,
+    Other(i64),
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_bitlocker_protection(raw: Option<&str>) -> Option<BitLockerProtection> {
+    let n = raw?.trim().parse::<i64>().ok()?;
+    Some(match n {
+        1 => BitLockerProtection::On,
+        2 => BitLockerProtection::Off,
+        3 => BitLockerProtection::Encrypting,
+        4 => BitLockerProtection::Decrypting,
+        5 => BitLockerProtection::Suspended,
+        6 => BitLockerProtection::Locked,
+        7 => BitLockerProtection::PendingRestart,
+        other => BitLockerProtection::Other(other),
+    })
+}
+
+/// Windows disk-encryption summary row, in the shape the Linux builtin emits
+/// so the backend reads one shape. Only a fully protected volume is "yes":
+/// a suspended volume has its key in the clear, and a volume still
+/// encrypting is not yet protected. An unreadable property is "unknown",
+/// never a false "no"; `unreadable_reason` says why, so a fleet whose
+/// application-control policy blocks the read is distinguishable from a
+/// property that is genuinely missing.
+#[cfg(any(target_os = "windows", test))]
+fn windows_disk_encryption_rows(
+    drive: &str,
+    status: Option<BitLockerProtection>,
+    unreadable_reason: &str,
+) -> Value {
+    let (root_encrypted, mechanism, detail) = match status {
+        Some(BitLockerProtection::On) => ("yes", "bitlocker", "protection on".to_string()),
+        Some(BitLockerProtection::Locked) => ("yes", "bitlocker", "encrypted, locked".to_string()),
+        Some(BitLockerProtection::Off) => ("no", "none", "not encrypted".to_string()),
+        Some(BitLockerProtection::Suspended) => (
+            "no",
+            "bitlocker",
+            "protection suspended; key in the clear".to_string(),
+        ),
+        Some(BitLockerProtection::Encrypting) => {
+            ("no", "bitlocker", "encryption in progress".to_string())
+        }
+        Some(BitLockerProtection::Decrypting) => {
+            ("no", "bitlocker", "decryption in progress".to_string())
+        }
+        Some(BitLockerProtection::PendingRestart) => {
+            ("no", "none", "encryption pending a restart".to_string())
+        }
+        Some(BitLockerProtection::Other(n)) => (
+            "unknown",
+            "bitlocker",
+            format!("unrecognised BitLockerProtection value {}", n),
+        ),
+        None => (
+            "unknown",
+            "none",
+            if unreadable_reason.is_empty() {
+                "System.Volume.BitLockerProtection not readable".to_string()
+            } else {
+                format!(
+                    "System.Volume.BitLockerProtection not readable: {}",
+                    unreadable_reason
+                )
+            },
+        ),
+    };
+    json!([
+        {
+            "kind": "volume",
+            "name": drive,
+            "root_encrypted": root_encrypted,
+            "mechanism": mechanism,
+            "detail": detail,
+            "source": "shell_property"
+        },
+        {
+            "kind": "summary",
+            "root_encrypted": root_encrypted,
+            "home_encrypted": root_encrypted,
+            "mechanisms": if mechanism == "none" { json!([]) } else { json!([mechanism]) },
+            "source": "aggregate"
+        }
+    ])
+}
+
+/// Read the shell property for the system drive through PowerShell. The
+/// Shell COM object is the same path Explorer uses and needs no elevation.
+/// A spawn every 15 minutes is cheap; a COM binding in Rust is not worth it.
+/// Under AppLocker/WDAC PowerShell runs in ConstrainedLanguage mode, where
+/// `New-Object -ComObject` is refused; that case exits 3 so the row can say
+/// the policy, not the property, is what blocked the read.
+#[cfg(target_os = "windows")]
+fn read_bitlocker_protection(drive: &str) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    let script = format!(
+        "if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {{ exit 3 }}; \
+         (New-Object -ComObject Shell.Application).NameSpace('{}').Self.ExtendedProperty('System.Volume.BitLockerProtection')",
+        drive
+    );
+    let out = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("powershell spawn failed: {}", e))?;
+    if out.status.code() == Some(3) {
+        return Err("blocked by application control (PowerShell ConstrainedLanguage)".to_string());
+    }
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        log::warn!(
+            "bitlocker property read failed ({}): {}",
+            out.status,
+            stderr
+        );
+        return Err(format!("powershell {}", out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        Err("empty property".to_string())
+    } else {
+        Ok(text)
+    }
+}
+
+/// Collect Windows disk-encryption posture for the system drive, unprivileged.
+#[cfg(target_os = "windows")]
+fn collect_disk_encryption_windows() -> Value {
+    let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    match read_bitlocker_protection(&drive) {
+        Ok(raw) => {
+            windows_disk_encryption_rows(&drive, parse_bitlocker_protection(Some(raw.as_str())), "")
+        }
+        Err(reason) => {
+            log::warn!("bitlocker: {}", reason);
+            add_breadcrumb(
+                "collection",
+                &format!("bitlocker_unreadable: {}", reason),
+                Level::Warning,
+            );
+            windows_disk_encryption_rows(&drive, None, &reason)
+        }
+    }
+}
+
+/// The local account password and lockout policy, as `NetUserModalsGet`
+/// returns it (levels 0 and 3). Ages and durations are seconds; the API
+/// uses u32::MAX (TIMEQ_FOREVER) for "never".
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PasswordPolicy {
+    min_password_len: u32,
+    max_password_age_secs: u32,
+    min_password_age_secs: u32,
+    password_history_len: u32,
+    lockout_threshold: u32,
+    lockout_duration_secs: u32,
+    lockout_window_secs: u32,
+}
+
+#[cfg(any(target_os = "windows", test))]
+const TIMEQ_FOREVER: u32 = u32::MAX;
+
+/// Seconds to whole units of `unit_secs`, or None for "never" (TIMEQ_FOREVER).
+#[cfg(any(target_os = "windows", test))]
+fn policy_units(secs: u32, unit_secs: u64) -> Option<u64> {
+    (secs != TIMEQ_FOREVER).then(|| u64::from(secs) / unit_secs)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn policy_days(secs: u32) -> Option<u64> {
+    policy_units(secs, 86_400)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn policy_minutes(secs: u32) -> Option<u64> {
+    policy_units(secs, 60)
+}
+
+/// One row describing the local password and lockout policy. A lockout
+/// threshold of 0 means accounts never lock; a null maximum age means
+/// passwords never expire. An unreadable policy is one "unknown" row, never a
+/// row of zeros that reads as "no policy". `NetUserModalsGet(NULL, ..)` reads
+/// the local SAM, which governs local accounts only; `scope` says whether the
+/// machine is domain-joined (its users' passwords are ruled by the domain, not
+/// these numbers) so the backend does not grade a domain user by local
+/// defaults.
+#[cfg(any(target_os = "windows", test))]
+fn password_policy_rows(policy: Option<PasswordPolicy>, scope: &str) -> Value {
+    match policy {
+        Some(p) => json!([{
+            "minimum_password_length": p.min_password_len,
+            "maximum_password_age_days": policy_days(p.max_password_age_secs),
+            "minimum_password_age_days": policy_days(p.min_password_age_secs),
+            "password_history_size": p.password_history_len,
+            "lockout_threshold": p.lockout_threshold,
+            "lockout_duration_minutes": policy_minutes(p.lockout_duration_secs),
+            "lockout_window_minutes": policy_minutes(p.lockout_window_secs),
+            "policy_of": "local_accounts",
+            "scope": scope,
+            "status": "ok",
+            "source": "NetUserModalsGet"
+        }]),
+        None => json!([{
+            "status": "unknown",
+            "scope": scope,
+            "source": "NetUserModalsGet",
+            "detail": "NetUserModalsGet failed"
+        }]),
+    }
+}
+
+/// Whether this machine is joined to an AD domain ("domain"), stands alone
+/// ("local"), or cannot say. Entra-only joins report "local": telling them
+/// apart needs NetGetAadJoinInformation and another windows-sys feature.
+#[cfg(target_os = "windows")]
+fn read_join_scope() -> &'static str {
+    use windows_sys::Win32::NetworkManagement::NetManagement::{
+        NetApiBufferFree, NetGetJoinInformation, NetSetupDomainName, NetSetupUnjoined,
+        NetSetupWorkgroupName, NETSETUP_JOIN_STATUS,
+    };
+    let mut name: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let mut status: NETSETUP_JOIN_STATUS = 0;
+    // SAFETY: NetGetJoinInformation allocates the name buffer, which is never
+    // read and is released with NetApiBufferFree; a non-zero return leaves
+    // both out-parameters untouched.
+    unsafe {
+        if NetGetJoinInformation(std::ptr::null(), &mut name, &mut status) != 0 {
+            return "unknown";
+        }
+        if !name.is_null() {
+            NetApiBufferFree(name as *const std::ffi::c_void);
+        }
+    }
+    // The windows-sys constants are not upper-case, so a match pattern on
+    // them trips `non_upper_case_globals` under CI's -D warnings.
+    if status == NetSetupDomainName {
+        "domain"
+    } else if status == NetSetupWorkgroupName || status == NetSetupUnjoined {
+        "local"
+    } else {
+        "unknown"
+    }
+}
+
+/// Read the local password and lockout policy. `NetUserModalsGet` levels 0
+/// and 3 need no elevation. Every failure path returns None.
+#[cfg(target_os = "windows")]
+fn read_password_policy() -> Option<PasswordPolicy> {
+    use windows_sys::Win32::NetworkManagement::NetManagement::{
+        NetApiBufferFree, NetUserModalsGet, USER_MODALS_INFO_0, USER_MODALS_INFO_3,
+    };
+    // SAFETY: NetUserModalsGet allocates the buffer; it is read once as the
+    // struct the requested level documents, then released with
+    // NetApiBufferFree. A non-zero status leaves the pointer untouched.
+    unsafe {
+        let mut p0: *mut u8 = std::ptr::null_mut();
+        if NetUserModalsGet(std::ptr::null(), 0, &mut p0) != 0 || p0.is_null() {
+            return None;
+        }
+        let m0 = *(p0 as *const USER_MODALS_INFO_0);
+        NetApiBufferFree(p0 as *const std::ffi::c_void);
+
+        let mut p3: *mut u8 = std::ptr::null_mut();
+        if NetUserModalsGet(std::ptr::null(), 3, &mut p3) != 0 || p3.is_null() {
+            return None;
+        }
+        let m3 = *(p3 as *const USER_MODALS_INFO_3);
+        NetApiBufferFree(p3 as *const std::ffi::c_void);
+
+        Some(PasswordPolicy {
+            min_password_len: m0.usrmod0_min_passwd_len,
+            max_password_age_secs: m0.usrmod0_max_passwd_age,
+            min_password_age_secs: m0.usrmod0_min_passwd_age,
+            password_history_len: m0.usrmod0_password_hist_len,
+            lockout_threshold: m3.usrmod3_lockout_threshold,
+            lockout_duration_secs: m3.usrmod3_lockout_duration,
+            lockout_window_secs: m3.usrmod3_lockout_observation_window,
+        })
+    }
+}
+
+/// Collect the Windows password and lockout policy, unprivileged.
+#[cfg(target_os = "windows")]
+fn collect_password_policy_windows() -> Value {
+    password_policy_rows(read_password_policy(), read_join_scope())
+}
+
+/// The screensaver values one registry key can carry, as raw REG_SZ text.
+/// Windows stores them as text, not DWORDs. An absent value stays None so the
+/// parser can tell "not set" from "set to zero".
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default, Clone, PartialEq)]
+struct ScreenSaverValues {
+    active: Option<String>,          // ScreenSaveActive     "1" / "0"
+    secure: Option<String>,          // ScreenSaverIsSecure  "1" / "0"
+    timeout_seconds: Option<String>, // ScreenSaveTimeOut    seconds as text
+    exe: Option<String>,             // SCRNSAVE.EXE         the saver; absent = "(None)"
+}
+
+/// Every screen-lock source on a Windows host, as raw text. The IO wrapper
+/// fills it; every decision below is pure and unit-tested on any host. The
+/// screen-saver policies are user-scope only (ControlPanelDisplay.admx), so
+/// there is no machine key to read: a value under HKLM\...\Control Panel\
+/// Desktop is never applied by Windows and must not outrank the real ones.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default, Clone, PartialEq)]
+struct WindowsScreenLockInputs {
+    /// HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+    /// InactivityTimeoutSecs: the machine inactivity limit, in seconds.
+    inactivity_timeout_secs: Option<String>,
+    /// HKCU\Software\Policies\Microsoft\Windows\Control Panel\Desktop
+    user_policy: ScreenSaverValues,
+    /// HKCU\Control Panel\Desktop
+    user_preference: ScreenSaverValues,
+}
+
+/// Parse a REG_SZ boolean ("1" or "0"). Anything else is unknown, never a
+/// silent "no".
+#[cfg(any(target_os = "windows", test))]
+fn parse_reg_sz_bool(raw: Option<&str>) -> Option<bool> {
+    match raw?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a REG_SZ unsigned number ("600"). Empty or non-numeric is unknown.
+#[cfg(any(target_os = "windows", test))]
+fn parse_reg_sz_u64(raw: Option<&str>) -> Option<u64> {
+    raw?.trim().parse::<u64>().ok()
+}
+
+/// One parsed value and the key that supplied it.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq)]
+struct Sourced<T> {
+    value: Option<T>,
+    source: &'static str,
+}
+
+/// Pick the first key, by policy precedence, that sets one value. Windows
+/// applies policy PER VALUE, not per key: a policy that sets only
+/// ScreenSaverIsSecure leaves the user's own timeout in effect. A first-key-
+/// wins rule would report "unknown" on the most common managed setup.
+#[cfg(any(target_os = "windows", test))]
+fn first_set<'a, T>(
+    ranked: &[(&'static str, &'a ScreenSaverValues)],
+    field: fn(&'a ScreenSaverValues) -> Option<&'a str>,
+    parse: fn(Option<&str>) -> Option<T>,
+) -> Sourced<T> {
+    for (source, values) in ranked {
+        if let Some(raw) = field(values) {
+            return Sourced {
+                value: parse(Some(raw)),
+                source,
+            };
+        }
+    }
+    Sourced {
+        value: None,
+        source: "none",
+    }
+}
+
+/// Windows screenlock row. Decision order:
+/// 1. A machine inactivity limit above zero locks the console whatever the
+///    screensaver says, so it answers "yes" outright.
+/// 2. Otherwise the screensaver must be active, must ask for a password,
+///    must have a non-zero timeout, and a saver must be selected: Windows
+///    runs no saver, and so never locks, when SCRNSAVE.EXE is unset, whatever
+///    the other three say. Any definite failure is "no"; a missing value is
+///    "unknown". A definite "no" beats "unknown", so a saver that never asks
+///    for a password is reported even when its timeout is unset.
+#[cfg(any(target_os = "windows", test))]
+fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
+    if let Some(secs) = parse_reg_sz_u64(inputs.inactivity_timeout_secs.as_deref()) {
+        if secs > 0 {
+            return screenlock_row(
+                "windows",
+                "yes",
+                Some(secs),
+                "machine_inactivity_policy",
+                &format!("InactivityTimeoutSecs={}", secs),
+            );
+        }
+    }
+    let ranked = [
+        ("user_policy", &inputs.user_policy),
+        ("user", &inputs.user_preference),
+    ];
+    let active = first_set(&ranked, |v| v.active.as_deref(), parse_reg_sz_bool);
+    let secure = first_set(&ranked, |v| v.secure.as_deref(), parse_reg_sz_bool);
+    let timeout = first_set(&ranked, |v| v.timeout_seconds.as_deref(), parse_reg_sz_u64);
+    let exe = first_set(&ranked, |v| v.exe.as_deref(), parse_reg_sz_path);
+    let detail = format!(
+        "ScreenSaveActive={}({}) ScreenSaverIsSecure={}({}) ScreenSaveTimeOut={}({}) SCRNSAVE.EXE={}({})",
+        fmt_opt(active.value),
+        active.source,
+        fmt_opt(secure.value),
+        secure.source,
+        fmt_opt(timeout.value),
+        timeout.source,
+        fmt_opt(exe.value.clone()),
+        exe.source
+    );
+    // The highest-ranking key that contributed anything names the source.
+    let source = [active.source, secure.source, timeout.source, exe.source]
+        .into_iter()
+        .min_by_key(|s| match *s {
+            "user_policy" => 0,
+            "user" => 1,
+            _ => 2,
+        })
+        .unwrap_or("none");
+    if source == "none" {
+        return screenlock_row(
+            "windows",
+            "unknown",
+            None,
+            "none",
+            "no screen-lock policy and no screen saver values found",
+        );
+    }
+    if active.value == Some(false) || secure.value == Some(false) {
+        return screenlock_row("windows", "no", timeout.value, source, &detail);
+    }
+    if timeout.value == Some(0) {
+        // Mirrors the GNOME idle-delay=0 rule: a lock that never triggers is
+        // not a lock.
+        return screenlock_row("windows", "no", Some(0), source, &detail);
+    }
+    match (active.value, secure.value, timeout.value) {
+        (Some(true), Some(true), Some(t)) if exe.value.is_none() => screenlock_row(
+            "windows",
+            "no",
+            Some(t),
+            source,
+            &format!(
+                "{} (no screen saver selected, so none runs and nothing locks)",
+                detail
+            ),
+        ),
+        (Some(true), Some(true), Some(t)) => {
+            screenlock_row("windows", "yes", Some(t), source, &detail)
+        }
+        _ => screenlock_row("windows", "unknown", timeout.value, source, &detail),
+    }
+}
+
+/// Parse a REG_SZ path (SCRNSAVE.EXE). Empty text means no saver.
+#[cfg(any(target_os = "windows", test))]
+fn parse_reg_sz_path(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
+fn fmt_opt<T: std::fmt::Display>(v: Option<T>) -> String {
+    v.map(|x| x.to_string())
+        .unwrap_or_else(|| "unset".to_string())
+}
+
+/// Read one registry value as text. REG_SZ comes back as is; a REG_DWORD is
+/// rendered as decimal, because some management tools write the inactivity
+/// limit either way. A missing key, a missing value, or a wrong type all stay
+/// None, so the parser reports "unknown" and never a false "no".
+#[cfg(target_os = "windows")]
+fn reg_value_text(root: winreg::HKEY, path: &str, name: &str) -> Option<String> {
+    let key = winreg::RegKey::predef(root).open_subkey(path).ok()?;
+    if let Ok(s) = key.get_value::<String, _>(name) {
+        return Some(s);
+    }
+    key.get_value::<u32, _>(name).ok().map(|n| n.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn read_screensaver_values(root: winreg::HKEY, path: &str) -> ScreenSaverValues {
+    ScreenSaverValues {
+        active: reg_value_text(root, path, "ScreenSaveActive"),
+        secure: reg_value_text(root, path, "ScreenSaverIsSecure"),
+        timeout_seconds: reg_value_text(root, path, "ScreenSaveTimeOut"),
+        exe: reg_value_text(root, path, "SCRNSAVE.EXE"),
+    }
+}
+
+/// Read every screen-lock source from the registry. All three keys are
+/// readable without administrator rights. The build is x64, so no WOW64
+/// redirection applies to HKLM\SOFTWARE.
+#[cfg(target_os = "windows")]
+fn read_windows_screenlock_inputs() -> WindowsScreenLockInputs {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    WindowsScreenLockInputs {
+        inactivity_timeout_secs: reg_value_text(
+            HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+            "InactivityTimeoutSecs",
+        ),
+        user_policy: read_screensaver_values(
+            HKEY_CURRENT_USER,
+            r"Software\Policies\Microsoft\Windows\Control Panel\Desktop",
+        ),
+        user_preference: read_screensaver_values(HKEY_CURRENT_USER, r"Control Panel\Desktop"),
+    }
+}
+
+/// Collect Windows screen-lock posture, unprivileged.
+#[cfg(target_os = "windows")]
+fn collect_screenlock_windows() -> Value {
+    windows_screenlock_row(&read_windows_screenlock_inputs())
 }
 
 /// Flatten osquery results into JSON:API resources, stamping each row with collected_at.
@@ -773,19 +1871,30 @@ fn build_payload_items(
     items
 }
 
+/// An HTTP client with the agent's User-Agent and connection deadlines. reqwest
+/// sets none by default, and a peer that keeps the TCP connection alive but
+/// never answers (a proxy that accepts and stalls) is the case nothing else
+/// catches; the loops that await these requests would otherwise stop for good.
+/// `overall` bounds the whole request for small exchanges; without it, the
+/// read timeout bounds silence on a body stream, so a slow but live installer
+/// download is not cut off.
+fn http_client(overall: Option<Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("KlaayGuard/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60));
+    if let Some(t) = overall {
+        builder = builder.timeout(t);
+    }
+    builder.build().expect("reqwest client")
+}
+
 /// Returns true only when the API positively rejects the token (401/403). Network
 /// errors, timeouts, or any other status return false ("not definitely invalid") so a
 /// transient blip never blocks a legitimate sign-in — the collection loop's own 401
 /// handling stays the backstop for a token that later turns out bad.
 async fn token_definitely_invalid(base: &str, token: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .user_agent(concat!("KlaayGuard/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let client = http_client(Some(Duration::from_secs(10)));
     match client
         .get(format!("{}/me", base))
         .bearer_auth(token)
@@ -807,11 +1916,15 @@ async fn token_definitely_invalid(base: &str, token: &str) -> bool {
 /// reject only on a definitive 401/403 (see `token_definitely_invalid`).
 ///
 /// NOTE: this still can't stop an attacker who injects a token for *their own valid*
-/// account (a confused-deputy). Closing that fully needs an app-generated `state` nonce
-/// echoed back by the Klaay Frontend login redirect — tracked as a separate cross-repo task.
+/// account (a confused-deputy) until `AUTH_STATE_STRICT` is on: the `state` nonce this
+/// app mints is echoed by the Klaay Frontend, and a present-but-wrong one is rejected.
+///
+/// Callers are the main thread (setup, the Windows single-instance window, macOS
+/// `Opened`) or a plugin thread, so the network validation and the keyring write run
+/// on the async runtime; only the parse and the nonce check happen inline.
 fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
     let Some(tok) = parse_deep_link_token(url) else {
-        log::info!("deep_link_ignored url={}", url);
+        log::info!("deep_link_ignored url={}", redact_deep_link(url));
         return;
     };
     let provided_state = deep_link_query_value(url, "state");
@@ -821,86 +1934,100 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
         provided_state.is_some()
     );
 
-    // Outcome: None = state-nonce check failed, Some(false) = token rejected by API,
-    // Some(true) = accepted. The nonce is consumed (single-use) before anything else.
-    let outcome = tauri::async_runtime::block_on(async {
-        let expected = state.pending_auth_state.write().await.take();
-        if !auth_state_ok(
-            AUTH_STATE_STRICT,
-            expected.as_deref(),
-            provided_state.as_deref(),
-        ) {
-            return None;
-        }
-        let base = state.api_base_url.read().await.clone();
-        if token_definitely_invalid(&base, &tok).await {
-            return Some(false);
-        }
-        *state.auth_token.write().await = Some(tok.clone());
-        Some(true)
-    });
+    // Compare before consuming: a callback with a wrong state must not burn
+    // the live nonce, or a stale tab (or junk) could deny the real sign-in
+    // that follows it.
+    let expected = lock_read(&state.pending_auth_state)
+        .as_ref()
+        .map(|(nonce, _)| nonce.clone());
+    if !auth_state_ok(
+        AUTH_STATE_STRICT,
+        expected.as_deref(),
+        provided_state.as_deref(),
+    ) {
+        log::warn!("deep_link_state_check_failed rejecting token");
+        add_breadcrumb("auth", "deep_link_state_rejected", Level::Warning);
+        sentry::capture_message("deep_link_state_rejected", Level::Warning);
+        let _ = app.emit("auth:status", json!({ "authenticated": false }));
+        return;
+    }
+    if provided_state.is_some() {
+        // Matched: the nonce is single-use.
+        *lock_write(&state.pending_auth_state) = None;
+    }
 
-    match outcome {
-        Some(true) => {
-            // The keyring is the primary store. Without a Secret Service daemon
-            // (common on Linux) the agent falls back to a user-only file so the
-            // sign-in still survives a reboot. Tell the user the store is
-            // degraded instead of failing silently.
-            match keychain::save_token(&tok) {
-                Ok(keychain::CredentialStore::Keyring) => {}
-                Ok(keychain::CredentialStore::File) => {
-                    log::warn!("secure credential store unavailable; saved sign-in to a file");
-                    notify_user(
-                        "KlaayGuard",
-                        "No secure credential store found. Your sign-in is saved with reduced \
-                         protection. Install a keyring (gnome-keyring or KWallet) for full \
-                         protection.",
-                    );
-                    add_breadcrumb("auth", "token_saved_file_fallback", Level::Warning);
-                    sentry::capture_message("keychain_token_file_fallback", Level::Warning);
-                }
-                Err(e) => {
-                    log::error!("keychain: token save failed: {}", e);
-                    sentry::capture_message(
-                        &format!("keychain_token_save_failed: {}", e),
-                        Level::Error,
-                    );
-                }
-            }
-            let _ = app.emit("auth:status", json!({ "authenticated": true }));
-            add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
-            sentry::capture_message("deep_link_token_saved", Level::Info);
-        }
-        Some(false) => {
+    let app = app.clone();
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        if token_definitely_invalid(&state.api_base_url, &tok).await {
             log::warn!("deep_link_token_rejected_by_api length={}", tok.len());
             add_breadcrumb("auth", "deep_link_token_rejected", Level::Warning);
             sentry::capture_message("deep_link_token_rejected", Level::Warning);
             let _ = app.emit("auth:status", json!({ "authenticated": false }));
+            return;
         }
-        None => {
-            log::warn!("deep_link_state_check_failed rejecting token");
-            add_breadcrumb("auth", "deep_link_state_rejected", Level::Warning);
-            sentry::capture_message("deep_link_state_rejected", Level::Warning);
-            let _ = app.emit("auth:status", json!({ "authenticated": false }));
+        *lock_write(&state.auth_token) = Some(tok.clone());
+        state.token_acquired.notify_one();
+
+        // The keyring is the primary store. Without a Secret Service daemon
+        // (common on Linux) the agent falls back to a user-only file so the
+        // sign-in still survives a reboot. Tell the user the store is
+        // degraded instead of failing silently. The keyring call blocks
+        // (D-Bus, Keychain), so it stays off the async workers.
+        let saved = tauri::async_runtime::spawn_blocking(move || keychain::save_token(&tok)).await;
+        match saved {
+            Ok(Ok(keychain::CredentialStore::Keyring)) => {}
+            Ok(Ok(keychain::CredentialStore::File)) => {
+                log::warn!("secure credential store unavailable; saved sign-in to a file");
+                notify_user(
+                    "KlaayGuard",
+                    "No secure credential store found. Your sign-in is saved with reduced \
+                     protection. Install a keyring (gnome-keyring or KWallet) for full \
+                     protection.",
+                );
+                add_breadcrumb("auth", "token_saved_file_fallback", Level::Warning);
+                sentry::capture_message("keychain_token_file_fallback", Level::Warning);
+            }
+            Ok(Err(e)) => {
+                log::error!("keychain: token save failed: {}", e);
+                sentry::capture_message(
+                    &format!("keychain_token_save_failed: {}", e),
+                    Level::Error,
+                );
+            }
+            Err(e) => {
+                log::error!("keychain: token save task failed: {}", e);
+            }
         }
-    }
+        let _ = app.emit("auth:status", json!({ "authenticated": true }));
+        add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
+        sentry::capture_message("deep_link_token_saved", Level::Info);
+    });
 }
 
-/// Scan process args for a klaayguard deep link and handle it
-fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>) {
+/// Route the first klaayguard:// URL in `args` (this process's launch, or a
+/// command line forwarded by a second instance) to the deep-link handler.
+/// Returns whether one was found. The URL itself carries the bearer token,
+/// so only its presence is logged.
+fn dispatch_deep_link_args(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    args: &[String],
+    origin: &str,
+) -> bool {
+    let Some(url) = args.iter().find(|a| a.starts_with("klaayguard://")) else {
+        log::info!("{}: {} args, no deep link", origin, args.len());
+        return false;
+    };
+    log::info!("{}: deep link found", origin);
+    handle_deep_link_url(app, state, url);
+    true
+}
+
+/// Scan this process's args for a klaayguard deep link and handle it.
+fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>) -> bool {
     let args: Vec<String> = std::env::args().collect();
-    log::info!(
-        "process_args count={} sample_arg1={}",
-        args.len(),
-        args.get(1).cloned().unwrap_or_default()
-    );
-    for a in args {
-        if a.starts_with("klaayguard://") {
-            log::info!("deep_link_found_in_process_args");
-            handle_deep_link_url(app, state, &a);
-            break;
-        }
-    }
+    dispatch_deep_link_args(app, state, &args, "process_args")
 }
 
 /// Executes a batch of SQL statements against osquery and returns results keyed by logical id
@@ -916,7 +2043,17 @@ async fn execute_sql_batch(
             .shell()
             .sidecar("klaayguard-osqueryi")
             .map_err(|e| format!("klaayguard-osqueryi sidecar unavailable: {}", e))?
-            .args(["--json", sql.as_str()]);
+            .args([
+                // The text guard in `is_read_only_query` cannot keep a SELECT
+                // off the network: osquery's `curl` table performs an HTTP
+                // request, `yara` fetches `sigurl`, and the carver uploads.
+                // Turn those off in the engine, where the SQL text does not
+                // matter, and keep extensions from adding new ones.
+                "--disable_tables=curl,curl_certificate,yara,carves",
+                "--disable_extensions=true",
+                "--json",
+                sql.as_str(),
+            ]);
 
         // osquery failing to spawn at all is a systemic problem — surface it.
         let output = cmd.output().await.map_err(|e| e.to_string())?;
@@ -925,6 +2062,14 @@ async fn execute_sql_batch(
         // empty result for it and keep collecting (and sending) the others.
         if !output.status.success() {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
+            // Log it too: Sentry only runs when a DSN was baked in at build
+            // time, and a breadcrumb alone leaves a missing table
+            // undiagnosable from the log file.
+            log::warn!(
+                "osquery query '{}' skipped: {}",
+                logical_id,
+                stderr_str.trim()
+            );
             add_breadcrumb(
                 "collection",
                 &format!(
@@ -938,14 +2083,16 @@ async fn execute_sql_batch(
             continue;
         }
 
-        let parsed = String::from_utf8(output.stdout)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        // osquery copies column bytes verbatim, so one non-UTF-8 byte (a
+        // process argv, a file name) must not blank the whole table: decode
+        // lossily and let the row survive with U+FFFD in that field.
+        let parsed = serde_json::from_str::<Value>(&String::from_utf8_lossy(&output.stdout)).ok();
         match parsed {
             Some(v) => {
                 all_results.insert(logical_id, v);
             }
             None => {
+                log::warn!("osquery query '{}' returned unparseable output", logical_id);
                 add_breadcrumb(
                     "collection",
                     &format!("osquery_parse_skipped '{}'", logical_id),
@@ -959,65 +2106,81 @@ async fn execute_sql_batch(
     Ok(all_results)
 }
 
-async fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
+fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) {
     // Stop using the token, but DON'T delete it from the keychain: a keychain write
     // pops a second OS prompt on unsigned builds, and the stale token is harmless
-    // (overwritten on next sign-in). Just clear it in memory and prompt re-login.
-    *state.auth_token.write().await = None;
+    // (the next sign-in overwrites it, or shadows it through the file store, which
+    // `keychain::load_token` reads first). Just clear it in memory and prompt re-login.
+    *lock_write(&state.auth_token) = None;
     log::warn!("Authentication invalidated; notifying user to re-sign-in");
-    notify_signin_needed(app, state).await;
+    notify_signin_needed(app, state);
     let _ = app.emit("auth:invalidated", ());
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     add_breadcrumb("auth", "auth_invalidated", Level::Warning);
     sentry::capture_message("auth_invalidated", Level::Warning);
-    Ok(())
+}
+
+/// A positive number of seconds from an environment override, or `default`.
+/// Zero is rejected: `tokio::time::interval` asserts on a zero period, which
+/// would kill the loop that reads it.
+fn env_seconds(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
 }
 
 fn focus_debounce_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(60)
+    env_seconds("KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS", 60)
 }
 
 fn collection_interval_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_COLLECTION_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(900)
+    env_seconds("KLAAYGUARD_COLLECTION_INTERVAL_SECONDS", 900)
 }
 
 /// Debounced sign-in nudge: opens the login page in the browser and posts a native
-/// notification. Replaces the old "focus the window" nudge now that the app is
-/// tray-only. The debounce keeps repeated 401s from spamming browser tabs.
-async fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    let now = std::time::Instant::now();
-    let debounce = std::time::Duration::from_secs(focus_debounce_seconds());
-    let should = match *state.last_focus_at.read().await {
+/// notification. The debounce keeps repeated 401s from spamming browser tabs. A
+/// no-op once a token is present: a cold start by deep link signs the user in
+/// while this is being decided.
+fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    if lock_read(&state.auth_token).is_some() {
+        return;
+    }
+    let now = Instant::now();
+    let debounce = Duration::from_secs(focus_debounce_seconds());
+    let should = match *lock_read(&state.last_focus_at) {
         Some(prev) => now.duration_since(prev) >= debounce,
         None => true,
     };
     if !should {
         return;
     }
-    *state.last_focus_at.write().await = Some(now);
+    *lock_write(&state.last_focus_at) = Some(now);
     log::warn!("sign-in required; opening login page (debounced)");
     add_breadcrumb("ui", "signin_required_notification", Level::Info);
     open_sign_in(app);
     notify_user("KlaayGuard", "Open KlaayGuard in the menu bar to sign in.");
+    // Stock GNOME shows the tray to nobody. Without a tray the user has no
+    // way back to sign-in after a token expires, so open the window here,
+    // when it is needed, instead of at every login.
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::atomic::Ordering;
+        if fallback_window_needed(
+            state.tray_built.load(Ordering::Relaxed),
+            state.tray_watcher_present.load(Ordering::Relaxed),
+            false,
+        ) {
+            open_fallback_window(app);
+        }
+    }
 }
 
-async fn emit_error_and_focus(
-    app: &tauri::AppHandle,
-    _state: &Arc<AppState>,
-    event: &str,
-    payload: serde_json::Value,
-) {
-    // Emit to UI listeners
+/// Emit a collection error to UI listeners, the log, and Sentry (error level).
+fn emit_error(app: &tauri::AppHandle, event: &str, payload: serde_json::Value) {
     let _ = app.emit(event, payload.clone());
-    // Report to Sentry as an error-level event with context
     let serialized = payload.to_string();
-    // Also log locally to KlaayGuard.log
     log::error!("error_event:{}, payload:{}", event, serialized);
     sentry::capture_message(
         &format!("error_event:{}, payload:{}", event, serialized),
@@ -1062,9 +2225,47 @@ fn extract_serial(rows: &Value) -> Option<String> {
         .find_map(|k| {
             obj.get(*k)
                 .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !is_placeholder_serial(s))
         })
         .map(|s| s.to_string())
+}
+
+/// Whether a BIOS serial is one of the placeholders OEM boards, virtual
+/// machines, and osquery itself ("-1" when WMI fails) hand out instead of a
+/// real one. Adopting one as the device identity would merge every such
+/// machine into one device.
+fn is_placeholder_serial(raw: &str) -> bool {
+    const PLACEHOLDERS: [&str; 22] = [
+        "-1",
+        "0",
+        "none",
+        "n/a",
+        "null",
+        "(null string)",
+        "invalid",
+        "default",
+        "default string",
+        "system serial number",
+        "to be filled by o.e.m.",
+        "not applicable",
+        "not specified",
+        "not available",
+        "unknown",
+        "serial number",
+        "serialnumber",
+        "oem",
+        "empty",
+        "123456789",
+        "0123456789",
+        "1234567890",
+    ];
+    let s = raw.trim().to_ascii_lowercase();
+    let mut chars = s.chars();
+    let first = chars.next();
+    s.len() < 4
+        || PLACEHOLDERS.contains(&s.as_str())
+        || first.is_some_and(|f| chars.all(|c| c == f))
 }
 
 /// Which device identity to use and whether to store it.
@@ -1093,11 +2294,7 @@ fn hash_machine_id(machine_id: &str) -> String {
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"com.klaay.klaayguard")
         .expect("HMAC accepts any key length");
     mac.update(machine_id.as_bytes());
-    mac.finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    hex_lower(&mac.finalize().into_bytes())
 }
 
 /// Rank the identity sources: stored value, then hardware serial, then hashed
@@ -1189,6 +2386,17 @@ fn notification_command(title: &str, body: &str) -> Option<(&'static str, Vec<St
     }
 }
 
+/// Spawn a fire-and-forget helper and reap it when it exits. std never waits
+/// on a dropped `Child`, so without this every notify-send, browser, or
+/// clipboard helper would stay a zombie for the life of the agent.
+fn spawn_and_reap(cmd: &mut std::process::Command) -> std::io::Result<()> {
+    let mut child = cmd.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 /// Show a native notification. Failure is fine; this is best-effort UX.
 fn notify_user(title: &str, body: &str) {
     if let Some((program, args)) = notification_command(title, body) {
@@ -1199,7 +2407,7 @@ fn notify_user(title: &str, body: &str) {
         // never shows.
         #[cfg(target_os = "linux")]
         apply_appimage_sanitization(&mut cmd);
-        let _ = cmd.spawn();
+        let _ = spawn_and_reap(&mut cmd);
     }
 }
 
@@ -1214,7 +2422,7 @@ fn read_machine_id() -> Option<String> {
 fn generate_device_identity() -> Result<String, String> {
     let mut bytes = [0u8; 16];
     getrandom::getrandom(&mut bytes).map_err(|e| format!("getrandom failed: {}", e))?;
-    Ok(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+    Ok(hex_lower(&bytes))
 }
 
 /// Quote and escape a path for the Desktop Entry `Exec` field. The entry is
@@ -1239,12 +2447,38 @@ fn desktop_exec_field(path: &str) -> String {
     out
 }
 
-/// A fallback window is needed when the tray cannot serve as the UI: the
-/// tray failed to build, or no StatusNotifier host is on the bus to show it
-/// (stock GNOME without the AppIndicator extension).
+/// A fallback window is needed when the tray cannot serve as the UI.
+///
+/// A tray that failed to build leaves no UI at all, so the window opens
+/// whatever the sign-in state. A tray that built but has no StatusNotifier
+/// host to show it (stock GNOME without the AppIndicator extension) is the
+/// normal case on Fedora, Debian and Arch: there the window is only worth
+/// opening when the user must sign in. A signed-in agent needs no UI, and a
+/// window at every login is noise.
 #[cfg(any(target_os = "linux", test))]
-fn fallback_window_needed(tray_built: bool, watcher_present: bool) -> bool {
-    !tray_built || !watcher_present
+fn fallback_window_needed(tray_built: bool, watcher_present: bool, signed_in: bool) -> bool {
+    !tray_built || (!watcher_present && !signed_in)
+}
+
+/// Open the sign-in fallback window, once. A second call while the window
+/// lives is a no-op, so startup and a later sign-out cannot stack windows.
+#[cfg(target_os = "linux")]
+fn open_fallback_window(app: &tauri::AppHandle) {
+    if app.get_webview_window("fallback").is_some() {
+        return;
+    }
+    if let Err(e) = tauri::WebviewWindowBuilder::new(
+        app,
+        "fallback",
+        tauri::WebviewUrl::App("fallback.html".into()),
+    )
+    .title("KlaayGuard")
+    .inner_size(440.0, 340.0)
+    .build()
+    {
+        log::error!("fallback window failed: {}", e);
+        sentry::capture_message(&format!("fallback_window_failed: {}", e), Level::Error);
+    }
 }
 
 /// Whether a StatusNotifier host listens on the session bus. Errors and a
@@ -1311,10 +2545,35 @@ fn autostart_exec(appimage_env: Option<&str>, current_exe: &str) -> String {
         .to_string()
 }
 
-/// Location of the XDG autostart entry for this user.
+/// Location of the XDG autostart entry: `$XDG_CONFIG_HOME/autostart`, which
+/// is what the session's autostart implementation reads, not a fixed
+/// `~/.config`.
 #[cfg(any(target_os = "linux", test))]
-fn autostart_path(home: &std::path::Path) -> std::path::PathBuf {
-    home.join(".config/autostart/klaayguard.desktop")
+fn autostart_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join("autostart/klaayguard.desktop")
+}
+
+/// Whether an APPIMAGE value names the image this process runs from. The
+/// AppImage runtime exports APPIMAGE and APPDIR to every child, so a deb/rpm
+/// agent started from an AppImage browser or terminal inherits a foreign
+/// pair; only an executable inside APPDIR, the runtime's mount of that file,
+/// is ours.
+#[cfg(any(target_os = "linux", test))]
+fn appimage_is_own(
+    appimage: &std::path::Path,
+    appdir: &std::path::Path,
+    current_exe: &std::path::Path,
+) -> bool {
+    appimage.is_absolute() && appdir.is_absolute() && current_exe.starts_with(appdir)
+}
+
+/// The AppImage this process runs from, if any (see `appimage_is_own`).
+#[cfg(target_os = "linux")]
+fn own_appimage() -> Option<std::path::PathBuf> {
+    let appimage = std::path::PathBuf::from(std::env::var_os("APPIMAGE")?);
+    let appdir = std::path::PathBuf::from(std::env::var_os("APPDIR")?);
+    let exe = std::env::current_exe().ok()?;
+    (appimage_is_own(&appimage, &appdir, &exe) && appimage.is_file()).then_some(appimage)
 }
 
 /// Whether the user disabled autostart. The GNOME toggle writes
@@ -1333,17 +2592,14 @@ fn autostart_is_user_disabled(contents: &str) -> bool {
 /// disable, and writes atomically.
 #[cfg(target_os = "linux")]
 fn install_autostart_entry() -> Result<(), String> {
-    let home = dirs::home_dir().ok_or("no home directory")?;
+    let config_dir = dirs::config_dir().ok_or("no config directory")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
 
-    // Trust the APPIMAGE path only if it is absolute and present; otherwise a
-    // stray value would persist an attacker-chosen Exec under our name.
-    let appimage = std::env::var("APPIMAGE").ok().filter(|p| {
-        let p = std::path::Path::new(p);
-        p.is_absolute() && p.exists()
-    });
+    // Trust APPIMAGE only for the image this process runs from; a stray value
+    // inherited from another AppImage would persist its path under our name.
+    let appimage = own_appimage().map(|p| p.to_string_lossy().into_owned());
     let entry = autostart_entry(&autostart_exec(appimage.as_deref(), &exe.to_string_lossy()));
-    let path = autostart_path(&home);
+    let path = autostart_path(&config_dir);
 
     if let Ok(existing) = std::fs::read_to_string(&path) {
         if autostart_is_user_disabled(&existing) {
@@ -1366,12 +2622,47 @@ fn install_autostart_entry() -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
 }
 
+/// Write (or repair) the HKCU Run value the installer created, so a value a
+/// cleanup tool or policy removed comes back at the next launch, as the Linux
+/// and macOS paths do. A user who turned KlaayGuard off in Task Manager >
+/// Startup apps is honoured: Windows records that in StartupApproved and
+/// ignores the Run value, which this never touches.
+#[cfg(target_os = "windows")]
+fn ensure_autostart_entry() -> Result<(), String> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let want = format!("\"{}\"", exe.to_string_lossy());
+    let (key, _) = winreg::RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey_with_flags(
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            KEY_READ | KEY_WRITE,
+        )
+        .map_err(|e| format!("open Run key: {}", e))?;
+    if key.get_value::<String, _>("KlaayGuard").ok().as_deref() == Some(want.as_str()) {
+        return Ok(());
+    }
+    key.set_value("KlaayGuard", &want)
+        .map_err(|e| format!("write Run value: {}", e))
+}
+
 /// Resolve the stable device identity. The first run decides it and stores it
-/// in the keychain; every later run returns the stored value.
-async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, String> {
+/// in the keychain; every later run returns the stored value, cached in memory
+/// after the first successful read. `system_info` is the osquery rows this
+/// cycle already collected, so the serial query is not run a second time.
+async fn get_device_identity_internal(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    system_info: Option<&Value>,
+) -> Result<String, String> {
+    if let Some(cached) = lock_read(&state.device_identity).clone() {
+        return Ok(cached);
+    }
     // Fast path, and the rule the tests pin as IdentityDecision::Use.
     match keychain::load_device_identity() {
-        Ok(Some(stored)) if !stored.is_empty() => return Ok(stored),
+        Ok(Some(stored)) if !stored.is_empty() => {
+            *lock_write(&state.device_identity) = Some(stored.clone());
+            return Ok(stored);
+        }
         Ok(_) => {}
         Err(e) => {
             // A broken credential store forces re-derivation every cycle.
@@ -1384,20 +2675,23 @@ async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, 
         }
     }
 
-    let hardware_serial = match execute_sql_batch(
-        app.clone(),
-        vec![(
-            "system_info".to_string(),
-            "SELECT * FROM system_info".to_string(),
-        )],
-    )
-    .await
-    {
-        Ok(result) => extract_serial(result.get("system_info").unwrap_or(&Value::Null)),
-        Err(e) => {
-            log::warn!("identity: system_info query failed: {}", e);
-            None
-        }
+    let hardware_serial = match system_info {
+        Some(rows) => extract_serial(rows),
+        None => match execute_sql_batch(
+            app.clone(),
+            vec![(
+                "system_info".to_string(),
+                "SELECT * FROM system_info".to_string(),
+            )],
+        )
+        .await
+        {
+            Ok(result) => extract_serial(result.get("system_info").unwrap_or(&Value::Null)),
+            Err(e) => {
+                log::warn!("identity: system_info query failed: {}", e);
+                None
+            }
+        },
     };
 
     let (identity, source) = match decide_device_identity(
@@ -1410,49 +2704,40 @@ async fn get_device_identity_internal(app: &tauri::AppHandle) -> Result<String, 
         IdentityDecision::Generate => (generate_device_identity()?, "generated"),
     };
 
-    if let Err(e) = keychain::save_device_identity(&identity) {
-        // Report but still return the identity: one collection with an
-        // unstored identity beats none.
-        log::error!("identity: keychain save failed: {}", e);
-        sentry::capture_message(&format!("device_identity_save_failed: {}", e), Level::Error);
+    match keychain::save_device_identity(&identity) {
+        // Cache only what is persisted, so a failed save is retried next cycle.
+        Ok(()) => *lock_write(&state.device_identity) = Some(identity.clone()),
+        Err(e) => {
+            // Report but still return the identity: one collection with an
+            // unstored identity beats none.
+            log::error!("identity: keychain save failed: {}", e);
+            sentry::capture_message(&format!("device_identity_save_failed: {}", e), Level::Error);
+        }
     }
     log::info!("identity: device identity {}", source);
     Ok(identity)
 }
 
-async fn run_cycle(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    client: &reqwest::Client,
-) -> Result<(), String> {
-    let token = match state.auth_token.read().await.clone() {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-
-    let base = state.api_base_url.read().await.clone();
-
-    // Mark an attempt start and notify UI listeners
-    *state.last_attempt_at.write().await = Some(std::time::Instant::now());
-    let _ = app.emit("collection:attempt", ());
-
-    // 1) GET /klaayguard/config
-    add_breadcrumb("collection", "config_fetch_start", Level::Info);
-    sentry::capture_message("collection_config_fetch_start", Level::Info);
+/// Send a request, retrying transient failures (network errors, 429, 5xx)
+/// with the fixed delay ladder. Returns the last response, or the network
+/// error once the ladder is exhausted. The builder must be cloneable (a bytes
+/// body is), which every call here satisfies.
+async fn send_with_retry(
+    request: reqwest::RequestBuilder,
+    label: &str,
+) -> Result<reqwest::Response, String> {
     let is_transient_status = |code: u16| -> bool { code == 429 || (500..=599).contains(&code) };
     let retry_delays = [60u64, 120u64];
     let mut attempt = 0usize;
-    let cfg_resp = loop {
-        match client
-            .get(format!("{}/klaayguard/config", base))
-            .bearer_auth(&token)
-            .send()
-            .await
-        {
+    loop {
+        let Some(req) = request.try_clone() else {
+            return Err(format!("{}: request is not retryable", label));
+        };
+        match req.send().await {
             Ok(resp) => {
                 add_breadcrumb(
                     "collection",
-                    &format!("config_status:{}", resp.status().as_u16()),
+                    &format!("{}_status:{}", label, resp.status().as_u16()),
                     Level::Info,
                 );
                 if !resp.status().is_success()
@@ -1462,45 +2747,79 @@ async fn run_cycle(
                     let delay = retry_delays[attempt];
                     add_breadcrumb(
                         "collection",
-                        &format!("transient_retry_in_s:{}", delay),
+                        &format!("{}_transient_retry_in_s:{}", label, delay),
                         Level::Warning,
                     );
-                    sentry::capture_message("collection_transient_retry", Level::Warning);
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                     attempt += 1;
                     continue;
                 }
-                break resp;
+                return Ok(resp);
             }
             Err(e) => {
                 add_breadcrumb(
                     "collection",
-                    &format!("config_network_error:{}", e),
+                    &format!("{}_network_error:{}", label, e),
                     Level::Warning,
                 );
-                sentry::capture_message("collection_config_network_error", Level::Warning);
                 if attempt < retry_delays.len() {
                     let delay = retry_delays[attempt];
                     add_breadcrumb(
                         "collection",
-                        &format!("retry_in_s:{}", delay),
+                        &format!("{}_retry_in_s:{}", label, delay),
                         Level::Warning,
                     );
-                    sentry::capture_message("collection_retry", Level::Warning);
                     tokio::time::sleep(Duration::from_secs(delay)).await;
                     attempt += 1;
                     continue;
-                } else {
-                    return Err(e.to_string());
                 }
+                return Err(e.to_string());
             }
+        }
+    }
+}
+
+async fn run_cycle(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let token = match lock_read(&state.auth_token).clone() {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let base = state.api_base_url.as_str();
+
+    // Mark an attempt start and notify UI listeners
+    *lock_write(&state.last_attempt_at) = Some(Instant::now());
+    let _ = app.emit("collection:attempt", ());
+
+    // 1) GET /klaayguard/config
+    add_breadcrumb("collection", "config_fetch_start", Level::Info);
+    let cfg_resp = match send_with_retry(
+        client
+            .get(format!("{}/klaayguard/config", base))
+            .bearer_auth(&token),
+        "config",
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            emit_error(
+                app,
+                "collection:error",
+                json!({ "stage": "config", "error": e }),
+            );
+            return Ok(());
         }
     };
 
     if cfg_resp.status() == reqwest::StatusCode::UNAUTHORIZED
         || cfg_resp.status() == reqwest::StatusCode::FORBIDDEN
     {
-        invalidate_auth(app, state).await?;
+        invalidate_auth(app, state);
         let _ = app.emit(
             "collection:error",
             json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
@@ -1509,14 +2828,11 @@ async fn run_cycle(
         return Ok(());
     }
     if !cfg_resp.status().is_success() {
-        emit_error_and_focus(
+        emit_error(
             app,
-            state,
             "collection:error",
             json!({ "stage": "config", "status": cfg_resp.status().as_u16() }),
-        )
-        .await;
-        sentry::capture_message("collection_error_config_non_transient", Level::Warning);
+        );
         return Ok(());
     }
 
@@ -1524,19 +2840,17 @@ async fn run_cycle(
     let items = parse_config_items(&cfg_json, std::env::consts::OS);
 
     if items.is_empty() {
-        emit_error_and_focus(
+        emit_error(
             app,
-            state,
             "collection:error",
             json!({ "stage": "config", "reason": "no_tables" }),
-        )
-        .await;
+        );
         return Ok(());
     }
 
     // Split osquery items from native (builtin) ones. osquery runs through the
-    // sidecar as before; builtin checks resolve in-process. Both fill the same
-    // results map keyed by logical id, so the payload builder is unchanged.
+    // sidecar; builtin checks resolve in-process. Both fill the same results
+    // map keyed by logical id, so the payload builder is unchanged.
     let mut osquery_queries: Vec<(String, String)> = Vec::new();
     let mut builtin_checks: Vec<(String, String)> = Vec::new();
     for item in items {
@@ -1546,23 +2860,29 @@ async fn run_cycle(
         }
     }
 
-    // 2) osquery
-    add_breadcrumb("collection", "osquery_start", Level::Info);
-    sentry::capture_message("collection_osquery_start", Level::Info);
-    let mut results = if osquery_queries.is_empty() {
-        HashMap::new()
-    } else {
-        execute_sql_batch(app.clone(), osquery_queries).await?
-    };
-    // 2b) native checks (Linux disk encryption, screen lock).
+    // 2) Native checks first: they do not need osquery, so a sidecar that
+    //    cannot spawn must not cost the posture they can still report.
+    let mut results: HashMap<String, Value> = HashMap::new();
     for (id, check) in builtin_checks {
         results.insert(id, run_builtin_check(&check));
     }
-    *state.last_run_at.write().await = Some(std::time::Instant::now());
+    // 2b) osquery. A sidecar that fails to spawn at all is a systemic problem:
+    //     report it, and still send whatever the native checks produced.
+    add_breadcrumb("collection", "osquery_start", Level::Info);
+    if !osquery_queries.is_empty() {
+        match execute_sql_batch(app.clone(), osquery_queries).await {
+            Ok(rows) => results.extend(rows),
+            Err(e) => emit_error(
+                app,
+                "collection:error",
+                json!({ "stage": "osquery", "error": e }),
+            ),
+        }
+    }
 
     // 3) Build the JSON:API payload from the freshly collected rows
     let collected_at = chrono::Utc::now().to_rfc3339();
-    let device_serial = get_device_identity_internal(app)
+    let device_serial = get_device_identity_internal(app, state, results.get("system_info"))
         .await
         .unwrap_or_else(|_| "unknown".to_string());
     let items = build_payload_items(&results, &collected_at);
@@ -1577,126 +2897,99 @@ async fn run_cycle(
         jsonapi: Some(json!({ "version": "1.0" })),
     };
 
-    // 4) POST straight to /klaayguard/data, reusing the transient-retry ladder
-    let mut post_attempt = 0usize;
-    loop {
-        let body_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
-        match client
+    // 4) POST straight to /klaayguard/data, with the same transient-retry ladder
+    let body_json = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    let resp = match send_with_retry(
+        client
             .post(format!("{}/klaayguard/data", base))
             .bearer_auth(&token)
             .header(reqwest::header::CONTENT_TYPE, "application/vnd.api+json")
             .header(reqwest::header::ACCEPT, "application/vnd.api+json")
-            .body(body_json)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                add_breadcrumb(
-                    "collection",
-                    &format!("post_status:{}", resp.status().as_u16()),
-                    Level::Info,
-                );
-                if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-                    || resp.status() == reqwest::StatusCode::FORBIDDEN
-                {
-                    invalidate_auth(app, state).await?;
-                    let _ = app.emit(
-                        "collection:error",
-                        json!({ "stage": "post", "status": resp.status().as_u16() }),
-                    );
-                    return Ok(());
-                }
-                if resp.status().is_success() || resp.status() == reqwest::StatusCode::ACCEPTED {
-                    let _ = app.emit("collection:success", json!({ "sent_rows": row_count }));
-                    log::info!("collection_success sent_rows={}", row_count);
-                    add_breadcrumb(
-                        "collection",
-                        &format!("success_count:{}", row_count),
-                        Level::Info,
-                    );
-                    return Ok(());
-                } else if is_transient_status(resp.status().as_u16())
-                    && post_attempt < retry_delays.len()
-                {
-                    let delay = retry_delays[post_attempt];
-                    sentry::capture_message("collection_post_transient_retry", Level::Warning);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    post_attempt += 1;
-                    continue;
-                } else {
-                    emit_error_and_focus(
-                        app,
-                        state,
-                        "collection:error",
-                        json!({ "stage": "post", "status": resp.status().as_u16() }),
-                    )
-                    .await;
-                    return Ok(());
-                }
-            }
-            Err(e) => {
-                if post_attempt < retry_delays.len() {
-                    let delay = retry_delays[post_attempt];
-                    sentry::capture_message("collection_post_retry", Level::Warning);
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
-                    post_attempt += 1;
-                    continue;
-                } else {
-                    emit_error_and_focus(
-                        app,
-                        state,
-                        "collection:error",
-                        json!({ "stage": "post", "error": e.to_string() }),
-                    )
-                    .await;
-                    return Ok(());
-                }
-            }
+            .body(body_json),
+        "post",
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            emit_error(
+                app,
+                "collection:error",
+                json!({ "stage": "post", "error": e }),
+            );
+            return Ok(());
         }
+    };
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        || resp.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        invalidate_auth(app, state);
+        let _ = app.emit(
+            "collection:error",
+            json!({ "stage": "post", "status": resp.status().as_u16() }),
+        );
+        return Ok(());
     }
+    if resp.status().is_success() {
+        let _ = app.emit("collection:success", json!({ "sent_rows": row_count }));
+        log::info!("collection_success sent_rows={}", row_count);
+        add_breadcrumb(
+            "collection",
+            &format!("success_count:{}", row_count),
+            Level::Info,
+        );
+        return Ok(());
+    }
+    emit_error(
+        app,
+        "collection:error",
+        json!({ "stage": "post", "status": resp.status().as_u16() }),
+    );
+    Ok(())
 }
 
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!("KlaayGuard/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("reqwest client");
+        // The config GET and data POST are small: give the whole request a
+        // deadline, so a peer that accepts and then stalls cannot park this
+        // loop for the life of the process.
+        let client = http_client(Some(Duration::from_secs(60)));
 
         // wait for token once
         loop {
-            if state.auth_token.read().await.is_some() {
+            if lock_read(&state.auth_token).is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
 
         // interval's first tick fires immediately, giving the initial collection.
-        // Skip (don't burst) ticks missed while the machine was asleep.
+        // Skip (don't burst) ticks missed while the machine was asleep. A token
+        // acquired between ticks (a sign-in after a sign-out or a 401) collects
+        // at once and restarts the interval from there, instead of waiting out
+        // the rest of the period behind a tray that says "Fetching now…".
         let mut interval =
             tokio::time::interval(Duration::from_secs(collection_interval_seconds()));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = state.token_acquired.notified() => {
+                    interval.reset();
+                }
+            }
             if let Err(e) = run_cycle(&app, &state, &client).await {
                 log::error!("cycle error: {}", e);
-                emit_error_and_focus(
+                emit_error(
                     &app,
-                    &state,
                     "collection:error",
                     json!({ "stage": "internal", "error": e }),
-                )
-                .await;
+                );
             }
         }
     });
 }
 
-/// Installs a launch agent for automatic startup on macOS.
-///
-/// This function creates a launchd plist file in the user's LaunchAgents directory
-/// and loads it to ensure the app starts automatically on login. This is a mandatory
-/// security feature that cannot be disabled by users.
 /// Minimal XML text/attribute escaping for values interpolated into the plist
 /// template. Keeps a stray `&`/`<`/`>` (or an injected `</string>…`) in a path or URL
 /// from corrupting — or injecting keys into — the generated launchd plist.
@@ -1709,6 +3002,15 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Installs a launch agent for automatic startup on macOS.
+///
+/// This function creates a launchd plist file in the user's LaunchAgents directory
+/// and loads it to ensure the app starts automatically on login. This is a mandatory
+/// security feature that cannot be disabled by users. When the app is not installed
+/// under /Applications (a dev binary, a launch from the mounted DMG) the plist is
+/// written inert (no RunAtLoad, no KeepAlive): a KeepAlive job pointing at a path
+/// that is gone at next login makes launchd respawn `open` every ThrottleInterval
+/// seconds, forever.
 #[cfg(target_os = "macos")]
 async fn install_launch_agent() -> Result<String, String> {
     use std::fs;
@@ -1740,10 +3042,7 @@ async fn install_launch_agent() -> Result<String, String> {
             .unwrap_or_else(|| "/Applications/KlaayGuard.app".to_string())
     };
     // Determine API base for env injection in LaunchAgent
-    let api_base_for_plist: String = std::env::var("VITE_API_BASE_URL")
-        .ok()
-        .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
-        .unwrap_or_else(|| "https://api.klaay.com".to_string());
+    let api_base_for_plist = get_api_base_url();
 
     let log_dir = home_dir.join("Library/Logs/KlaayGuard");
     fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create log directory: {}", e))?;
@@ -1751,6 +3050,22 @@ async fn install_launch_agent() -> Result<String, String> {
     let plist_content = include_str!("../resources/com.klaay.klaayguard.plist")
         .replace("__LABEL__", label)
         .replace("__OPEN_PATH__", "/usr/bin/open")
+        .replace(
+            "__RUN_AT_LOAD__",
+            if installed_exists {
+                "<true/>"
+            } else {
+                "<false/>"
+            },
+        )
+        .replace(
+            "__KEEP_ALIVE__",
+            if installed_exists {
+                "<true/>"
+            } else {
+                "<false/>"
+            },
+        )
         .replace("__APP_PATH__", &xml_escape(&app_path))
         .replace("__VITE_API_BASE_URL__", &xml_escape(&api_base_for_plist))
         .replace("__LOG_DIR__", &xml_escape(&log_dir.to_string_lossy()));
@@ -1839,35 +3154,55 @@ fn select_appimage_asset<'a>(assets: &'a [ReleaseAsset], arch: &str) -> Option<&
     })
 }
 
-/// The file to replace on self-update. Set only when this process runs from
-/// an AppImage; deb and rpm installs update through the package manager.
-#[cfg(any(target_os = "linux", test))]
-fn appimage_update_target(appimage_env: Option<&str>) -> Option<std::path::PathBuf> {
-    appimage_env
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
+/// The release-artifact architecture tag for a Windows host. Windows and
+/// macOS artifacts use the short tag ("x64", "arm64"); Linux ones use the
+/// Rust arch string ("x86_64"). Passing std::env::consts::ARCH straight
+/// through would never match "Windows_x64" and the agent would stop updating
+/// in silence. An arch with no tag returns None rather than guess; a tagged
+/// arch with no asset in the release logs that honestly.
+#[cfg(any(target_os = "windows", test))]
+fn windows_arch_tag(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("x64"),
+        "aarch64" => Some("arm64"),
+        _ => None,
+    }
 }
 
-/// Where to stage the downloaded AppImage: same directory as the target, so
-/// the final rename stays on one filesystem and is atomic.
-#[cfg(any(target_os = "linux", test))]
-fn staged_appimage_path(target: &std::path::Path, pid: u32) -> std::path::PathBuf {
+/// Pick the NSIS installer asset for this architecture. `original_name` is
+/// the contract; the friendly label ("Windows Installer") carries neither the
+/// architecture nor the file type. No label fallback: a label-only match
+/// could hand back a `.deb`. The suffix test also rejects `.nsis.zip`,
+/// `.exe.sig`, and `.msi`.
+#[cfg(any(target_os = "windows", test))]
+fn select_windows_installer_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    arch_tag: &str,
+) -> Option<&'a ReleaseAsset> {
+    let infix = format!("Windows_{}", arch_tag);
+    assets.iter().find(|asset| {
+        asset
+            .original_name
+            .as_deref()
+            .is_some_and(|n| n.ends_with(".exe") && n.contains(&infix))
+    })
+}
+
+/// Where to stage a downloaded replacement (AppImage, .app bundle): the same
+/// directory as the target, so the final rename stays on one filesystem and
+/// is atomic.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn staged_sibling_path(target: &std::path::Path, pid: u32) -> std::path::PathBuf {
     let base = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "KlaayGuard.AppImage".to_string());
+        .unwrap_or_else(|| "KlaayGuard".to_string());
     target.with_file_name(format!(".{}.update-{}", base, pid))
 }
 
 /// macOS artifact tags for the current host: (filename infix, friendly-name infix).
-/// Returns None on other systems: the installer below mounts a DMG, so a
-/// non-macOS host must not download one. Without this gate a Linux or Windows
-/// x86_64 host selects the Intel DMG, downloads it, and fails at mount time.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn host_arch_tags() -> Option<(&'static str, &'static str)> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
     match std::env::consts::ARCH {
         "aarch64" => Some(("macOS_arm64", "Apple silicon")),
         "x86_64" => Some(("macOS_x64", "Intel")),
@@ -1878,7 +3213,7 @@ fn host_arch_tags() -> Option<(&'static str, &'static str)> {
 /// Pick the DMG asset matching this host's architecture. Prefers the real
 /// artifact filename (`original_name`); falls back to the friendly label only
 /// when it is absent. Returns None rather than guess the wrong architecture.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 fn select_dmg_asset<'a>(
     assets: &'a [ReleaseAsset],
     arch_tag: &str,
@@ -1897,18 +3232,21 @@ fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let actual: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
+    let actual = hex_lower(&hasher.finalize());
     actual.eq_ignore_ascii_case(expected.trim_start_matches("sha256:"))
+}
+
+/// Whether this platform refuses an update that carries no server checksum.
+/// macOS has a second, independent gate after the hash (codesign team match
+/// plus a Gatekeeper assessment), so it may proceed. Linux and Windows have
+/// nothing after the hash, so unverifiable bytes must never run. `os` is a
+/// parameter so tests pin every branch without cross-compiling.
+fn update_requires_checksum(os: &str) -> bool {
+    os != "macos"
 }
 
 #[derive(serde::Deserialize)]
 struct ReleaseInfo {
-    #[serde(rename = "name")]
-    _name: Option<String>,
     version: String, // This is the tag_name from GitHub
     assets: Vec<ReleaseAsset>,
 }
@@ -1932,13 +3270,21 @@ fn get_frontend_url() -> String {
 /// bundled libraries and GTK modules. A browser we spawn must not inherit the
 /// AppImage values, or it loads the wrong libraries and fails to start.
 #[cfg(target_os = "linux")]
-const APPIMAGE_CHILD_ENV_VARS: [&str; 6] = [
+const APPIMAGE_CHILD_ENV_VARS: [&str; 12] = [
+    // Set by the AppImage runtime (AppRun).
+    "PATH",
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
+    "XDG_DATA_DIRS",
+    "GSETTINGS_SCHEMA_DIR",
+    // Set by the linuxdeploy GTK hook.
     "GTK_PATH",
+    "GTK_EXE_PREFIX",
+    "GTK_DATA_PREFIX",
+    "GTK_IM_MODULE_FILE",
     "GDK_PIXBUF_MODULE_FILE",
     "GIO_MODULE_DIR",
-    "GSETTINGS_SCHEMA_DIR",
+    "GIO_EXTRA_MODULES",
 ];
 
 /// Remove the colon-separated entries that live under `appdir` (the AppImage
@@ -2016,9 +3362,7 @@ fn open_in_new_browser_window(url: &str) -> Result<(), String> {
     let mut cmd = std::process::Command::new(&browser);
     cmd.args(["--new-window", url]);
     apply_appimage_sanitization(&mut cmd);
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("{}: {}", browser, e))
+    spawn_and_reap(&mut cmd).map_err(|e| format!("{}: {}", browser, e))
 }
 
 /// Copy text to the clipboard, best-effort. Tries Wayland (`wl-copy`) then X11
@@ -2042,7 +3386,11 @@ fn copy_to_clipboard(text: &str) -> bool {
             if let Some(mut stdin) = child.stdin.take() {
                 let _ = stdin.write_all(text.as_bytes());
             }
-            // Do not wait: wl-copy stays resident to serve the clipboard.
+            // Do not block here (wl-copy forks a resident server and its
+            // parent exits at once); reap the child on a thread.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             return true;
         }
     }
@@ -2059,9 +3407,7 @@ fn open_url_in_browser(url: &str) -> Result<(), String> {
     let mut cmd = std::process::Command::new("xdg-open");
     cmd.arg(url);
     apply_appimage_sanitization(&mut cmd);
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("xdg-open: {}", e))
+    spawn_and_reap(&mut cmd).map_err(|e| format!("xdg-open: {}", e))
 }
 
 /// Whether `notify-send` can attach a clickable action (libnotify >= 0.8).
@@ -2116,18 +3462,16 @@ fn notify_sign_in_link(url: &str, on_clipboard: bool) {
     }
 }
 
-/// Open a URL in the user's browser, and make sure the user can find it.
+/// Open a URL in the user's browser.
 ///
 /// On Wayland an app cannot raise a window, and a URL opened in an
 /// already-running browser lands as a background tab the user may never see. So
-/// on Linux: open a new browser window (a focusing compositor raises it), copy
-/// the URL to the clipboard, and post a notification (clickable where the daemon
-/// supports it) that names the link. Off Linux, use the opener plugin unchanged.
+/// on Linux open a new browser window (a focusing compositor raises it); the
+/// sign-in flow adds the clipboard copy and notification itself (see
+/// `open_sign_in`). Off Linux, use the opener plugin unchanged.
 fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        let on_clipboard = copy_to_clipboard(url);
-        notify_sign_in_link(url, on_clipboard);
         if open_url_in_browser(url).is_ok() {
             return Ok(());
         }
@@ -2138,8 +3482,6 @@ fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Open the browser to the Klaay Frontend sign-in page; it deep-links back via
-/// `klaayguard://auth-callback?token=…`. Invoked from the tray "Sign in" item.
 /// Open a Klaay Frontend path in the default browser.
 fn open_frontend(app: &tauri::AppHandle, path: &str) {
     let url = format!("{}{}", get_frontend_url(), path);
@@ -2149,19 +3491,43 @@ fn open_frontend(app: &tauri::AppHandle, path: &str) {
     }
 }
 
-/// Open the Klaay Frontend sign-in page; it deep-links back via klaayguard://. Issues a
-/// fresh single-use `state` nonce (stored in AppState) and passes it along so the
-/// callback can be bound to a sign-in *this* app initiated. If the OS RNG is somehow
-/// unavailable we open without a nonce (rollout accept-missing path) rather than block
-/// sign-in entirely.
+/// How long a minted sign-in nonce stays valid for reuse. The app itself opens
+/// more than one sign-in tab (startup nudge, tray click, 401 nudge), and each
+/// must carry a state the callback check accepts, so a fresh nonce is minted
+/// only when none is pending or the pending one is older than this.
+const AUTH_NONCE_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Open the Klaay Frontend sign-in page; it deep-links back via klaayguard://. Passes
+/// the single-use `state` nonce (stored in AppState) along so the callback can be
+/// bound to a sign-in *this* app initiated. If the OS RNG is somehow unavailable we
+/// open without a nonce (rollout accept-missing path) rather than block sign-in
+/// entirely.
 fn open_sign_in(app: &tauri::AppHandle) {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let nonce = {
+        let mut pending = lock_write(&state.pending_auth_state);
+        let reusable = pending
+            .as_ref()
+            .filter(|(_, minted)| minted.elapsed() < AUTH_NONCE_TTL)
+            .map(|(nonce, _)| nonce.clone());
+        reusable.or_else(|| {
+            let fresh = generate_auth_nonce()?;
+            *pending = Some((fresh.clone(), Instant::now()));
+            Some(fresh)
+        })
+    };
     let mut path = "/login?app=klaayguard".to_string();
-    if let Some(nonce) = generate_auth_nonce() {
-        let state = app.state::<Arc<AppState>>().inner().clone();
-        tauri::async_runtime::block_on(async {
-            *state.pending_auth_state.write().await = Some(nonce.clone());
-        });
+    if let Some(nonce) = nonce {
         path.push_str(&format!("&state={}", nonce));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // On Wayland the browser window may not surface: put the link on the
+        // clipboard and in a notification (clickable where the daemon supports
+        // it), for the sign-in flow only.
+        let url = format!("{}{}", get_frontend_url(), path);
+        let on_clipboard = copy_to_clipboard(&url);
+        notify_sign_in_link(&url, on_clipboard);
     }
     open_frontend(app, &path);
 }
@@ -2213,10 +3579,10 @@ fn fmt_countdown(secs: i64) -> String {
 
 /// Refresh the single tray item: a clickable "Sign in" when signed out, or a greyed
 /// countdown to the next fetch when signed in. Menu mutation runs on the main thread.
-async fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    let (text, enabled) = if state.auth_token.read().await.is_some() {
+fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    let (text, enabled) = if lock_read(&state.auth_token).is_some() {
         let interval = collection_interval_seconds() as i64;
-        let remaining = match *state.last_attempt_at.read().await {
+        let remaining = match *lock_read(&state.last_attempt_at) {
             Some(t) => (interval - t.elapsed().as_secs() as i64).max(0),
             None => 0,
         };
@@ -2262,25 +3628,34 @@ const SIGN_OUT_LABEL: &str = "Sign out";
 /// from the OS credential store, forget any pending sign-in nonce, and refresh
 /// the tray. refresh_tray then turns the dot red and removes the "Sign out"
 /// item. An explicit sign out deletes the stored token, unlike an invalidated
-/// one, so the next start does not reuse it.
-async fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    *state.auth_token.write().await = None;
-    *state.pending_auth_state.write().await = None;
-    if let Err(e) = keychain::delete_token() {
-        log::warn!("sign out: could not delete stored token: {}", e);
+/// one, so the next start does not reuse it; if the store refuses, the next
+/// start WILL sign back in, so that is reported, not shrugged off.
+fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
+    *lock_write(&state.auth_token) = None;
+    *lock_write(&state.pending_auth_state) = None;
+    match keychain::delete_token() {
+        Ok(()) => log::info!("user signed out from the tray"),
+        Err(e) => {
+            log::error!("sign out incomplete: {}", e);
+            sentry::capture_message(&format!("sign_out_incomplete: {}", e), Level::Error);
+            notify_user(
+                "KlaayGuard",
+                "Sign out could not remove the stored sign-in; it will be used again at the next start.",
+            );
+        }
     }
-    log::info!("user signed out from the tray");
     let _ = app.emit("auth:status", json!({ "authenticated": false }));
     add_breadcrumb("auth", "user_signed_out", Level::Info);
-    refresh_tray(app, state).await;
+    refresh_tray(app, state);
 }
 
-/// Handle a click on the tray "Sign out" item.
+/// Handle a click on the tray "Sign out" item. The keyring delete blocks
+/// (D-Bus, Keychain), so it runs off the tray thread.
 fn handle_sign_out_click(app: &tauri::AppHandle) {
     let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<Arc<AppState>>().inner().clone();
-        sign_out(&app, &state).await;
+        sign_out(&app, &state);
     });
 }
 
@@ -2290,7 +3665,7 @@ fn spawn_tray_clock(app: tauri::AppHandle, state: Arc<AppState>) {
         let mut iv = tokio::time::interval(Duration::from_secs(1));
         loop {
             iv.tick().await;
-            refresh_tray(&app, &state).await;
+            refresh_tray(&app, &state);
         }
     });
 }
@@ -2306,7 +3681,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         api_base
     );
 
-    let client = reqwest::Client::new();
+    let client = http_client(Some(Duration::from_secs(30)));
 
     // Get latest release info
     let response = client
@@ -2390,13 +3765,14 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         // installs go through the package manager, so they skip.
         #[cfg(target_os = "linux")]
         {
-            let appimage = std::env::var("APPIMAGE").ok();
-            let Some(_target) = appimage_update_target(appimage.as_deref()) else {
+            // The file to replace on self-update is our own AppImage; deb and
+            // rpm installs update through the package manager.
+            if own_appimage().is_none() {
                 log::info!(
                     "ℹ️  Auto-update on Linux serves AppImage installs only; this is not one"
                 );
                 return Ok(None);
-            };
+            }
             return match select_appimage_asset(&release.assets, std::env::consts::ARCH) {
                 Some(asset) => {
                     log::info!(
@@ -2419,21 +3795,51 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             };
         }
 
+        // Windows self-update reruns the NSIS installer we ship, so the update
+        // path and the manual install path use one artifact and one hook set.
+        #[cfg(target_os = "windows")]
+        {
+            let Some(arch_tag) = windows_arch_tag(std::env::consts::ARCH) else {
+                log::info!(
+                    "ℹ️  Auto-update on Windows has no artifact tag for this architecture ({})",
+                    std::env::consts::ARCH
+                );
+                return Ok(None);
+            };
+            return match select_windows_installer_asset(&release.assets, arch_tag) {
+                Some(asset) => {
+                    log::info!(
+                        "✅ Selected Windows {} installer update: {} (ID: {})",
+                        arch_tag,
+                        asset.original_name.as_deref().unwrap_or(&asset.name),
+                        asset.id
+                    );
+                    Ok(Some(SelectedUpdate {
+                        asset_id: asset.id.to_string(),
+                        sha256: asset.sha256.clone(),
+                    }))
+                }
+                None => {
+                    log::warn!("⚠️  No Windows {} installer asset in the release", arch_tag);
+                    Ok(None)
+                }
+            };
+        }
+
         // The manifest returns every macOS build (arm64 + x64); the human-facing
         // `name` does not distinguish them, so match on `original_name` (the real
         // artifact filename) against THIS host's architecture. Picking the wrong
         // arch would install an app the arch-mismatch gate then refuses to launch.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         let Some((arch_tag, arch_label)) = host_arch_tags() else {
             log::info!(
-                "ℹ️  Auto-update supports macOS and Linux AppImage installs; skipping on {} {}",
-                std::env::consts::OS,
+                "ℹ️  Auto-update has no macOS artifact for this architecture ({})",
                 std::env::consts::ARCH
             );
             return Ok(None);
         };
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
         if let Some(dmg_asset) = select_dmg_asset(&release.assets, arch_tag, arch_label) {
             log::info!(
                 "✅ Selected {} update: {} (ID: {})",
@@ -2484,7 +3890,9 @@ async fn download_and_install_update_internal(
         asset_id
     );
 
-    let client = reqwest::Client::new();
+    // No overall deadline: an installer download that is slow but alive must
+    // finish; the read timeout bounds silence instead.
+    let client = http_client(None);
 
     // Download the DMG
     let download_url = format!("{}/klaayguard/download/{}", api_base, asset_id);
@@ -2522,21 +3930,41 @@ async fn download_and_install_update_internal(
         None => log::warn!("⚠️  No checksum provided for update asset; skipping verification"),
     }
 
+    // macOS gets a codesign gate after the checksum; Linux and Windows have
+    // nothing after it. Refuse to install unverifiable bytes there.
+    if expected_sha256.is_none() && update_requires_checksum(std::env::consts::OS) {
+        let msg = format!(
+            "No checksum for the {} update; refusing to install",
+            std::env::consts::OS
+        );
+        log::error!("❌ {}", msg);
+        sentry::capture_message(&msg, Level::Error);
+        return Err(msg);
+    }
+
     #[cfg(target_os = "linux")]
     {
-        // macOS gets a codesign gate after the checksum; Linux has nothing
-        // after it. Refuse to install unverifiable bytes.
-        if expected_sha256.is_none() {
-            let msg = "No checksum for the AppImage update; refusing to install".to_string();
-            log::error!("❌ {}", msg);
-            sentry::capture_message(&msg, Level::Error);
-            return Err(msg);
-        }
         return install_appimage_update(&bytes, app);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return install_windows_update(&bytes, expected_sha256, app);
     }
 
     #[cfg(target_os = "macos")]
     {
+        // The swap creates entries in /Applications (root:admin 775), which a
+        // standard user cannot do. Say so before pulling the DMG every 6 h.
+        if nix::unistd::access("/Applications", nix::unistd::AccessFlags::W_OK).is_err() {
+            let msg = "No write access to /Applications (not an admin user); the update \
+                       must be installed by an administrator or MDM"
+                .to_string();
+            log::error!("❌ {}", msg);
+            report_update_failure_once(&msg);
+            return Err(msg);
+        }
+
         // Stage the download in a private, process-scoped temp path rather than the
         // world-known ~/Downloads/KlaayGuard-update.dmg. The signature gate in
         // replace_application verifies the *mounted* bundle, so this is defense-in-depth
@@ -2564,9 +3992,9 @@ async fn download_and_install_update_internal(
         Ok(())
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        // app is consumed only by the linux and macOS install arms.
+        // app is consumed only by the platform install arms.
         let _ = app;
         Err("auto-update is not supported on this platform".to_string())
     }
@@ -2580,9 +4008,10 @@ fn install_appimage_update(bytes: &[u8], app: &tauri::AppHandle) -> Result<(), S
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-    let target = appimage_update_target(std::env::var("APPIMAGE").ok().as_deref())
-        .ok_or_else(|| "APPIMAGE not set; not an AppImage install".to_string())?;
-    let staged = staged_appimage_path(&target, std::process::id());
+    let target = own_appimage().ok_or_else(|| {
+        "APPIMAGE not set or not this process's image; not an AppImage install".to_string()
+    })?;
+    let staged = staged_sibling_path(&target, std::process::id());
 
     // Create the staged file exclusively (create_new) with private perms, so a
     // pre-planted symlink or a hostile file in a shared directory cannot be
@@ -2670,6 +4099,115 @@ fn install_appimage_update(bytes: &[u8], app: &tauri::AppHandle) -> Result<(), S
     Ok(())
 }
 
+/// Where to stage the downloaded installer: a private per-user directory
+/// under the local app data root, next to the logs. Another user cannot write
+/// there, so nothing swaps the installer between our write and our run.
+/// `data_local` is a parameter so the path rule is testable on any host.
+#[cfg(any(target_os = "windows", test))]
+fn windows_update_dir(data_local: &std::path::Path) -> std::path::PathBuf {
+    data_local.join("com.klaay.app").join("updates")
+}
+
+/// The installer command line for an unattended update, the same flags
+/// tauri-plugin-updater passes. `/S` runs the NSIS installer with no window
+/// and no prompt; in silent mode the Tauri template stops the running agent
+/// itself instead of asking. `/UPDATE` tells the template this is an update:
+/// it skips the WebView2 bootstrapper section (whose abort would leave the
+/// agent down after we have exited) and creates no new shortcuts, so one the
+/// user removed stays removed. `/R` makes the installer start the new agent
+/// when it finishes, as the logged-in user. Without `/S` an unattended
+/// machine stalls on the "close the app" prompt forever.
+#[cfg(any(target_os = "windows", test))]
+fn windows_installer_args() -> [&'static str; 3] {
+    ["/S", "/UPDATE", "/R"]
+}
+
+/// Run the downloaded NSIS installer over this install and let it restart the
+/// agent. Windows cannot overwrite a running .exe, so the installer stops this
+/// process; we exit right after the spawn so it never has to kill us
+/// mid-write. The installer also rewrites the Run key, so every update
+/// repairs autostart.
+#[cfg(target_os = "windows")]
+fn install_windows_update(
+    bytes: &[u8],
+    expected_sha256: Option<&str>,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+
+    // The caller refuses a missing checksum on Windows already; keep the gate
+    // here too so this function is safe on its own.
+    let expected = expected_sha256.ok_or("no checksum for the Windows update")?;
+
+    let dir = windows_update_dir(&dirs::data_local_dir().ok_or("no local app data directory")?);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("update dir: {}", e))?;
+    // A fixed name means at most one stale file, not one per update. Linux
+    // needs a pid suffix because it renames over a live target; we do not.
+    let staged = dir.join("KlaayGuard-update.exe");
+    let _ = std::fs::remove_file(&staged);
+
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&staged)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        // Never leave a partial installer behind.
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("stage installer: {}", e));
+    }
+
+    // Re-read and re-verify the bytes on disk. Until Authenticode signing is
+    // live this is the only check that happens after the bytes hit disk; it
+    // catches a short write and narrows the swap window.
+    let on_disk = std::fs::read(&staged).map_err(|e| format!("re-read installer: {}", e))?;
+    if !sha256_matches(&on_disk, expected) {
+        let _ = std::fs::remove_file(&staged);
+        let msg = "Staged Windows installer does not match its checksum".to_string();
+        log::error!("❌ {}", msg);
+        sentry::capture_message(&msg, Level::Error);
+        return Err(msg);
+    }
+
+    // Leave any job object the agent was started in. A launcher that puts
+    // its children in a kill-on-close job (an SSH session does; some
+    // management tools do) would otherwise take the installer down with the
+    // agent when it exits. Breakaway is refused when the job forbids it, so
+    // fall back to a plain spawn rather than fail the update.
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    log::info!("🔄 Running installer {:?} silently", staged);
+    let launch = |flags: u32| {
+        std::process::Command::new(&staged)
+            .args(windows_installer_args())
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    let spawn = launch(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB).or_else(|e| {
+        log::warn!(
+            "installer spawn with job breakaway failed ({}); retrying without",
+            e
+        );
+        launch(CREATE_NO_WINDOW)
+    });
+    if let Err(e) = spawn {
+        // Nothing is installed yet, so the running agent stays as it is and
+        // the error is honest. This differs from the Linux relaunch rule,
+        // where the bytes were already in place.
+        let msg = format!("installer spawn failed: {}", e);
+        log::error!("❌ {}", msg);
+        sentry::capture_message(&format!("windows_update_spawn_failed: {}", e), Level::Error);
+        return Err(msg);
+    }
+    log::info!("✅ Installer started; exiting so it can replace this process");
+    app.exit(0);
+    Ok(())
+}
+
 /// Klaay's Apple Developer Team ID (the OU of our Developer ID Application cert).
 /// The update's signature MUST chain to Apple and carry this team, or we refuse to
 /// install it.
@@ -2742,7 +4280,7 @@ fn verify_klaay_signature(app_path: &std::path::Path) -> Result<(), String> {
 /// a table; the mount point is the last tab-separated field of the line that
 /// names a `/Volumes/` path. A volume name may contain spaces, so split on tabs,
 /// not spaces.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", test))]
 fn parse_hdiutil_mount_point(stdout: &str) -> Option<&str> {
     stdout
         .lines()
@@ -2752,23 +4290,11 @@ fn parse_hdiutil_mount_point(stdout: &str) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Where to stage the downloaded `.app`: the same directory as the target, so
-/// the final rename stays on one filesystem and is atomic. Mirrors
-/// `staged_appimage_path` for the macOS bundle.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn staged_app_path(target: &std::path::Path, pid: u32) -> std::path::PathBuf {
-    let base = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "KlaayGuard.app".to_string());
-    target.with_file_name(format!(".{}.update-{}", base, pid))
-}
-
 /// Detach a mounted update volume. Tries a graceful detach, then a forced one,
 /// so a busy volume still comes down. Runs on every path — success or failure —
 /// so a failed update never leaks a `/Volumes/KlaayGuard` mount that forces the
 /// next one to mount as `/Volumes/KlaayGuard 1`.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 fn detach_dmg(mount_point: &str) {
     log::info!("💿 Unmounting DMG from: {}", mount_point);
     let detached = std::process::Command::new("hdiutil")
@@ -2802,7 +4328,7 @@ fn stage_verify_and_swap(
     target_app: &std::path::Path,
 ) -> Result<(), String> {
     let pid = std::process::id();
-    let staged = staged_app_path(target_app, pid);
+    let staged = staged_sibling_path(target_app, pid);
     let base = target_app
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -2860,9 +4386,8 @@ fn stage_verify_and_swap(
     }
 }
 
-/// Verify and install the mounted bundle into `/Applications`. Returns without
-/// touching the disk on a non-macOS host — this arm only runs on macOS.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// Verify and install the mounted bundle into `/Applications`.
+#[cfg(target_os = "macos")]
 fn install_from_mount(mount_point: &str) -> Result<(), String> {
     let source_app = std::path::Path::new(mount_point).join("KlaayGuard.app");
     let target_app = std::path::Path::new("/Applications/KlaayGuard.app");
@@ -2874,19 +4399,10 @@ fn install_from_mount(mount_point: &str) -> Result<(), String> {
         return Err(format!("Source app not found at: {:?}", source_app));
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        stage_verify_and_swap(&source_app, target_app)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = target_app;
-        Err("macOS update path invoked on a non-macOS host".to_string())
-    }
+    stage_verify_and_swap(&source_app, target_app)
 }
 
-// Called only from the macOS update arm; dead on Linux and Windows.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(target_os = "macos")]
 async fn replace_application(
     dmg_path: &std::path::Path,
     app: &tauri::AppHandle,
@@ -2940,23 +4456,17 @@ async fn replace_application(
     log::info!("🎉 Application updated successfully! Restarting...");
     app.restart();
 }
-/// Main entry point for the KlaayGuard security monitoring application.
-///
-/// This function initializes the Tauri application with security-focused configuration:
-/// - Hides the app from the dock on macOS for background operation
-/// - Creates a system tray with limited options (no quit functionality)
-/// - Sets up automatic updates for security patches
-/// - Configures window behavior to prevent accidental closure
-///
-/// Security Features:
-/// - Background operation prevents easy termination
-/// - System tray provides controlled access
-/// - Automatic updates ensure latest security patches
 fn update_check_interval_seconds() -> u64 {
-    std::env::var("KLAAYGUARD_UPDATE_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(6 * 60 * 60)
+    env_seconds("KLAAYGUARD_UPDATE_INTERVAL_SECONDS", 6 * 60 * 60)
+}
+
+/// Report a failed update to Sentry once per process: the check repeats every
+/// 6 h, and a device that can never update must be visible, not a log line.
+fn report_update_failure_once(msg: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        sentry::capture_message(&format!("auto_update_failed: {}", msg), Level::Error);
+    }
 }
 
 /// One update check: if a newer build is offered, download + verify + install it
@@ -2974,6 +4484,7 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
             .await
             {
                 log::error!("💥 Auto-update failed: {}", e);
+                report_update_failure_once(&e);
             }
         }
         Ok(None) => log::info!("✅ No updates available - app is up to date"),
@@ -2983,26 +4494,133 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
 
 /// Check for updates immediately, then on a recurring interval (default 6h), so the
 /// always-on agent self-updates in place rather than only at restart.
-fn spawn_update_loop(app: tauri::AppHandle) {
+fn spawn_update_loop(app: tauri::AppHandle, api_base: String) {
     tauri::async_runtime::spawn(async move {
         let mut interval =
             tokio::time::interval(Duration::from_secs(update_check_interval_seconds()));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await; // first tick is immediate (startup check)
-            let api_base = get_api_base_url();
             log::info!("🚀 Update check against {}", api_base);
             run_update_check(&api_base, &app).await;
         }
     });
 }
 
+/// Startup work that may block: the deep-link handler and autostart entries,
+/// then the stored token, then the launch URL or the sign-in nudge. Runs off
+/// the main thread so the tray is already visible while a locked keyring waits
+/// on its prompt.
+fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
+    // Register the klaayguard:// handler for this user at run time.
+    // Linux package installs also register it through the desktop
+    // entry, and the AppImage has only this path. The Windows
+    // installer writes the same keys, but only this path repairs them
+    // when another program takes the scheme or the install moves.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        use tauri_plugin_deep_link::DeepLinkExt;
+        if let Err(e) = app.deep_link().register_all() {
+            log::error!("deep_link register_all failed: {}", e);
+            sentry::capture_message(&format!("deep_link_register_failed: {}", e), Level::Error);
+        }
+    }
+    // From an AppImage the plugin's own xdg-mime call runs with the bundled
+    // library paths and fails, so repeat it with a clean environment.
+    #[cfg(target_os = "linux")]
+    repair_deep_link_registration(&app);
+
+    // Start at login, like the macOS LaunchAgent. An agent that only runs
+    // when a human remembers to launch it leaves gaps the fleet dashboard
+    // cannot tell from an offline machine.
+    #[cfg(target_os = "linux")]
+    {
+        match install_autostart_entry() {
+            Ok(()) => warn_if_autostart_unserved(),
+            Err(e) => {
+                log::error!("autostart install failed: {}", e);
+                sentry::capture_message(&format!("autostart_install_failed: {}", e), Level::Error);
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = ensure_autostart_entry() {
+            log::error!("autostart repair failed: {}", e);
+            sentry::capture_message(&format!("autostart_install_failed: {}", e), Level::Error);
+        }
+    }
+
+    // Load any saved token; if absent, nudge the user to sign in via the tray.
+    let authed = match keychain::load_token() {
+        Ok(Some(tok)) => {
+            *lock_write(&state.auth_token) = Some(tok);
+            state.token_acquired.notify_one();
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            // A broken credential store looks like "not signed in" to
+            // the user. Report it so support can tell the two apart.
+            log::error!("keychain: token load failed: {}", e);
+            sentry::capture_message(&format!("keychain_token_load_failed: {}", e), Level::Error);
+            false
+        }
+    };
+    if authed {
+        log::info!("KlaayGuard started - authenticated, collecting in background");
+    } else {
+        log::info!("KlaayGuard started - sign-in required");
+    }
+
+    // A launch by klaayguard:// URL (first instance) is a sign-in in
+    // progress: hand it to the handler and do not open a second login tab.
+    if !try_handle_deep_link_from_args(&app, &state) && !authed {
+        notify_signin_needed(&app, &state);
+    }
+}
+
+/// Main entry point for the KlaayGuard security monitoring application.
+///
+/// This function initializes the Tauri application with security-focused configuration:
+/// - Hides the app from the dock on macOS for background operation
+/// - Creates a system tray with limited options (no quit functionality)
+/// - Sets up automatic updates for security patches
+/// - Configures window behavior to prevent accidental closure
+///
+/// Security Features:
+/// - Background operation prevents easy termination
+/// - System tray provides controlled access
+/// - Automatic updates ensure latest security patches
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // CLI seam: `--install-agent` registers the launchd LaunchAgent and exits
     // immediately, without entering the Tauri event loop. The macOS .pkg
     // postinstall script invokes this (as the console user) so setup happens at
     // install time instead of relying on the user launching the app manually.
+    // Uninstall seam: `--forget-credentials` clears the stored sign-in and the
+    // staged installer, then exits. The Windows uninstaller runs it (see
+    // windows/hooks.nsi) so an offboarded machine keeps no bearer token; the
+    // device identity stays, so a reinstall continues the same device record.
+    if std::env::args().any(|a| a == "--forget-credentials") {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(local) = dirs::data_local_dir() {
+                let _ = std::fs::remove_dir_all(windows_update_dir(&local));
+            }
+        }
+        match keychain::delete_token() {
+            Ok(()) => {
+                println!("forget-credentials: stored sign-in cleared");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("forget-credentials failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if std::env::args().any(|a| a == "--install-agent") {
         #[cfg(target_os = "macos")]
         {
@@ -3024,41 +4642,36 @@ pub fn run() {
         }
     }
 
-    // Prefer runtime env; fall back to compile-time embedded default; then hard-coded prod
-    let api_base = std::env::var("VITE_API_BASE_URL")
-        .ok()
-        .or_else(|| option_env!("APP_DEFAULT_API_BASE_URL").map(|s| s.to_string()))
-        .unwrap_or_else(|| "https://api.klaay.com".to_string());
-    if let Ok(frontend) = std::env::var("VITE_FRONTEND_URL") {
+    // Runtime env, else the compile-time default build.rs baked in.
+    let api_base = get_api_base_url();
+    let frontend = get_frontend_url();
+    add_breadcrumb(
+        "startup",
+        &format!("endpoints api:{} frontend:{}", api_base, frontend),
+        Level::Info,
+    );
+    // naive mismatch hint: localhost vs non-localhost
+    let api_is_local = api_base.contains("localhost") || api_base.contains("127.0.0.1");
+    let ew_is_local = frontend.contains("localhost") || frontend.contains("127.0.0.1");
+    if api_is_local ^ ew_is_local {
         add_breadcrumb(
             "startup",
-            &format!("endpoints api:{} frontend:{}", api_base, frontend),
-            Level::Info,
-        );
-        // naive mismatch hint: localhost vs non-localhost
-        let api_is_local = api_base.contains("localhost") || api_base.contains("127.0.0.1");
-        let ew_is_local = frontend.contains("localhost") || frontend.contains("127.0.0.1");
-        if api_is_local ^ ew_is_local {
-            add_breadcrumb(
-                "startup",
-                "endpoint_mismatch_local_vs_remote",
-                Level::Warning,
-            );
-        }
-    } else {
-        add_breadcrumb(
-            "startup",
-            &format!("endpoints api:{} frontend:<unset>", api_base),
-            Level::Info,
+            "endpoint_mismatch_local_vs_remote",
+            Level::Warning,
         );
     }
     let state = Arc::new(AppState {
         auth_token: RwLock::new(None),
-        api_base_url: RwLock::new(api_base),
-        last_run_at: RwLock::new(None),
+        api_base_url: api_base,
         last_attempt_at: RwLock::new(None),
         last_focus_at: RwLock::new(None),
         pending_auth_state: RwLock::new(None),
+        device_identity: RwLock::new(None),
+        token_acquired: tokio::sync::Notify::new(),
+        // Assume a usable tray until setup proves otherwise, so a nudge that
+        // somehow runs first does not open a window on a healthy desktop.
+        tray_built: std::sync::atomic::AtomicBool::new(true),
+        tray_watcher_present: std::sync::atomic::AtomicBool::new(true),
     });
 
     let app = tauri::Builder::default()
@@ -3072,18 +4685,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // Handle deep link if present in args (secondary launches)
             let st = app.state::<Arc<AppState>>().inner().clone();
-            log::info!(
-                "single_instance_args count={} sample_arg0={}",
-                args.len(),
-                args.first().cloned().unwrap_or_default()
-            );
-            for a in args {
-                if a.starts_with("klaayguard://") {
-                    log::info!("single_instance_deep_link_received");
-                    handle_deep_link_url(app, &st, &a);
-                    break;
-                }
-            }
+            dispatch_deep_link_args(app, &st, &args, "single_instance");
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
         .plugin(tauri_plugin_shell::init())
@@ -3102,33 +4704,6 @@ pub fn run() {
                 log::info!("KlaayGuard configured as background service - tray only, hidden from dock");
             }
 
-            // Register the klaayguard:// handler for this user at run time.
-            // Package installs also register it system-wide through the
-            // bundler's desktop entry; the AppImage has only this path, since
-            // nothing installs its desktop entry for it.
-            #[cfg(target_os = "linux")]
-            {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                if let Err(e) = app.deep_link().register_all() {
-                    log::error!("deep_link register_all failed: {}", e);
-                    sentry::capture_message(
-                        &format!("deep_link_register_failed: {}", e),
-                        Level::Error,
-                    );
-                }
-
-                // Start at login, like the macOS LaunchAgent. An agent that
-                // only runs when a human remembers to launch it leaves gaps
-                // the fleet dashboard cannot tell from an offline machine.
-                if let Err(e) = install_autostart_entry() {
-                    log::error!("autostart install failed: {}", e);
-                    sentry::capture_message(
-                        &format!("autostart_install_failed: {}", e),
-                        Level::Error,
-                    );
-                }
-            }
-
             // Architecture mismatch: warn the user natively and do NOT start the
             // collection loop (the binary can't run correctly on this hardware).
             if std::env::var("KLAAY_ARCH_MISMATCH").ok().as_deref() == Some("1") {
@@ -3143,77 +4718,27 @@ pub fn run() {
                         "display dialog \"KlaayGuard was built for {} but this Mac is {}. Please reinstall the correct build.\" buttons {{\"OK\"}} with icon stop with title \"KlaayGuard\"",
                         built, host
                     );
-                    let _ = std::process::Command::new("osascript")
-                        .args(["-e", &script])
-                        .spawn();
+                    let mut cmd = std::process::Command::new("osascript");
+                    cmd.args(["-e", &script]);
+                    let _ = spawn_and_reap(&mut cmd);
                 }
                 return Ok(());
             }
 
-            // Check if we're already running as a regular process to prevent duplicates
-            // Duplicate instance prevention handled by single-instance plugin; remove manual pgrep/exit logic
+            let state = app.state::<Arc<AppState>>().inner().clone();
 
-            // Check for updates on startup AND on a recurring interval, so an
-            // always-on agent self-updates in place without waiting for a restart.
-            spawn_update_loop(app.handle().clone());
-
-            // Install and kickstart LaunchAgent with KeepAlive
-            #[cfg(target_os = "macos")]
-            {
-                tauri::async_runtime::spawn(async {
-                    if let Err(e) = install_launch_agent().await {
-                        log::error!("LaunchAgent install failed: {}", e);
-                        sentry::capture_message(
-                            &format!("launch_agent_install_failed:{}", e),
-                            Level::Error,
-                        );
-                    }
-                });
-            }
-            // Load any saved token; if absent, nudge the user to sign in via the tray.
-            let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
-            let authed = match keychain::load_token() {
-                Ok(Some(tok)) => {
-                    tauri::async_runtime::block_on(async {
-                        *state_for_loop.auth_token.write().await = Some(tok);
-                    });
-                    true
-                }
-                Ok(None) => false,
-                Err(e) => {
-                    // A broken credential store looks like "not signed in" to
-                    // the user. Report it so support can tell the two apart.
-                    log::error!("keychain: token load failed: {}", e);
-                    sentry::capture_message(
-                        &format!("keychain_token_load_failed: {}", e),
-                        Level::Error,
-                    );
-                    false
-                }
-            };
-            if authed {
-                log::info!("KlaayGuard started - authenticated, collecting in background");
-            } else {
-                log::info!("KlaayGuard started - sign-in required");
-                let st = state_for_loop.clone();
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(
-                    async move { notify_signin_needed(&app_handle, &st).await },
-                );
-            }
-
-            // Handle deep link if app was launched by klaayguard:// URL (first instance)
-            try_handle_deep_link_from_args(app.handle(), &state_for_loop);
-
-            // Tray menu: live auth/countdown item, an Employee Hub link, and a
-            // version line. "Sign out" is appended below the version only while
-            // signed in (see refresh_tray), so it sits at the very bottom, away
-            // from the other clickable items. No quit.
+            // Tray menu first, in a neutral state, so the icon is up before any
+            // credential-store, D-Bus, or network work; the tray clock flips it
+            // to the real state within a second. A live auth/countdown item, an
+            // Employee Hub link, and a version line. "Sign out" is appended
+            // below the version only while signed in (see refresh_tray), so it
+            // sits at the very bottom, away from the other clickable items. No
+            // quit.
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
-                if authed { "Signed in" } else { "Sign in" },
-                !authed,
+                "Starting…",
+                false,
                 None::<&str>,
             )?;
             let hub_i = tauri::menu::MenuItem::with_id(
@@ -3247,12 +4772,6 @@ pub fn run() {
                     &version_i,
                 ],
             )?;
-            // Start with "Sign out" present only if already signed in; the
-            // last_signed_in state below matches, so refresh_tray keeps it in
-            // sync on later flips.
-            if authed {
-                let _ = menu.append(&sign_out_i);
-            }
             // Status-dot icons: green when signed in, red when not. A tray
             // failure must not kill the agent: collection works without a
             // tray, and Linux gets a fallback window below.
@@ -3271,7 +4790,7 @@ pub fn run() {
                         "sign_out" => handle_sign_out_click(app),
                         _ => {}
                     })
-                    .icon(if authed { green.clone() } else { red.clone() })
+                    .icon(red.clone())
                     .tooltip("KlaayGuard")
                     .menu(&menu)
                     .build(app)?;
@@ -3282,7 +4801,7 @@ pub fn run() {
                     tray,
                     green,
                     red,
-                    last_signed_in: std::sync::atomic::AtomicBool::new(authed),
+                    last_signed_in: std::sync::atomic::AtomicBool::new(false),
                 });
                 Ok(())
             })();
@@ -3291,41 +4810,57 @@ pub fn run() {
                 sentry::capture_message(&format!("tray_build_failed: {}", e), Level::Error);
             }
 
-            // Stock GNOME shows no AppIndicator tray. When the tray cannot
-            // be the UI, open a small window so the user can still sign in.
+            // Stock GNOME shows no AppIndicator tray. Record both facts here;
+            // the sign-in nudge opens the fallback window when it needs one.
+            // Only a tray that failed to build leaves no UI at all, so only
+            // that case opens a window before the stored token is read.
             #[cfg(target_os = "linux")]
             {
                 let watcher = status_notifier_watcher_present();
-                if fallback_window_needed(tray_built.is_ok(), watcher) {
+                state
+                    .tray_built
+                    .store(tray_built.is_ok(), std::sync::atomic::Ordering::Relaxed);
+                state
+                    .tray_watcher_present
+                    .store(watcher, std::sync::atomic::Ordering::Relaxed);
+                if fallback_window_needed(tray_built.is_ok(), watcher, true) {
                     log::warn!(
                         "tray unusable (built={}, watcher={}); opening fallback window",
                         tray_built.is_ok(),
                         watcher
                     );
-                    if let Err(e) = tauri::WebviewWindowBuilder::new(
-                        app,
-                        "fallback",
-                        tauri::WebviewUrl::App("fallback.html".into()),
-                    )
-                    .title("KlaayGuard")
-                    .inner_size(440.0, 340.0)
-                    .build()
-                    {
-                        log::error!("fallback window failed: {}", e);
-                        sentry::capture_message(
-                            &format!("fallback_window_failed: {}", e),
-                            Level::Error,
-                        );
-                    }
+                    open_fallback_window(app.handle());
                 }
             }
             #[cfg(not(target_os = "linux"))]
             drop(tray_built);
-            // Spawn the single collect-and-send loop + the tray countdown clock.
-            let state_for_loop = app.state::<Arc<AppState>>().inner().clone();
+
+            // Check for updates on startup AND on a recurring interval, so an
+            // always-on agent self-updates in place without waiting for a restart.
+            spawn_update_loop(app.handle().clone(), state.api_base_url.clone());
+            // The single collect-and-send loop + the tray countdown clock.
+            spawn_tray_clock(app.handle().clone(), state.clone());
+            spawn_background_loop(app.handle().clone(), state.clone());
+
+            // Install and kickstart LaunchAgent with KeepAlive
+            #[cfg(target_os = "macos")]
+            {
+                tauri::async_runtime::spawn(async {
+                    if let Err(e) = install_launch_agent().await {
+                        log::error!("LaunchAgent install failed: {}", e);
+                        sentry::capture_message(
+                            &format!("launch_agent_install_failed:{}", e),
+                            Level::Error,
+                        );
+                    }
+                });
+            }
+
+            // Everything else blocks (desktop-database and registry writes,
+            // the credential store, which can wait on an unlock prompt), so it
+            // runs on its own thread while the event loop starts.
             let app_handle = app.handle().clone();
-            spawn_tray_clock(app_handle.clone(), state_for_loop.clone());
-            spawn_background_loop(app_handle, state_for_loop);
+            std::thread::spawn(move || startup_blocking_work(app_handle, state));
 
             Ok(())
         })
@@ -3340,7 +4875,7 @@ pub fn run() {
                 let st = _app_handle.state::<Arc<AppState>>().inner().clone();
                 for u in urls {
                     let s = u.to_string();
-                    log::info!("run_event_opened url={}", s);
+                    log::info!("run_event_opened url={}", redact_deep_link(&s));
                     handle_deep_link_url(_app_handle, &st, &s);
                 }
             }
@@ -3374,7 +4909,8 @@ mod update_selection_tests {
             r#"[
               {"id":1,"name":"Linux (Debian/Ubuntu .deb)","original_name":"KlaayGuard_0.1.12_Linux_x86_64_production.deb","sha256":"aa"},
               {"id":2,"name":"MacOS (Apple silicon)","original_name":"KlaayGuard_0.1.12_macOS_arm64_production.dmg","sha256":"bb"},
-              {"id":3,"name":"MacOS (Intel)","original_name":"KlaayGuard_0.1.12_macOS_x64_production.dmg","sha256":"cc"}
+              {"id":3,"name":"MacOS (Intel)","original_name":"KlaayGuard_0.1.12_macOS_x64_production.dmg","sha256":"cc"},
+              {"id":4,"name":"Windows Installer","original_name":"KlaayGuard_0.1.12_Windows_x64_production.exe","sha256":"dd"}
             ]"#,
         )
         .unwrap()
@@ -3425,6 +4961,86 @@ mod update_selection_tests {
     }
 
     #[test]
+    fn selects_the_windows_installer_by_arch_tag() {
+        // One release carries macOS, Linux, and Windows artifacts; matching
+        // on the friendly label alone could return a .deb.
+        let assets = manifest();
+        let sel = select_windows_installer_asset(&assets, "x64").unwrap();
+        assert_eq!(sel.id, 4);
+        assert!(sel.original_name.as_deref().unwrap().ends_with(".exe"));
+    }
+
+    #[test]
+    fn windows_installer_never_matches_a_label_only_asset() {
+        // select_dmg_asset falls back to the label. The Windows selector must
+        // not: the label carries neither architecture nor file type.
+        let label_only: Vec<ReleaseAsset> =
+            serde_json::from_value(json!([{"id": 9, "name": "Windows Installer"}])).unwrap();
+        assert!(select_windows_installer_asset(&label_only, "x64").is_none());
+    }
+
+    #[test]
+    fn windows_installer_ignores_the_other_windows_artifacts() {
+        // Turning on updater artifacts, or shipping arm64 later, must not
+        // make an x64 host download the wrong file.
+        let assets: Vec<ReleaseAsset> = serde_json::from_value(json!([
+            {"id": 1, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_x64_production.nsis.zip"},
+            {"id": 2, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_x64_production.exe.sig"},
+            {"id": 3, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_arm64_production.exe"},
+            {"id": 4, "name": "x", "original_name": "KlaayGuard_0.2.0_Windows_x64_production.exe"}
+        ]))
+        .unwrap();
+        assert_eq!(
+            select_windows_installer_asset(&assets, "x64").unwrap().id,
+            4
+        );
+        assert_eq!(
+            select_windows_installer_asset(&assets, "arm64").unwrap().id,
+            3
+        );
+    }
+
+    #[test]
+    fn windows_arch_tag_follows_the_artifact_names() {
+        // Windows artifacts use the short tag while Linux uses the Rust arch
+        // string. Passing ARCH straight through never matches, and the agent
+        // stops updating in silence.
+        assert_eq!(windows_arch_tag("x86_64"), Some("x64"));
+        assert_eq!(windows_arch_tag("aarch64"), Some("arm64"));
+        assert_eq!(windows_arch_tag("x86"), None);
+    }
+
+    #[test]
+    fn windows_installer_runs_silently_and_relaunches() {
+        // Without /S the NSIS template asks the user to close the running
+        // app; an unattended machine stalls there forever. Without /R nothing
+        // starts the new agent after the old one is stopped.
+        let args = windows_installer_args();
+        assert!(args.contains(&"/S"));
+        assert!(args.contains(&"/R"));
+        // Without /UPDATE the template runs the WebView2 bootstrapper section
+        // and re-creates shortcuts, as for a fresh install.
+        assert!(args.contains(&"/UPDATE"));
+    }
+
+    #[test]
+    fn update_requires_checksum_everywhere_but_macos() {
+        // macOS has codesign and Gatekeeper after the hash. Linux and Windows
+        // have nothing, so bytes with no server checksum must never run.
+        assert!(update_requires_checksum("linux"));
+        assert!(update_requires_checksum("windows"));
+        assert!(!update_requires_checksum("macos"));
+    }
+
+    #[test]
+    fn windows_update_dir_stays_under_the_local_app_data() {
+        // Staging in a per-user directory stops another user swapping the
+        // installer between our write and our run.
+        let dir = windows_update_dir(std::path::Path::new(r"C:\Users\u\AppData\Local"));
+        assert!(dir.ends_with(std::path::Path::new("com.klaay.app").join("updates")));
+    }
+
+    #[test]
     fn checksum_accepts_match_and_rejects_mismatch() {
         // sha256("") well-known digest, bare and "sha256:"-prefixed.
         let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -3472,6 +5088,15 @@ mod happy_path_tests {
                 "state"
             ),
             Some("deadbeef".to_string())
+        );
+        // Reserved characters arrive percent-encoded (encodeURIComponent).
+        assert_eq!(
+            deep_link_query_value("klaayguard://auth-callback?state=a%2Bb%3D", "state"),
+            Some("a+b=".to_string())
+        );
+        assert_eq!(
+            redact_deep_link("klaayguard://auth-callback?token=a.b.c&state=x"),
+            "klaayguard://auth-callback?<redacted>"
         );
         assert_eq!(
             deep_link_query_value("klaayguard://auth-callback?token=a.b.c", "state"),
@@ -3560,10 +5185,10 @@ mod happy_path_tests {
     }
 
     #[test]
-    fn config_items_dispatch_builtin_source() {
+    fn config_items_dispatch_builtin_drops_missing_check() {
         let cfg = json!({"data": [
-            {"id": "disk_encryption", "platform": "linux", "source": "builtin", "check": "disk_encryption"},
-            {"id": "broken", "source": "builtin"},
+            {"id": "disk_encryption", "platform": "linux", "type": "builtin", "check": "disk_encryption"},
+            {"id": "broken", "type": "builtin"},
             {"id": "os_version", "sql": "SELECT name FROM os_version"}
         ]});
         let items = parse_config_items(&cfg, "linux");
@@ -3576,6 +5201,23 @@ mod happy_path_tests {
         assert!(!items
             .iter()
             .any(|i| matches!(i, CollectionItem::Builtin { id, .. } if id == "broken")));
+        assert_eq!(osquery_pairs(&items).len(), 1);
+    }
+
+    #[test]
+    fn config_items_dispatch_builtin_type() {
+        // kiln's contract is `type: "builtin"`. Reading only `source` sent
+        // the Linux disk_encryption and screenlock builtins to osquery,
+        // where one misreports LUKS and the other has no table.
+        let cfg = json!({"data": [
+            {"type": "builtin", "id": "screenlock", "platform": "linux", "check": "screenlock"},
+            {"type": "osquery-table", "id": "system_info"}
+        ]});
+        let items = parse_config_items(&cfg, "linux");
+        assert!(items.contains(&CollectionItem::Builtin {
+            id: "screenlock".to_string(),
+            check: "screenlock".to_string(),
+        }));
         assert_eq!(osquery_pairs(&items).len(), 1);
     }
 
@@ -3610,12 +5252,42 @@ mod happy_path_tests {
             ]}
           ]}
         ]}"#;
-        let rows = build_disk_encryption_rows(Some(lsblk), "", Some("/home"));
+        // A real home path: the classification is of the mount it lives on.
+        let rows = build_disk_encryption_rows(Some(lsblk), "", Some("/home/u"));
         let s = summary(&rows);
         assert_eq!(s["root_encrypted"], "yes");
         // Home is on the same crypt device, matched via its mountpoints list.
         assert_eq!(s["home_encrypted"], "yes");
         assert_eq!(s["mechanisms"], json!(["luks"]));
+    }
+
+    #[test]
+    fn disk_encryption_home_resolves_to_its_enclosing_mount() {
+        // A home directory is not itself a mountpoint; with only `/` mounted
+        // it shares the root determination instead of reading "unknown".
+        let lsblk = r#"{"blockdevices":[
+          {"name":"sda","type":"disk","children":[
+            {"name":"sda1","type":"part","fstype":"ext4","mountpoint":"/"}
+          ]}
+        ]}"#;
+        let rows = build_disk_encryption_rows(Some(lsblk), "", Some("/home/u"));
+        assert_eq!(summary(&rows)["home_encrypted"], "no");
+        // Nothing mounted at all: still unknown, never a guess.
+        let rows = build_disk_encryption_rows(None, "", Some("/home/u"));
+        assert_eq!(summary(&rows)["home_encrypted"], "unknown");
+    }
+
+    #[test]
+    fn proc_mounts_octal_escapes_decode_to_bytes() {
+        // /proc/mounts escapes space as \040 and non-ASCII bytes one at a time.
+        let mounts = "/dev/sda2 /home/u/My\\040Docs ecryptfs rw 0 0\n\
+                      /dev/sda3 /mnt/caf\\303\\251 ext4 rw 0 0\n";
+        let parsed = parse_proc_mounts(mounts);
+        assert_eq!(parsed[0].mountpoint, "/home/u/My Docs");
+        assert_eq!(parsed[1].mountpoint, "/mnt/café");
+        // An ecryptfs home at a path with a space is found.
+        let rows = build_disk_encryption_rows(None, mounts, Some("/home/u/My Docs"));
+        assert_eq!(summary(&rows)["home_encrypted"], "yes");
     }
 
     #[test]
@@ -3662,8 +5334,131 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(detect_desktop(Some("GNOME")), Desktop::Gnome);
         assert_eq!(detect_desktop(Some("KDE")), Desktop::Kde);
         assert_eq!(detect_desktop(Some("Hyprland")), Desktop::Hyprland);
-        assert_eq!(detect_desktop(Some("XFCE")), Desktop::Unknown);
+        assert_eq!(detect_desktop(Some("X-Cinnamon")), Desktop::Cinnamon);
+        assert_eq!(detect_desktop(Some("MATE")), Desktop::Mate);
+        assert_eq!(detect_desktop(Some("XFCE")), Desktop::Xfce);
+        assert_eq!(detect_desktop(Some("xubuntu:XFCE")), Desktop::Xfce);
         assert_eq!(detect_desktop(None), Desktop::Unknown);
+    }
+
+    #[test]
+    fn xset_timeout_reads_the_x_screensaver_blank_delay() {
+        let out = "Keyboard Control:\n  auto repeat:  on\nScreen Saver:\n  \
+                   prefer blanking:  yes    allow exposures:  yes\n  \
+                   timeout:  600    cycle:  600\nColors:\n";
+        assert_eq!(parse_xset_timeout(out), Some(600));
+        // A zero timeout means X never blanks, so light-locker never fires.
+        assert_eq!(
+            parse_xset_timeout("Screen Saver:\n  timeout:  0    cycle:  0\n"),
+            Some(0)
+        );
+        assert_eq!(parse_xset_timeout("no screen saver section"), None);
+    }
+
+    #[test]
+    fn xfce4_screensaver_needs_all_four_switches_and_a_delay() {
+        // All four switches on, 10 min idle + 1 min grace = 660 s.
+        let row = screenlock_row_xfce_screensaver(
+            Some(true),
+            Some(true),
+            Some(10),
+            Some(true),
+            Some(true),
+            Some(1),
+        );
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 660);
+        assert_eq!(row[0]["desktop_environment"], "xfce");
+        assert_eq!(row[0]["source"], "xfce4-screensaver");
+
+        // Each switch alone turns the lock off. gs-listener requires
+        // saver-enabled AND idle-activation; add_lock_timer requires
+        // lock-enabled AND lock/saver-activation/enabled.
+        for (saver, idle_act, lock, lock_saver) in [
+            (false, true, true, true),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, false),
+        ] {
+            let off = screenlock_row_xfce_screensaver(
+                Some(saver),
+                Some(idle_act),
+                Some(10),
+                Some(lock),
+                Some(lock_saver),
+                Some(0),
+            );
+            assert_eq!(off[0]["enabled"], "no", "{:?}", off);
+        }
+
+        // A zero idle delay never triggers, as on every other desktop.
+        let zero = screenlock_row_xfce_screensaver(
+            Some(true),
+            Some(true),
+            Some(0),
+            Some(true),
+            Some(true),
+            Some(0),
+        );
+        assert_eq!(zero[0]["enabled"], "no");
+        assert_eq!(zero[0]["delay_seconds"], 0);
+
+        // xfconf stores only values that differ from the schema, so an
+        // untouched machine has no keys at all. Every default is a locking
+        // one (5 min idle, 0 grace); reporting it unknown left the compliant
+        // majority blank, the same defect the KDE row had.
+        let untouched = screenlock_row_xfce_screensaver(None, None, None, None, None, None);
+        assert_eq!(untouched[0]["enabled"], "yes");
+        assert_eq!(untouched[0]["delay_seconds"], 300);
+    }
+
+    #[test]
+    fn light_locker_reads_its_autostart_flags() {
+        // light-locker takes seconds on the command line, not xfconf.
+        assert_eq!(
+            parse_light_locker_autostart(
+                "[Desktop Entry]\nType=Application\n\
+                 Exec=light-locker --lock-after-screensaver=30 --late-locking\n"
+            ),
+            Some(30)
+        );
+        // No flag: light-locker's own default is 5 seconds.
+        assert_eq!(
+            parse_light_locker_autostart("[Desktop Entry]\nExec=light-locker\n"),
+            Some(5)
+        );
+        // The user disabled the entry, so nothing locks.
+        assert_eq!(
+            parse_light_locker_autostart("[Desktop Entry]\nExec=light-locker\nHidden=true\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn light_locker_locks_only_when_x_blanks() {
+        // X blanks after 600 s, light-locker locks 5 s later.
+        let row = screenlock_row_light_locker(Some(5), Some(600));
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 605);
+        assert_eq!(row[0]["desktop_environment"], "xfce");
+        assert_eq!(row[0]["source"], "light-locker");
+
+        // X never blanks, so light-locker never fires.
+        let never = screenlock_row_light_locker(Some(5), Some(0));
+        assert_eq!(never[0]["enabled"], "no");
+        assert_eq!(never[0]["delay_seconds"], 0);
+
+        // The autostart entry is disabled: light-locker never runs.
+        assert_eq!(
+            screenlock_row_light_locker(None, Some(600))[0]["enabled"],
+            "no"
+        );
+
+        // No xset answer: unknown, never a false "yes".
+        assert_eq!(
+            screenlock_row_light_locker(Some(5), None)[0]["enabled"],
+            "unknown"
+        );
     }
 
     #[test]
@@ -3678,20 +5473,368 @@ zroot/ROOT/default / zfs rw 0 0
     #[test]
     fn gnome_lock_needs_enabled_and_nonzero_delay() {
         assert_eq!(
-            screenlock_row_gnome(Some(true), Some(300))[0]["enabled"],
+            screenlock_row_gnome(Some(true), Some(300), None)[0]["enabled"],
             "yes"
         );
         // Enabled but idle-delay 0 never triggers.
         assert_eq!(
-            screenlock_row_gnome(Some(true), Some(0))[0]["enabled"],
+            screenlock_row_gnome(Some(true), Some(0), None)[0]["enabled"],
             "no"
         );
         assert_eq!(
-            screenlock_row_gnome(Some(false), Some(300))[0]["enabled"],
+            screenlock_row_gnome(Some(false), Some(300), None)[0]["enabled"],
             "no"
         );
         // Missing gsettings -> unknown, never a false "no".
-        assert_eq!(screenlock_row_gnome(None, None)[0]["enabled"], "unknown");
+        assert_eq!(
+            screenlock_row_gnome(None, None, None)[0]["enabled"],
+            "unknown"
+        );
+    }
+
+    fn saver(active: &str, secure: &str, timeout: &str) -> ScreenSaverValues {
+        ScreenSaverValues {
+            active: Some(active.to_string()),
+            secure: Some(secure.to_string()),
+            timeout_seconds: Some(timeout.to_string()),
+            exe: Some(r"C:\Windows\System32\scrnsave.scr".to_string()),
+        }
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_no_saver_is_selected() {
+        // ScreenSaveActive=1 / IsSecure=1 / TimeOut=600 with the saver at
+        // "(None)": Windows runs no saver and never locks. Reporting "yes"
+        // from the three text values alone is the common false positive.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: ScreenSaverValues {
+                exe: None,
+                ..saver("1", "1", "600")
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "no");
+        assert!(row[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no screen saver selected"));
+        // An empty string is "(None)" too.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: ScreenSaverValues {
+                exe: Some("".into()),
+                ..saver("1", "1", "600")
+            },
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+    }
+
+    #[test]
+    fn reg_sz_parsers_read_windows_text_values() {
+        // Windows stores these as REG_SZ text, not DWORDs. Treating an
+        // unreadable value as 0 or false invents a "no".
+        assert_eq!(parse_reg_sz_bool(Some("1")), Some(true));
+        assert_eq!(parse_reg_sz_bool(Some("0")), Some(false));
+        assert_eq!(parse_reg_sz_bool(Some(" 1 ")), Some(true));
+        assert_eq!(parse_reg_sz_bool(Some("")), None);
+        assert_eq!(parse_reg_sz_bool(Some("yes")), None);
+        assert_eq!(parse_reg_sz_bool(None), None);
+        assert_eq!(parse_reg_sz_u64(Some("600")), Some(600));
+        assert_eq!(parse_reg_sz_u64(Some("0")), Some(0));
+        assert_eq!(parse_reg_sz_u64(Some("")), None);
+        assert_eq!(parse_reg_sz_u64(Some("abc")), None);
+    }
+
+    #[test]
+    fn windows_screenlock_yes_from_the_machine_inactivity_limit() {
+        // The machine inactivity limit locks the console whatever the
+        // screensaver says. Reading only the screensaver reports "unknown" on
+        // a correctly hardened machine.
+        let inputs = WindowsScreenLockInputs {
+            inactivity_timeout_secs: Some("900".into()),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 900);
+        assert_eq!(row[0]["source"], "machine_inactivity_policy");
+    }
+
+    #[test]
+    fn windows_screenlock_ignores_a_zero_inactivity_limit() {
+        // Zero means "not configured", not a zero-second lock.
+        let inputs = WindowsScreenLockInputs {
+            inactivity_timeout_secs: Some("0".into()),
+            user_preference: saver("1", "1", "600"),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 600);
+        assert_eq!(row[0]["source"], "user");
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_the_saver_is_not_secure() {
+        // The most common false positive on Windows: the screensaver runs and
+        // never asks for a password.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: saver("1", "0", "600"),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_the_timeout_is_zero() {
+        // Mirrors the GNOME idle-delay=0 rule: a lock that never triggers is
+        // not a lock.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: saver("1", "1", "0"),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "no");
+        assert_eq!(row[0]["delay_seconds"], 0);
+    }
+
+    #[test]
+    fn windows_screenlock_policy_overrides_the_user_preference() {
+        // Group policy wins. Reporting the user value tells the dashboard a
+        // managed fleet is unlocked.
+        let inputs = WindowsScreenLockInputs {
+            user_policy: saver("1", "1", "300"),
+            user_preference: saver("0", "0", "0"),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 300);
+        assert_eq!(row[0]["source"], "user_policy");
+    }
+
+    #[test]
+    fn windows_screenlock_merges_policy_and_user_values() {
+        // Windows applies policy per value, not per key. A first-key-wins
+        // rule reports "unknown" on the most common managed setup.
+        let inputs = WindowsScreenLockInputs {
+            user_policy: ScreenSaverValues {
+                secure: Some("1".into()),
+                ..Default::default()
+            },
+            user_preference: ScreenSaverValues {
+                active: Some("1".into()),
+                timeout_seconds: Some("600".into()),
+                exe: Some("scrnsave.scr".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 600);
+        assert_eq!(row[0]["source"], "user_policy");
+        let detail = row[0]["detail"].as_str().unwrap();
+        assert!(detail.contains("ScreenSaverIsSecure=true(user_policy)"));
+        assert!(detail.contains("ScreenSaveTimeOut=600(user)"));
+    }
+
+    #[test]
+    fn windows_screenlock_user_policy_beats_the_user_preference() {
+        // Pins the middle rank of the three-level precedence.
+        let inputs = WindowsScreenLockInputs {
+            user_policy: ScreenSaverValues {
+                timeout_seconds: Some("300".into()),
+                ..Default::default()
+            },
+            user_preference: saver("1", "1", "1200"),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["delay_seconds"], 300);
+    }
+
+    #[test]
+    fn windows_screenlock_unknown_when_a_value_is_missing() {
+        // Guessing "yes" reports a machine compliant on two of three values.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: ScreenSaverValues {
+                active: Some("1".into()),
+                timeout_seconds: Some("600".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "unknown");
+        assert!(row[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ScreenSaverIsSecure=unset"));
+    }
+
+    #[test]
+    fn windows_screenlock_unknown_when_nothing_is_readable() {
+        // An empty registry read must never look like "no lock". Unknown and
+        // no are different answers on the dashboard.
+        let row = windows_screenlock_row(&WindowsScreenLockInputs::default());
+        assert_eq!(row[0]["enabled"], "unknown");
+        assert!(row[0]["delay_seconds"].is_null());
+        assert_eq!(row[0]["source"], "none");
+    }
+
+    #[test]
+    fn bitlocker_protection_parses_the_shell_property_values() {
+        // The shell property is an integer as text. Only 1 and 6 mean the
+        // data is protected right now; an unparseable value is None.
+        assert_eq!(
+            parse_bitlocker_protection(Some("1")),
+            Some(BitLockerProtection::On)
+        );
+        assert_eq!(
+            parse_bitlocker_protection(Some("2")),
+            Some(BitLockerProtection::Off)
+        );
+        assert_eq!(
+            parse_bitlocker_protection(Some(" 5 ")),
+            Some(BitLockerProtection::Suspended)
+        );
+        assert_eq!(
+            parse_bitlocker_protection(Some("9")),
+            Some(BitLockerProtection::Other(9))
+        );
+        assert_eq!(
+            parse_bitlocker_protection(Some("7")),
+            Some(BitLockerProtection::PendingRestart)
+        );
+        assert_eq!(parse_bitlocker_protection(Some("")), None);
+        assert_eq!(parse_bitlocker_protection(None), None);
+    }
+
+    #[test]
+    fn windows_disk_encryption_only_a_protected_volume_is_yes() {
+        // A suspended volume has its key in the clear and an encrypting one
+        // is not yet protected. Reporting either as "yes" tells the
+        // dashboard a laptop is safe to lose when it is not.
+        let yes = |s| windows_disk_encryption_rows("C:", Some(s), "")[1]["root_encrypted"] == "yes";
+        assert!(yes(BitLockerProtection::On));
+        assert!(yes(BitLockerProtection::Locked));
+        assert!(!yes(BitLockerProtection::Off));
+        assert!(!yes(BitLockerProtection::Suspended));
+        assert!(!yes(BitLockerProtection::Encrypting));
+        assert!(!yes(BitLockerProtection::Decrypting));
+        assert!(!yes(BitLockerProtection::PendingRestart));
+    }
+
+    #[test]
+    fn windows_disk_encryption_unknown_when_the_property_is_unreadable() {
+        // Unknown and no are different answers on the dashboard.
+        let rows = windows_disk_encryption_rows("C:", None, "");
+        assert_eq!(rows[1]["root_encrypted"], "unknown");
+        assert_eq!(rows[0]["source"], "shell_property");
+        assert_eq!(
+            windows_disk_encryption_rows("C:", Some(BitLockerProtection::Other(42)), "")[1]
+                ["root_encrypted"],
+            "unknown"
+        );
+        // A read blocked by policy says so, instead of looking like a missing
+        // property.
+        let blocked = windows_disk_encryption_rows("C:", None, "blocked by application control");
+        assert_eq!(blocked[1]["root_encrypted"], "unknown");
+        assert!(blocked[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("blocked by application control"));
+    }
+
+    #[test]
+    fn windows_disk_encryption_uses_the_linux_summary_shape() {
+        // kiln's encryption_status_from_rows reads root_encrypted off the
+        // summary row; the Windows builtin must emit the same shape.
+        let rows = windows_disk_encryption_rows("C:", Some(BitLockerProtection::On), "");
+        let summary = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == "summary")
+            .unwrap();
+        assert_eq!(summary["root_encrypted"], "yes");
+        assert_eq!(summary["mechanisms"], json!(["bitlocker"]));
+        assert_eq!(summary["source"], "aggregate");
+    }
+
+    #[test]
+    fn password_policy_row_converts_the_api_units() {
+        // NetUserModalsGet returns seconds and uses u32::MAX for "never".
+        // The row must say days and minutes, and null for never, or a
+        // 42-day maximum age reads as 3.6 million.
+        let p = PasswordPolicy {
+            min_password_len: 0,
+            max_password_age_secs: 42 * 86_400,
+            min_password_age_secs: 0,
+            password_history_len: 0,
+            lockout_threshold: 10,
+            lockout_duration_secs: 600,
+            lockout_window_secs: 600,
+        };
+        let row = &password_policy_rows(Some(p), "local")[0];
+        assert_eq!(row["maximum_password_age_days"], 42);
+        assert_eq!(row["scope"], "local");
+        assert_eq!(row["policy_of"], "local_accounts");
+        assert_eq!(row["minimum_password_age_days"], 0);
+        assert_eq!(row["lockout_threshold"], 10);
+        assert_eq!(row["lockout_duration_minutes"], 10);
+        assert_eq!(row["lockout_window_minutes"], 10);
+        assert_eq!(row["status"], "ok");
+    }
+
+    #[test]
+    fn password_policy_row_reports_never_as_null() {
+        // A password that never expires must not look like a 49710-day one.
+        let p = PasswordPolicy {
+            min_password_len: 12,
+            max_password_age_secs: TIMEQ_FOREVER,
+            min_password_age_secs: 86_400,
+            password_history_len: 24,
+            lockout_threshold: 0,
+            lockout_duration_secs: TIMEQ_FOREVER,
+            lockout_window_secs: 1800,
+        };
+        let row = &password_policy_rows(Some(p), "domain")[0];
+        assert!(row["maximum_password_age_days"].is_null());
+        assert_eq!(row["scope"], "domain");
+        assert!(row["lockout_duration_minutes"].is_null());
+        assert_eq!(row["minimum_password_length"], 12);
+        assert_eq!(row["password_history_size"], 24);
+        assert_eq!(row["lockout_threshold"], 0);
+    }
+
+    #[test]
+    fn password_policy_unknown_when_the_api_fails() {
+        // Never emit zeros for an unreadable policy; zeros mean "no policy".
+        let row = &password_policy_rows(None, "unknown")[0];
+        assert_eq!(row["status"], "unknown");
+        assert!(row.get("minimum_password_length").is_none());
+    }
+
+    #[test]
+    fn windows_screenlock_row_uses_the_shared_row_shape() {
+        // The backend reads one screenlock shape for every operating system.
+        let row = windows_screenlock_row(&WindowsScreenLockInputs::default());
+        let obj = row[0].as_object().unwrap();
+        let mut keys: Vec<_> = obj.keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "delay_seconds",
+                "desktop_environment",
+                "detail",
+                "enabled",
+                "source"
+            ]
+        );
+        assert_eq!(row[0]["desktop_environment"], "windows");
     }
 
     #[test]
@@ -3699,11 +5842,18 @@ zroot/ROOT/default / zfs rw 0 0
         let text = "[Daemon]\nAutolock=false\nTimeout=5\n[Greeter]\nAutolock=true\n";
         let (autolock, timeout) = parse_kscreenlockerrc(text);
         assert_eq!(autolock, Some(false));
-        assert_eq!(timeout, Some(5));
-        // Missing file/keys -> unknown enabled.
-        assert_eq!(screenlock_row_kde(None, None)[0]["enabled"], "unknown");
+        assert_eq!(timeout, Some(300));
+        // Plasma 6.3 stores the timeout as a double: 0.5 is thirty seconds,
+        // and it must not round up to a minute.
+        assert_eq!(parse_kscreenlockerrc("[Daemon]\nTimeout=0.5\n").1, Some(30));
         assert_eq!(
-            screenlock_row_kde(Some(true), Some(5))[0]["delay_seconds"],
+            parse_kscreenlockerrc("[Daemon]\nTimeout=10.0\n").1,
+            Some(600)
+        );
+        // Missing file/keys -> the Plasma default, which locks.
+        assert_eq!(screenlock_row_kde(None, None)[0]["enabled"], "yes");
+        assert_eq!(
+            screenlock_row_kde(Some(true), Some(300))[0]["delay_seconds"],
             300
         );
     }
@@ -3728,6 +5878,68 @@ listener {
         let dpms = "listener {\n timeout = 600\n on-timeout = hyprctl dispatch dpms off\n}\n";
         assert_eq!(parse_hypridle_config(dpms), None);
         assert_eq!(screenlock_row_hyprland(None)[0]["enabled"], "unknown");
+        // A zero timeout never fires. Seen on 2026-08-29: it reported "yes".
+        let zero = screenlock_row_hyprland(Some(0));
+        assert_eq!(zero[0]["enabled"], "no");
+        assert_eq!(zero[0]["delay_seconds"], 0);
+        assert_eq!(screenlock_row_hyprland(Some(300))[0]["enabled"], "yes");
+    }
+
+    #[test]
+    fn kde_absent_keys_mean_plasma_defaults() {
+        // An untouched Plasma install writes no kscreenlockerrc. That is the
+        // secure default (Autolock=true, 5 min), not unknown.
+        let row = screenlock_row_kde(None, None);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 300);
+        assert!(row[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Plasma default"));
+        // File values win over the defaults.
+        assert_eq!(
+            screenlock_row_kde(Some(false), Some(120))[0]["enabled"],
+            "no"
+        );
+        assert_eq!(
+            screenlock_row_kde(Some(true), Some(30))[0]["delay_seconds"],
+            30
+        );
+        // A zero timeout never fires, as on every other platform.
+        assert_eq!(screenlock_row_kde(None, Some(0))[0]["enabled"], "no");
+    }
+
+    #[test]
+    fn gsettings_desktops_add_lock_delay_and_mate_counts_minutes() {
+        // GNOME/Cinnamon: idle-delay 300 + lock-delay 3600 is a 65-minute
+        // lock, not a 5-minute one.
+        let g = screenlock_row_gnome(Some(true), Some(300), Some(3600));
+        assert_eq!(g[0]["enabled"], "yes");
+        assert_eq!(g[0]["delay_seconds"], 3900);
+        let c = screenlock_row_gsettings("cinnamon", Some(true), Some(900), None);
+        assert_eq!(c[0]["desktop_environment"], "cinnamon");
+        assert_eq!(c[0]["delay_seconds"], 900);
+        // idle-delay 0 never triggers, whatever lock-delay says.
+        assert_eq!(
+            screenlock_row_gsettings("cinnamon", Some(true), Some(0), Some(60))[0]["enabled"],
+            "no"
+        );
+        // MATE stores minutes: 5 + 1 minutes is 360 seconds.
+        let m = screenlock_row_mate(Some(true), Some(true), Some(5), Some(1));
+        assert_eq!(m[0]["enabled"], "yes");
+        assert_eq!(m[0]["delay_seconds"], 360);
+        assert_eq!(
+            screenlock_row_mate(Some(false), Some(true), Some(5), None)[0]["enabled"],
+            "no"
+        );
+        assert_eq!(
+            screenlock_row_mate(Some(true), Some(false), Some(5), None)[0]["enabled"],
+            "no"
+        );
+        assert_eq!(
+            screenlock_row_mate(None, None, None, None)[0]["enabled"],
+            "unknown"
+        );
     }
 
     #[test]
@@ -3743,6 +5955,12 @@ listener {
         // A specific OS matches only itself; case/whitespace insensitive.
         assert!(platform_matches(Some("linux"), "linux"));
         assert!(!platform_matches(Some("darwin"), "linux"));
+        // osquery's list and wildcard forms.
+        assert!(platform_matches(Some("linux,darwin"), "linux"));
+        assert!(platform_matches(Some("linux, darwin"), "macos"));
+        assert!(!platform_matches(Some("linux,darwin"), "windows"));
+        assert!(platform_matches(Some("any"), "windows"));
+        assert!(platform_matches(Some("ubuntu"), "linux"));
         // osquery's "darwin" tag matches a "macos" host (Rust's OS string).
         assert!(platform_matches(Some("darwin"), "macos"));
         assert!(platform_matches(Some(" Darwin "), "macos"));
@@ -3780,6 +5998,11 @@ listener {
         // Non-query verbs.
         assert!(!is_read_only_query("PRAGMA table_info(users)"));
         assert!(!is_read_only_query("DROP TABLE users"));
+        // DML hidden behind a CTE is not a query; a column named like a verb is fine.
+        assert!(!is_read_only_query(
+            "WITH t AS (SELECT 1) DELETE FROM users"
+        ));
+        assert!(is_read_only_query("SELECT last_update, deleted FROM x"));
     }
 
     #[test]
@@ -3821,6 +6044,32 @@ listener {
         // Shaped like real osquery system_info: serial is `hardware_serial`, not `serial_number`.
         let rows = json!([{"hardware_serial": "G97L3X4KYV", "uuid": "9082C1CD", "computer_name": "Athene"}]);
         assert_eq!(extract_serial(&rows), Some("G97L3X4KYV".to_string()));
+    }
+
+    #[test]
+    fn serial_rejects_bios_placeholders() {
+        // OEM boards and VMs report placeholders, and osquery reports "-1"
+        // when WMI fails; adopting one merges every such machine into one.
+        for s in [
+            "To Be Filled By O.E.M.",
+            "-1",
+            "0",
+            "Default string",
+            "System Serial Number",
+            "0000000000",
+            "N/A",
+        ] {
+            assert_eq!(
+                extract_serial(&json!([{"hardware_serial": s}])),
+                None,
+                "{}",
+                s
+            );
+        }
+        assert_eq!(
+            extract_serial(&json!([{"hardware_serial": " G97L3X4KYV "}])),
+            Some("G97L3X4KYV".to_string())
+        );
     }
 
     #[test]
@@ -3950,52 +6199,45 @@ listener {
     }
 
     #[test]
-    fn appimage_update_needs_the_appimage_env() {
-        // deb and rpm installs must not self-replace; only an AppImage run
-        // (APPIMAGE env set) may.
-        assert_eq!(
-            appimage_update_target(Some("/home/u/Apps/KlaayGuard.AppImage")),
-            Some(std::path::PathBuf::from("/home/u/Apps/KlaayGuard.AppImage"))
-        );
-        assert_eq!(appimage_update_target(Some("")), None);
-        assert_eq!(appimage_update_target(None), None);
+    fn appimage_is_own_requires_the_exe_under_appdir() {
+        use std::path::Path;
+        // Our own image: the executable runs from the runtime's mount of it.
+        assert!(appimage_is_own(
+            Path::new("/home/u/Apps/KlaayGuard.AppImage"),
+            Path::new("/tmp/.mount_Klaayx"),
+            Path::new("/tmp/.mount_Klaayx/usr/bin/klaayguard")
+        ));
+        // A deb/rpm agent started from an AppImage browser inherits its pair.
+        assert!(!appimage_is_own(
+            Path::new("/home/u/Apps/zen.AppImage"),
+            Path::new("/tmp/.mount_zenXY"),
+            Path::new("/usr/bin/klaayguard")
+        ));
+        assert!(!appimage_is_own(
+            Path::new("KlaayGuard.AppImage"),
+            Path::new("/tmp/.mount_Klaayx"),
+            Path::new("/tmp/.mount_Klaayx/usr/bin/klaayguard")
+        ));
     }
 
     #[test]
-    fn staged_appimage_lands_next_to_the_target() {
-        // The staged file must share the target directory so the final
-        // rename stays on one filesystem and is atomic.
-        let staged = staged_appimage_path(
-            std::path::Path::new("/home/u/Apps/KlaayGuard.AppImage"),
-            4242,
-        );
-        assert_eq!(staged.parent(), Some(std::path::Path::new("/home/u/Apps")));
-        assert!(staged
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .contains("4242"));
-        assert_ne!(
-            staged,
-            std::path::PathBuf::from("/home/u/Apps/KlaayGuard.AppImage")
-        );
-    }
-
-    #[test]
-    fn staged_app_lands_next_to_the_target() {
-        // The staged bundle must share the target directory so the final rename
-        // stays on one filesystem and is atomic.
-        let staged = staged_app_path(std::path::Path::new("/Applications/KlaayGuard.app"), 4242);
-        assert_eq!(staged.parent(), Some(std::path::Path::new("/Applications")));
-        assert!(staged
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .contains("4242"));
-        assert_ne!(
-            staged,
-            std::path::PathBuf::from("/Applications/KlaayGuard.app")
-        );
+    fn staged_path_lands_next_to_the_target() {
+        // The staged file or bundle must share the target directory so the
+        // final rename stays on one filesystem and is atomic.
+        for target in [
+            "/home/u/Apps/KlaayGuard.AppImage",
+            "/Applications/KlaayGuard.app",
+        ] {
+            let target = std::path::Path::new(target);
+            let staged = staged_sibling_path(target, 4242);
+            assert_eq!(staged.parent(), target.parent());
+            assert!(staged
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("4242"));
+            assert_ne!(staged, target);
+        }
     }
 
     #[test]
@@ -4028,12 +6270,32 @@ listener {
     #[test]
     fn fallback_window_shown_only_when_tray_unusable() {
         // Tray built and a StatusNotifier host answers: no window.
-        assert!(!fallback_window_needed(true, true));
-        // Tray failed to build: window.
-        assert!(fallback_window_needed(false, true));
-        // Tray built but nothing shows it (stock GNOME): window.
-        assert!(fallback_window_needed(true, false));
-        assert!(fallback_window_needed(false, false));
+        assert!(!fallback_window_needed(true, true, false));
+        assert!(!fallback_window_needed(true, true, true));
+        // Tray failed to build: no UI exists at all, so a window either way.
+        assert!(fallback_window_needed(false, true, true));
+        assert!(fallback_window_needed(false, false, true));
+        assert!(fallback_window_needed(false, true, false));
+        // Tray built but nothing shows it (stock GNOME). A signed-out user
+        // needs the window to sign in.
+        assert!(fallback_window_needed(true, false, false));
+        // A signed-in agent needs no UI: a window at every login is noise.
+        assert!(!fallback_window_needed(true, false, true));
+    }
+
+    #[test]
+    fn deep_link_handler_desktop_file_matches_the_plugin() {
+        // The plugin names the file after the running executable. We re-run
+        // its xdg-mime step with a sanitised environment, so the name must
+        // match exactly or we point the scheme at a file that does not exist.
+        assert_eq!(
+            deep_link_handler_desktop_file("klaay-guard"),
+            "klaay-guard-handler.desktop"
+        );
+        assert_eq!(
+            deep_link_handler_desktop_file("KlaayGuard"),
+            "KlaayGuard-handler.desktop"
+        );
     }
 
     #[test]
@@ -4094,8 +6356,13 @@ listener {
     #[test]
     fn autostart_path_is_the_xdg_autostart_entry() {
         assert_eq!(
-            autostart_path(std::path::Path::new("/home/u")),
+            autostart_path(std::path::Path::new("/home/u/.config")),
             std::path::PathBuf::from("/home/u/.config/autostart/klaayguard.desktop")
+        );
+        // A relocated XDG_CONFIG_HOME is where the session looks.
+        assert_eq!(
+            autostart_path(std::path::Path::new("/data/cfg")),
+            std::path::PathBuf::from("/data/cfg/autostart/klaayguard.desktop")
         );
     }
 
