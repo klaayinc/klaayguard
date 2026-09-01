@@ -53,6 +53,9 @@ fi
 # a klaayguard:// URL any local program could have claimed.
 if test -f "$DESKTOP"; then
   pass "desktop entry present"
+  grep -q '^MimeType=.*x-scheme-handler/klaayguard' "$DESKTOP" \
+    && fail "desktop entry registers x-scheme-handler/klaayguard; the scheme was removed and must stay removed" \
+    || pass "no klaayguard:// scheme handler"
   if command -v desktop-file-validate >/dev/null; then
     desktop-file-validate "$DESKTOP" && pass "desktop-file-validate" \
       || fail "desktop-file-validate rejected the entry"
