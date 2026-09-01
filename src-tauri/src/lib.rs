@@ -4494,17 +4494,33 @@ pub fn run() {
         tray_watcher_present: std::sync::atomic::AtomicBool::new(true),
     });
 
-    let app = tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Single-instance keys on the bundle identifier, and on macOS the plugin
+    // offers no override (`dbus_id` is Linux only). A development build would
+    // therefore see the installed agent's socket and exit on startup, which
+    // makes the sign-in flow impossible to test on a machine that runs the
+    // agent. Production registers it exactly as before; a build pointed
+    // elsewhere skips it and may run alongside.
+    if keychain::is_production_target(&get_api_base_url()) {
+        // Must init first, so a second launch exits before the other plugins
+        // spin up. Tauri documents this ordering.
+        builder = builder.plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {
+            log::info!("single_instance: secondary launch routed to primary instance");
+        }));
+    } else {
+        log::warn!(
+            "single_instance skipped: this build talks to {}, not production",
+            get_api_base_url()
+        );
+    }
+
+    let app = builder
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             fallback_sign_in,
             fallback_employee_hub
         ])
-        // Single-instance must init first, so a second launch exits before the
-        // other plugins spin up. Tauri documents this ordering.
-        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {
-            log::info!("single_instance: secondary launch routed to primary instance");
-        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(

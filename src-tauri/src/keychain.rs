@@ -45,6 +45,13 @@ fn api_base() -> String {
     crate::get_api_base_url()
 }
 
+/// Whether this build talks to production. Callers outside this module use it
+/// to keep production behaviour identical while letting a development build
+/// stand apart - see the single-instance registration in `lib.rs`.
+pub(crate) fn is_production_target(api_base_url: &str) -> bool {
+    target_suffix(api_base_url).is_none()
+}
+
 /// Which store held the credential. The caller surfaces a notice to the user
 /// when the OS Secret Service was unavailable and the file fallback was used.
 #[derive(Debug, PartialEq, Eq)]
@@ -288,6 +295,18 @@ mod tests {
             keychain_service_for("http://localhost:61521"),
             keychain_service_for("https://api.staging.klaay.com")
         );
+    }
+
+    // Single-instance keys on the bundle identifier, which cannot differ
+    // between builds without changing the app's identity. A development build
+    // therefore skips the plugin instead, so it does not exit on startup
+    // because the installed agent already holds the socket.
+    #[test]
+    fn only_a_production_build_joins_single_instance() {
+        assert!(is_production_target("https://api.klaay.com"));
+        assert!(is_production_target("https://api.klaay.com/"));
+        assert!(!is_production_target("http://localhost:61521"));
+        assert!(!is_production_target("https://api.staging.klaay.com"));
     }
 
     // The file fallback needs the same split. Without it, a local build
