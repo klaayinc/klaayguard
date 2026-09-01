@@ -61,11 +61,5 @@
       }
     }
   },
-  "plugins": {
-    "deep-link": {
-      "desktop": {
-        "schemes": ["klaayguard"]
-      }
-    }
-  }
+  "plugins": {}
 }

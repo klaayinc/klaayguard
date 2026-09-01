@@ -14,6 +14,7 @@
 //! - System tray provides controlled access to app functionality
 
 mod keychain;
+mod sign_in;
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -36,9 +37,6 @@ pub struct AppState {
     pub api_base_url: String,
     pub last_attempt_at: RwLock<Option<Instant>>,
     pub last_focus_at: RwLock<Option<Instant>>, // debounce for the sign-in nudge
-    /// The sign-in nonce and when it was minted. Reused while fresh, so the
-    /// app's own extra sign-in tabs all carry a state the callback accepts.
-    pub pending_auth_state: RwLock<Option<(String, Instant)>>,
     /// The device identity, resolved once per process (persisted by keychain).
     pub device_identity: RwLock<Option<String>>,
     /// Woken when a token is (re)acquired, so a collection runs at once.
@@ -78,64 +76,6 @@ fn add_breadcrumb(category: &str, message: &str, level: Level) {
         data,
         ..Default::default()
     });
-}
-
-/// Read a query-string value from a klaayguard:// deep link, fully
-/// percent-decoded (the Klaay Frontend passes the token and state through
-/// encodeURIComponent). Returns None for a non-klaayguard URL or a missing key.
-fn deep_link_query_value(url: &str, key: &str) -> Option<String> {
-    let parsed = tauri::Url::parse(url).ok()?;
-    if parsed.scheme() != "klaayguard" {
-        return None;
-    }
-    parsed
-        .query_pairs()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.into_owned())
-}
-
-/// A deep link with its query removed, for logs. The query carries the bearer
-/// token, and the log file is not a credential store.
-fn redact_deep_link(url: &str) -> String {
-    match url.split_once('?') {
-        Some((head, _)) => format!("{}?<redacted>", head),
-        None => url.to_string(),
-    }
-}
-
-/// Extract and shape-validate the JWT from a `klaayguard://...?token=...` deep link.
-/// Returns None for a non-klaayguard URL, a missing token, or one that isn't three
-/// dot-separated segments.
-fn parse_deep_link_token(url: &str) -> Option<String> {
-    let token = deep_link_query_value(url, "token")?;
-    (token.matches('.').count() == 2).then_some(token)
-}
-
-/// When true, a sign-in callback MUST carry a `state` that matches the nonce we issued.
-/// The Klaay Frontend echoes `state` in the klaayguard:// redirect (since July 2026), so
-/// this can flip to true, closing the deep-link confused-deputy, once the fleet runs an
-/// agent whose nonce survives its own second sign-in tab (see `open_sign_in`). A
-/// *mismatch* is rejected regardless of this flag — only a *missing* state is tolerated
-/// during rollout.
-const AUTH_STATE_STRICT: bool = false;
-
-/// Decide whether the callback's `state` clears the nonce check. A present-but-wrong
-/// state is always rejected (a positive attack signal); a missing nonce or missing
-/// state is accepted only while `strict` is false (the Klaay Frontend rollout window).
-fn auth_state_ok(strict: bool, expected: Option<&str>, provided: Option<&str>) -> bool {
-    match (expected, provided) {
-        (Some(want), Some(got)) => want == got,
-        _ => !strict,
-    }
-}
-
-/// 32 bytes of OS CSPRNG as hex, for the sign-in state nonce. Returns None only if the
-/// OS RNG is unavailable (effectively never); callers then skip the nonce rather than
-/// panic, degrading to the rollout accept-missing path.
-fn generate_auth_nonce() -> Option<String> {
-    let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf).ok()?;
-    Some(hex_lower(&buf))
 }
 
 /// Lower-case hex of a byte slice.
@@ -1065,69 +1005,6 @@ fn gsettings_uint(schema: &str, key: &str) -> Option<u64> {
     gsettings_get(schema, key).and_then(|s| parse_gsettings_uint(&s))
 }
 
-/// The .desktop file the deep-link plugin writes for the scheme handler. It
-/// names the file after the running executable, so we must build the same
-/// name to repeat its `xdg-mime default` step.
-#[cfg(any(target_os = "linux", test))]
-fn deep_link_handler_desktop_file(exe_file_name: &str) -> String {
-    format!("{}-handler.desktop", exe_file_name)
-}
-
-/// Point `x-scheme-handler/klaayguard` at our .desktop file again, with the
-/// AppImage library paths stripped.
-///
-/// The deep-link plugin writes the .desktop file itself, then spawns
-/// `update-desktop-database` and `xdg-mime` with our environment. From an
-/// AppImage those inherit the bundled `LD_LIBRARY_PATH`, and `xdg-mime` is a
-/// shell script that runs more system binaries: they fail to start, the
-/// scheme stays unregistered, and sign-in never returns to the app. The
-/// plugin gives no way to set a child environment, so repeat its two
-/// commands here. Both are idempotent.
-#[cfg(target_os = "linux")]
-fn repair_deep_link_registration(app: &tauri::AppHandle) {
-    if std::env::var("APPDIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_none()
-    {
-        return; // Not an AppImage: the plugin's own spawns are already clean.
-    }
-    let Ok(exe) = tauri::utils::platform::current_exe() else {
-        log::warn!("deep_link repair: no current_exe");
-        return;
-    };
-    let Some(file_name) = exe
-        .file_name()
-        .map(|n| deep_link_handler_desktop_file(&n.to_string_lossy()))
-    else {
-        return;
-    };
-    let Ok(target) = app.path().data_dir().map(|d| d.join("applications")) else {
-        log::warn!("deep_link repair: no data dir");
-        return;
-    };
-    let mut update = std::process::Command::new("update-desktop-database");
-    update.arg(&target);
-    apply_appimage_sanitization(&mut update);
-    if let Err(e) = update.status() {
-        log::warn!("deep_link repair: update-desktop-database failed: {}", e);
-    }
-    let mut mime = std::process::Command::new("xdg-mime");
-    mime.args(["default", &file_name, "x-scheme-handler/klaayguard"]);
-    apply_appimage_sanitization(&mut mime);
-    match mime.status() {
-        Ok(s) if s.success() => log::info!("deep_link repair: {} is the handler", file_name),
-        Ok(s) => {
-            log::error!("deep_link repair: xdg-mime exited {}", s);
-            sentry::capture_message("deep_link_repair_xdg_mime_failed", Level::Error);
-        }
-        Err(e) => {
-            log::error!("deep_link repair: xdg-mime failed: {}", e);
-            sentry::capture_message("deep_link_repair_xdg_mime_failed", Level::Error);
-        }
-    }
-}
-
 /// `xfconf-query -c <channel> -p <property>` as the desktop sees it. It
 /// prints "true"/"false" for bools and a bare number for ints, so the
 /// gsettings parsers read both. An unset property exits non-zero, which the
@@ -1909,60 +1786,19 @@ async fn token_definitely_invalid(base: &str, token: &str) -> bool {
     }
 }
 
-/// Persist a JWT delivered via a klaayguard:// deep link, but only after the API
-/// accepts it. The custom URL scheme is registered system-wide, so any local app or
-/// web page can fire `klaayguard://…?token=…`; adopting an unvalidated token would let
-/// them silently redirect this device's telemetry onto an account they control. We
-/// reject only on a definitive 401/403 (see `token_definitely_invalid`).
-///
-/// NOTE: this still can't stop an attacker who injects a token for *their own valid*
-/// account (a confused-deputy) until `AUTH_STATE_STRICT` is on: the `state` nonce this
-/// app mints is echoed by the Klaay Frontend, and a present-but-wrong one is rejected.
-///
-/// Callers are the main thread (setup, the Windows single-instance window, macOS
-/// `Opened`) or a plugin thread, so the network validation and the keyring write run
-/// on the async runtime; only the parse and the nonce check happen inline.
-fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str) {
-    let Some(tok) = parse_deep_link_token(url) else {
-        log::info!("deep_link_ignored url={}", redact_deep_link(url));
-        return;
-    };
-    let provided_state = deep_link_query_value(url, "state");
-    log::info!(
-        "deep_link_token_parsed length={} has_state={} validating",
-        tok.len(),
-        provided_state.is_some()
-    );
-
-    // Compare before consuming: a callback with a wrong state must not burn
-    // the live nonce, or a stale tab (or junk) could deny the real sign-in
-    // that follows it.
-    let expected = lock_read(&state.pending_auth_state)
-        .as_ref()
-        .map(|(nonce, _)| nonce.clone());
-    if !auth_state_ok(
-        AUTH_STATE_STRICT,
-        expected.as_deref(),
-        provided_state.as_deref(),
-    ) {
-        log::warn!("deep_link_state_check_failed rejecting token");
-        add_breadcrumb("auth", "deep_link_state_rejected", Level::Warning);
-        sentry::capture_message("deep_link_state_rejected", Level::Warning);
-        let _ = app.emit("auth:status", json!({ "authenticated": false }));
-        return;
-    }
-    if provided_state.is_some() {
-        // Matched: the nonce is single-use.
-        *lock_write(&state.pending_auth_state) = None;
-    }
-
+/// Store a token the loopback exchange just returned, once the API accepts
+/// it. The token reached this process over `127.0.0.1` and was released only
+/// against a verifier that never left it, so the binding is already settled
+/// by the time this runs; the API check stays because a token this agent
+/// cannot use is worth catching here rather than at the next collection.
+fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
     let app = app.clone();
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
         if token_definitely_invalid(&state.api_base_url, &tok).await {
-            log::warn!("deep_link_token_rejected_by_api length={}", tok.len());
-            add_breadcrumb("auth", "deep_link_token_rejected", Level::Warning);
-            sentry::capture_message("deep_link_token_rejected", Level::Warning);
+            log::warn!("sign_in_token_rejected_by_api length={}", tok.len());
+            add_breadcrumb("auth", "sign_in_token_rejected", Level::Warning);
+            sentry::capture_message("sign_in_token_rejected", Level::Warning);
             let _ = app.emit("auth:status", json!({ "authenticated": false }));
             return;
         }
@@ -2000,34 +1836,9 @@ fn handle_deep_link_url(app: &tauri::AppHandle, state: &Arc<AppState>, url: &str
             }
         }
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
-        add_breadcrumb("auth", "deep_link_token_saved", Level::Info);
-        sentry::capture_message("deep_link_token_saved", Level::Info);
+        add_breadcrumb("auth", "sign_in_token_saved", Level::Info);
+        sentry::capture_message("sign_in_token_saved", Level::Info);
     });
-}
-
-/// Route the first klaayguard:// URL in `args` (this process's launch, or a
-/// command line forwarded by a second instance) to the deep-link handler.
-/// Returns whether one was found. The URL itself carries the bearer token,
-/// so only its presence is logged.
-fn dispatch_deep_link_args(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    args: &[String],
-    origin: &str,
-) -> bool {
-    let Some(url) = args.iter().find(|a| a.starts_with("klaayguard://")) else {
-        log::info!("{}: {} args, no deep link", origin, args.len());
-        return false;
-    };
-    log::info!("{}: deep link found", origin);
-    handle_deep_link_url(app, state, url);
-    true
-}
-
-/// Scan this process's args for a klaayguard deep link and handle it.
-fn try_handle_deep_link_from_args(app: &tauri::AppHandle, state: &Arc<AppState>) -> bool {
-    let args: Vec<String> = std::env::args().collect();
-    dispatch_deep_link_args(app, state, &args, "process_args")
 }
 
 /// Executes a batch of SQL statements against osquery and returns results keyed by logical id
@@ -3492,44 +3303,75 @@ fn open_frontend(app: &tauri::AppHandle, path: &str) {
 }
 
 /// How long a minted sign-in nonce stays valid for reuse. The app itself opens
-/// more than one sign-in tab (startup nudge, tray click, 401 nudge), and each
-/// must carry a state the callback check accepts, so a fresh nonce is minted
-/// only when none is pending or the pending one is older than this.
-const AUTH_NONCE_TTL: Duration = Duration::from_secs(60 * 60);
-
-/// Open the Klaay Frontend sign-in page; it deep-links back via klaayguard://. Passes
-/// the single-use `state` nonce (stored in AppState) along so the callback can be
-/// bound to a sign-in *this* app initiated. If the OS RNG is somehow unavailable we
-/// open without a nonce (rollout accept-missing path) rather than block sign-in
-/// entirely.
+/// Open the Klaay sign-in page in the browser and wait on a loopback port
+/// for the answer.
+///
+/// The agent has no window, so the browser does the whole sign-in - which is
+/// why Google, Microsoft, and password all work here without this process
+/// knowing about any of them. What comes back arrives on `127.0.0.1`, not on
+/// a `klaayguard://` URL any local program could have claimed, and it is
+/// released only against a verifier this process never sends anywhere. So
+/// the token binds to this machine, and there is no nonce for anyone to get
+/// wrong.
 fn open_sign_in(app: &tauri::AppHandle) {
     let state = app.state::<Arc<AppState>>().inner().clone();
-    let nonce = {
-        let mut pending = lock_write(&state.pending_auth_state);
-        let reusable = pending
-            .as_ref()
-            .filter(|(_, minted)| minted.elapsed() < AUTH_NONCE_TTL)
-            .map(|(nonce, _)| nonce.clone());
-        reusable.or_else(|| {
-            let fresh = generate_auth_nonce()?;
-            *pending = Some((fresh.clone(), Instant::now()));
-            Some(fresh)
-        })
-    };
-    let mut path = "/login?app=klaayguard".to_string();
-    if let Some(nonce) = nonce {
-        path.push_str(&format!("&state={}", nonce));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // On Wayland the browser window may not surface: put the link on the
-        // clipboard and in a notification (clickable where the daemon supports
-        // it), for the sign-in flow only.
-        let url = format!("{}{}", get_frontend_url(), path);
-        let on_clipboard = copy_to_clipboard(&url);
-        notify_sign_in_link(&url, on_clipboard);
-    }
-    open_frontend(app, &path);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let pending = match sign_in::start(&state.api_base_url).await {
+            Ok(pending) => pending,
+            Err(e) => {
+                log::error!("sign_in_start_failed: {}", e);
+                sentry::capture_message(&format!("sign_in_start_failed: {}", e), Level::Error);
+                notify_user(
+                    "KlaayGuard",
+                    "Could not start sign-in. Check your connection and try again from the tray.",
+                );
+                return;
+            }
+        };
+
+        // The request id is not a secret: it selects a row and nothing more,
+        // so it is safe in an address bar, a browser history, or a replay.
+        let path = format!("/login?app=klaayguard&request={}", pending.request_id);
+        #[cfg(target_os = "linux")]
+        {
+            // On Wayland the browser window may not surface: put the link on
+            // the clipboard and in a notification (clickable where the daemon
+            // supports it), for the sign-in flow only.
+            let url = format!("{}{}", get_frontend_url(), path);
+            let on_clipboard = copy_to_clipboard(&url);
+            notify_sign_in_link(&url, on_clipboard);
+        }
+        open_frontend(&app, &path);
+
+        // Blocking accept, so it belongs off the async workers.
+        let sign_in::Pending {
+            verifier, listener, ..
+        } = pending;
+        let code =
+            match tauri::async_runtime::spawn_blocking(move || sign_in::wait_for_code(listener))
+                .await
+            {
+                Ok(Some(code)) => code,
+                Ok(None) => {
+                    log::info!("sign_in_no_code: the browser never came back");
+                    return;
+                }
+                Err(e) => {
+                    log::error!("sign_in_listener_failed: {}", e);
+                    return;
+                }
+            };
+
+        match sign_in::claim(&state.api_base_url, &code, &verifier).await {
+            Ok(token) => adopt_token(&app, &state, token),
+            Err(e) => {
+                log::error!("sign_in_claim_failed: {}", e);
+                sentry::capture_message(&format!("sign_in_claim_failed: {}", e), Level::Error);
+                let _ = app.emit("auth:status", json!({ "authenticated": false }));
+            }
+        }
+    });
 }
 
 /// Handles + assets for keeping the tray in sync with auth state.
@@ -3632,7 +3474,6 @@ const SIGN_OUT_LABEL: &str = "Sign out";
 /// start WILL sign back in, so that is reported, not shrugged off.
 fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
     *lock_write(&state.auth_token) = None;
-    *lock_write(&state.pending_auth_state) = None;
     match keychain::delete_token() {
         Ok(()) => log::info!("user signed out from the tray"),
         Err(e) => {
@@ -4512,24 +4353,6 @@ fn spawn_update_loop(app: tauri::AppHandle, api_base: String) {
 /// the main thread so the tray is already visible while a locked keyring waits
 /// on its prompt.
 fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
-    // Register the klaayguard:// handler for this user at run time.
-    // Linux package installs also register it through the desktop
-    // entry, and the AppImage has only this path. The Windows
-    // installer writes the same keys, but only this path repairs them
-    // when another program takes the scheme or the install moves.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    {
-        use tauri_plugin_deep_link::DeepLinkExt;
-        if let Err(e) = app.deep_link().register_all() {
-            log::error!("deep_link register_all failed: {}", e);
-            sentry::capture_message(&format!("deep_link_register_failed: {}", e), Level::Error);
-        }
-    }
-    // From an AppImage the plugin's own xdg-mime call runs with the bundled
-    // library paths and fails, so repeat it with a clean environment.
-    #[cfg(target_os = "linux")]
-    repair_deep_link_registration(&app);
-
     // Start at login, like the macOS LaunchAgent. An agent that only runs
     // when a human remembers to launch it leaves gaps the fleet dashboard
     // cannot tell from an offline machine.
@@ -4573,9 +4396,7 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
         log::info!("KlaayGuard started - sign-in required");
     }
 
-    // A launch by klaayguard:// URL (first instance) is a sign-in in
-    // progress: hand it to the handler and do not open a second login tab.
-    if !try_handle_deep_link_from_args(&app, &state) && !authed {
+    if !authed {
         notify_signin_needed(&app, &state);
     }
 }
@@ -4665,7 +4486,6 @@ pub fn run() {
         api_base_url: api_base,
         last_attempt_at: RwLock::new(None),
         last_focus_at: RwLock::new(None),
-        pending_auth_state: RwLock::new(None),
         device_identity: RwLock::new(None),
         token_acquired: tokio::sync::Notify::new(),
         // Assume a usable tray until setup proves otherwise, so a nudge that
@@ -4682,15 +4502,11 @@ pub fn run() {
         ])
         // Single-instance must init first, so a second launch exits before the
         // other plugins spin up. Tauri documents this ordering.
-        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            // Handle deep link if present in args (secondary launches)
-            let st = app.state::<Arc<AppState>>().inner().clone();
-            dispatch_deep_link_args(app, &st, &args, "single_instance");
+        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {
             log::info!("single_instance: secondary launch routed to primary instance");
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_deep_link::init())
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
@@ -4868,18 +4684,6 @@ pub fn run() {
         .expect("error building tauri application");
 
     app.run(|_app_handle, event| match event {
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        tauri::RunEvent::Opened { urls } => {
-            // macOS open-url events deliver here; handle klaayguard:// URLs at runtime
-            if !urls.is_empty() {
-                let st = _app_handle.state::<Arc<AppState>>().inner().clone();
-                for u in urls {
-                    let s = u.to_string();
-                    log::info!("run_event_opened url={}", redact_deep_link(&s));
-                    handle_deep_link_url(_app_handle, &st, &s);
-                }
-            }
-        }
         // Linux only. Closing the Linux fallback window destroys the last
         // window, which would otherwise exit the whole app and stop
         // collection; veto that window-triggered exit (code None). A
@@ -5053,86 +4857,6 @@ mod update_selection_tests {
 #[cfg(test)]
 mod happy_path_tests {
     use super::*;
-
-    #[test]
-    fn deep_link_token_extracted_and_shape_validated() {
-        assert_eq!(
-            parse_deep_link_token("klaayguard://auth-callback?token=aaa.bbb.ccc"),
-            Some("aaa.bbb.ccc".to_string())
-        );
-        // token among other params
-        assert_eq!(
-            parse_deep_link_token("klaayguard://x?foo=1&token=aaa.bbb.ccc&bar=2"),
-            Some("aaa.bbb.ccc".to_string())
-        );
-    }
-
-    #[test]
-    fn deep_link_token_rejected_when_invalid() {
-        assert_eq!(
-            parse_deep_link_token("https://evil?token=aaa.bbb.ccc"),
-            None
-        ); // wrong scheme
-        assert_eq!(parse_deep_link_token("klaayguard://x?foo=1"), None); // no token
-        assert_eq!(
-            parse_deep_link_token("klaayguard://x?token=not-a-jwt"),
-            None
-        ); // wrong shape
-    }
-
-    #[test]
-    fn deep_link_state_param_extracted() {
-        assert_eq!(
-            deep_link_query_value(
-                "klaayguard://auth-callback?token=a.b.c&state=deadbeef",
-                "state"
-            ),
-            Some("deadbeef".to_string())
-        );
-        // Reserved characters arrive percent-encoded (encodeURIComponent).
-        assert_eq!(
-            deep_link_query_value("klaayguard://auth-callback?state=a%2Bb%3D", "state"),
-            Some("a+b=".to_string())
-        );
-        assert_eq!(
-            redact_deep_link("klaayguard://auth-callback?token=a.b.c&state=x"),
-            "klaayguard://auth-callback?<redacted>"
-        );
-        assert_eq!(
-            deep_link_query_value("klaayguard://auth-callback?token=a.b.c", "state"),
-            None
-        );
-        assert_eq!(deep_link_query_value("https://evil?state=x", "state"), None);
-    }
-
-    #[test]
-    fn auth_state_rollout_semantics() {
-        // Rollout (strict=false): missing state OR missing nonce is tolerated...
-        assert!(auth_state_ok(false, Some("n"), None)); // old Klaay Frontend: no echo
-        assert!(auth_state_ok(false, None, None)); // no pending nonce
-        assert!(auth_state_ok(false, None, Some("x"))); // unsolicited-ish, tolerated in rollout
-                                                        // ...but a present-and-matching state always passes...
-        assert!(auth_state_ok(false, Some("n"), Some("n")));
-        // ...and a present-but-WRONG state is always rejected, even in rollout.
-        assert!(!auth_state_ok(false, Some("n"), Some("bad")));
-    }
-
-    #[test]
-    fn auth_state_strict_requires_matching_nonce() {
-        assert!(auth_state_ok(true, Some("n"), Some("n")));
-        assert!(!auth_state_ok(true, Some("n"), None)); // missing echo now rejected
-        assert!(!auth_state_ok(true, None, Some("x"))); // unsolicited rejected
-        assert!(!auth_state_ok(true, Some("n"), Some("bad")));
-    }
-
-    #[test]
-    fn auth_nonce_is_64_hex_chars_and_fresh() {
-        let a = generate_auth_nonce().expect("rng");
-        let b = generate_auth_nonce().expect("rng");
-        assert_eq!(a.len(), 64);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b);
-    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -6281,21 +6005,6 @@ listener {
         assert!(fallback_window_needed(true, false, false));
         // A signed-in agent needs no UI: a window at every login is noise.
         assert!(!fallback_window_needed(true, false, true));
-    }
-
-    #[test]
-    fn deep_link_handler_desktop_file_matches_the_plugin() {
-        // The plugin names the file after the running executable. We re-run
-        // its xdg-mime step with a sanitised environment, so the name must
-        // match exactly or we point the scheme at a file that does not exist.
-        assert_eq!(
-            deep_link_handler_desktop_file("klaay-guard"),
-            "klaay-guard-handler.desktop"
-        );
-        assert_eq!(
-            deep_link_handler_desktop_file("KlaayGuard"),
-            "KlaayGuard-handler.desktop"
-        );
     }
 
     #[test]
