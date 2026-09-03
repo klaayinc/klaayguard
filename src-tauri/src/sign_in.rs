@@ -39,12 +39,18 @@ pub struct Pending {
     pub listener: TcpListener,
 }
 
+/// The browser can only deliver the code to this machine, so a remote attacker
+/// never receives it. Named so a test can assert the address this code binds,
+/// not one the test binds itself.
+fn bind_loopback() -> std::io::Result<TcpListener> {
+    TcpListener::bind("127.0.0.1:0")
+}
+
 /// Binds a loopback port and registers the sign-in. Binds first, because the
 /// server has to be told the real port and the OS only names it once the
 /// socket exists.
 pub async fn start(api_base_url: &str) -> Result<Pending, String> {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("could not bind loopback: {e}"))?;
+    let listener = bind_loopback().map_err(|e| format!("could not bind loopback: {e}"))?;
     listener
         .set_nonblocking(false)
         .map_err(|e| format!("could not configure loopback: {e}"))?;
@@ -226,10 +232,11 @@ mod tests {
     }
 
     // The whole point of the port: the browser can only deliver the code to
-    // this machine, so a remote attacker never receives it.
+    // this machine, so a remote attacker never receives it. This calls the
+    // function `start` uses, so widening that address fails here.
     #[test]
     fn the_listener_binds_loopback_only() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let listener = bind_loopback().expect("bind");
         let addr = listener.local_addr().expect("addr");
         assert!(addr.ip().is_loopback());
         assert!(addr.port() >= 1024);
