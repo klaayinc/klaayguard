@@ -43,11 +43,14 @@ $run = Get-ItemProperty -Path $runKey -Name KlaayGuard -ErrorAction SilentlyCont
 if ($run -and $run.KlaayGuard -match "KlaayGuard\.exe") { Pass "Run key: $($run.KlaayGuard)" }
 else { Fail "Run key KlaayGuard is missing or does not name KlaayGuard.exe" }
 
-# The klaayguard:// handler comes from the Tauri template's deep-link support.
-# Sign-in depends on it.
+# The installer no longer registers a klaayguard:// handler, and must not:
+# a custom URL scheme is first-come, first-served on the machine, so any local
+# program could claim it and receive the sign-in token. Sign-in now comes back
+# over a loopback port this process owns. A handler here would mean the scheme
+# came back.
 $cmd = Get-ItemProperty -Path "$classesKey\shell\open\command" -Name "(default)" -ErrorAction SilentlyContinue
-if ($cmd -and $cmd."(default)" -match "KlaayGuard\.exe") { Pass "klaayguard:// handler: $($cmd.'(default)')" }
-else { Fail "klaayguard:// protocol handler is missing under HKCU\Software\Classes" }
+if ($cmd) { Fail "klaayguard:// protocol handler is registered; the scheme was removed and must stay removed" }
+else { Pass "no klaayguard:// protocol handler" }
 
 # A doubled backslash in a key name means someone escaped a path NSIS-style.
 $bad = Get-ChildItem -Path "HKCU:\Software" -Recurse -ErrorAction SilentlyContinue |

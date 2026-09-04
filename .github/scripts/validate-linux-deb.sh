@@ -48,15 +48,14 @@ else
   pass "sidecar is stripped"
 fi
 
-# The desktop entry must exist, be valid, and register the auth scheme.
+# The desktop entry must exist and be valid. It no longer registers a URL
+# scheme: sign-in comes back over a loopback port this process owns, not over
+# a klaayguard:// URL any local program could have claimed.
 if test -f "$DESKTOP"; then
   pass "desktop entry present"
   grep -q '^MimeType=.*x-scheme-handler/klaayguard' "$DESKTOP" \
-    && pass "MimeType registers klaayguard://" \
-    || fail "desktop entry does not register x-scheme-handler/klaayguard; sign-in cannot complete"
-  grep -qE '^Exec=.*%U' "$DESKTOP" \
-    && pass "Exec passes the URL (%U)" \
-    || fail "Exec has no %U field code; the auth callback URL is never delivered"
+    && fail "desktop entry registers x-scheme-handler/klaayguard; the scheme was removed and must stay removed" \
+    || pass "no klaayguard:// scheme handler"
   if command -v desktop-file-validate >/dev/null; then
     desktop-file-validate "$DESKTOP" && pass "desktop-file-validate" \
       || fail "desktop-file-validate rejected the entry"

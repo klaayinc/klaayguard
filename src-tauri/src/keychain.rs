@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use keyring::Entry;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,49 @@ use std::path::{Path, PathBuf};
 const KEYCHAIN_SERVICE: &str = "com.klaay.klaayguard";
 const KEYCHAIN_ACCOUNT: &str = "auth_token";
 const DEVICE_ID_ACCOUNT: &str = "device_identity";
+
+/// The one API base whose credential entry is shared by every installed
+/// agent. Any other target gets its own entry — see `keychain_service_for`.
+const PRODUCTION_API_BASE: &str = "https://api.klaay.com";
+
+/// The credential entry this build uses, chosen by the server it talks to.
+///
+/// A build pointed at production keeps the entry the fleet already holds, so
+/// an upgrade never signs anybody out. A build pointed anywhere else gets its
+/// own: a developer running against localhost must not overwrite the token of
+/// the agent installed on the same machine, and a staging agent must not
+/// collide with a local one.
+///
+/// The suffix is a hash rather than the URL itself, because a service name
+/// and a directory name cannot carry a scheme, a colon, or a slash.
+fn keychain_service_for(api_base_url: &str) -> String {
+    match target_suffix(api_base_url) {
+        None => KEYCHAIN_SERVICE.to_string(),
+        Some(suffix) => format!("{KEYCHAIN_SERVICE}.{suffix}"),
+    }
+}
+
+/// `None` for production, so its names stay byte-identical to what already
+/// exists on disk and in the keychain.
+fn target_suffix(api_base_url: &str) -> Option<String> {
+    let normalised = api_base_url.trim_end_matches('/');
+    if normalised == PRODUCTION_API_BASE {
+        return None;
+    }
+    let digest = Sha256::digest(normalised.as_bytes());
+    Some(digest.iter().take(4).map(|b| format!("{b:02x}")).collect())
+}
+
+fn api_base() -> String {
+    crate::get_api_base_url()
+}
+
+/// Whether this build talks to production. Callers outside this module use it
+/// to keep production behaviour identical while letting a development build
+/// stand apart - see the single-instance registration in `lib.rs`.
+pub(crate) fn is_production_target(api_base_url: &str) -> bool {
+    target_suffix(api_base_url).is_none()
+}
 
 /// Which store held the credential. The caller surfaces a notice to the user
 /// when the OS Secret Service was unavailable and the file fallback was used.
@@ -17,7 +61,8 @@ pub enum CredentialStore {
 }
 
 fn entry_for(account: &str) -> Result<Entry, String> {
-    Entry::new(KEYCHAIN_SERVICE, account).map_err(|e| format!("keychain new entry error: {}", e))
+    Entry::new(&keychain_service_for(&api_base()), account)
+        .map_err(|e| format!("keychain new entry error: {}", e))
 }
 
 fn keyring_set(account: &str, value: &str) -> Result<(), String> {
@@ -47,7 +92,18 @@ fn keyring_get(account: &str) -> Result<Option<String>, String> {
 // same backups as the file.
 
 fn credential_file(account: &str) -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("com.klaay.app").join("credentials").join(account))
+    credential_file_in(&api_base(), account)
+}
+
+/// The fallback file needs the same split as the keychain entry, or a local
+/// build overwrites the installed agent's token on any desktop without a
+/// Secret Service daemon. Production keeps the existing path exactly.
+fn credential_file_in(api_base_url: &str, account: &str) -> Option<PathBuf> {
+    let dir = match target_suffix(api_base_url) {
+        None => "credentials".to_string(),
+        Some(suffix) => format!("credentials-{suffix}"),
+    };
+    dirs::data_local_dir().map(|d| d.join("com.klaay.app").join(dir).join(account))
 }
 
 fn file_save_at(path: &Path, value: &str) -> Result<(), String> {
@@ -197,6 +253,79 @@ pub fn load_device_identity() -> Result<Option<String>, String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // A build pointed at production keeps the entry every installed agent
+    // already uses. Changing it would sign the fleet out on upgrade.
+    #[test]
+    fn production_keeps_the_installed_entry() {
+        assert_eq!(
+            keychain_service_for("https://api.klaay.com"),
+            "com.klaay.klaayguard"
+        );
+        assert_eq!(
+            keychain_service_for("https://api.klaay.com/"),
+            "com.klaay.klaayguard"
+        );
+    }
+
+    // A build pointed anywhere else must not share the production entry.
+    // Without this, running a local build signs the real agent out and
+    // replaces its token with one minted by a development server.
+    #[test]
+    fn any_other_target_gets_its_own_entry() {
+        for base in [
+            "http://localhost:61521",
+            "http://127.0.0.1:3000",
+            "https://api.staging.klaay.com",
+        ] {
+            let service = keychain_service_for(base);
+            assert_ne!(
+                service, "com.klaay.klaayguard",
+                "{base} shared the production entry"
+            );
+            assert!(service.starts_with("com.klaay.klaayguard."), "{service}");
+        }
+    }
+
+    // Two different non-production targets must not collide either, so a
+    // staging agent and a local one can coexist on one machine.
+    #[test]
+    fn two_non_production_targets_do_not_collide() {
+        assert_ne!(
+            keychain_service_for("http://localhost:61521"),
+            keychain_service_for("https://api.staging.klaay.com")
+        );
+    }
+
+    // Single-instance keys on the bundle identifier, which cannot differ
+    // between builds without changing the app's identity. A development build
+    // therefore skips the plugin instead, so it does not exit on startup
+    // because the installed agent already holds the socket.
+    #[test]
+    fn only_a_production_build_joins_single_instance() {
+        assert!(is_production_target("https://api.klaay.com"));
+        assert!(is_production_target("https://api.klaay.com/"));
+        assert!(!is_production_target("http://localhost:61521"));
+        assert!(!is_production_target("https://api.staging.klaay.com"));
+    }
+
+    // The file fallback needs the same split. Without it, a local build
+    // overwrites the installed agent's token on any desktop with no Secret
+    // Service daemon - the very case the fallback exists to serve.
+    #[test]
+    fn the_file_fallback_splits_the_same_way() {
+        let prod = credential_file_in("https://api.klaay.com", "auth_token");
+        let local = credential_file_in("http://localhost:61521", "auth_token");
+
+        assert_ne!(prod, local);
+        assert!(
+            prod.as_ref()
+                .unwrap()
+                .to_string_lossy()
+                .contains("/credentials/"),
+            "production path changed: {prod:?}"
+        );
+    }
 
     fn unique_path(name: &str) -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
