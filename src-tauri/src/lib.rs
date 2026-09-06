@@ -4294,8 +4294,21 @@ async fn replace_application(
 
     result?;
 
-    log::info!("🎉 Application updated successfully! Restarting...");
-    app.restart();
+    // One relauncher only. Under launchd the LaunchAgent wrapper runs
+    // `open -W` with KeepAlive, so this process exiting IS the relaunch;
+    // restarting ourselves as well spawns a second instance in the same
+    // instant, and two simultaneous starts race past the single-instance
+    // socket before either binds it (seen in production on 2026-09-05:
+    // adjacent PIDs, two tray icons). Outside launchd nothing else
+    // relaunches us, so there restart() stays.
+    if std::env::var("KLAAYGUARD_LAUNCHD").as_deref() == Ok("1") {
+        log::info!("🎉 Updated; exiting so launchd relaunches the new build");
+        app.exit(0);
+        Ok(())
+    } else {
+        log::info!("🎉 Application updated successfully! Restarting...");
+        app.restart();
+    }
 }
 fn update_check_interval_seconds() -> u64 {
     env_seconds("KLAAYGUARD_UPDATE_INTERVAL_SECONDS", 6 * 60 * 60)
