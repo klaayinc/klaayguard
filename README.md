@@ -208,6 +208,13 @@ running with `KeepAlive`.
 - The agent is per-user. It runs only while that user is logged in.
 - The `bootstrap` step is skipped when the app is not under `/Applications`.
   Launch from `/Applications`, not from Downloads.
+- Only the bundle the LaunchAgent points at writes it. A build running from
+  anywhere else — a developer binary, a copy on a mounted disk image — leaves it
+  alone, and says so in the log.
+- The LaunchAgent records the API base the app was **compiled** with, never the
+  one in the environment. It injects `VITE_API_BASE_URL` into the agent it
+  starts, so reading that back would write whatever the file already held, and a
+  wrong value could never correct itself.
 
 ## Automatic startup on Windows
 
