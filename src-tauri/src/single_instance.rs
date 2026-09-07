@@ -247,6 +247,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// A lock that cannot be evaluated is not the same as a lock someone else
+    /// holds. The agent runs anyway and reports it, because a security agent
+    /// that refuses to start is worse than two that run. The reason must name
+    /// the path, or the report is unactionable.
+    #[test]
+    fn an_unreachable_lock_path_reports_why_instead_of_conceding() {
+        let blocked = unique_path("not-a-directory");
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, b"").unwrap();
+        // The lock's parent is now a regular file, so the directory cannot be
+        // created and the claim cannot be judged either way.
+        let path = blocked.join("agent.lock");
+
+        match claim_agent_lock(&path, 2, NOW) {
+            Claim::Unavailable(why) => {
+                assert!(
+                    why.contains("agent.lock"),
+                    "the reason does not name the lock: {why}"
+                );
+            }
+            other => panic!("expected the lock to be unavailable, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(blocked.parent().unwrap());
+    }
+
     /// A production build and a developer build must not fight over one lock.
     #[test]
     fn two_api_targets_do_not_share_a_lock() {
