@@ -216,6 +216,21 @@ running with `KeepAlive`.
   starts, so reading that back would write whatever the file already held, and a
   wrong value could never correct itself.
 
+## One agent per machine
+
+Only one agent may run at a time, or the device reports its data twice and the
+two copies fight over the sign-in state.
+
+- macOS claims an exclusive `flock` on
+  `~/Library/Application Support/com.klaay.app/agent.lock` before it starts
+  anything else. A second agent finds the lock held and exits.
+- Linux and Windows use `tauri-plugin-single-instance`: a D-Bus name and a
+  named mutex. Both are atomic, so neither needs the lock file.
+- The lock name follows the API base the build was compiled against, so a
+  development build runs alongside the installed production agent.
+- The kernel releases the lock when the agent exits, so a crash never leaves a
+  stale lock behind.
+
 ## Automatic startup on Windows
 
 The installer writes a `Run` value under
@@ -244,7 +259,9 @@ staged installer and checks the hash again before it runs it.
 
 If any check fails, the running agent stays untouched. On success:
 
-- macOS replaces `/Applications/KlaayGuard.app` and restarts the agent.
+- macOS replaces `/Applications/KlaayGuard.app`. Under launchd the agent exits
+  and `KeepAlive` starts the new build; outside launchd it restarts itself.
+  Exactly one of the two relaunches, never both.
 - Linux replaces the AppImage file and restarts the agent.
 - Windows runs the new installer with `/S /R`. The installer stops the old
   agent, installs over it, and starts the new one.
