@@ -4508,16 +4508,16 @@ fn compiled_api_base_url() -> &'static str {
 
 /// The lock this agent holds for as long as it runs. `flock` binds to the open
 /// file description, so the lock lives exactly as long as this `File`; letting
-/// it drop would release the machine without a sound.
+/// it drop would release this login without a sound.
 #[cfg(target_os = "macos")]
 static AGENT_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
 
-/// Claim this machine, or exit because another agent already holds it.
+/// Claim this login, or exit because another agent already holds it.
 ///
 /// Runs before Tauri, so it reports through `append_early_log` rather than the
 /// plugin logger.
 #[cfg(target_os = "macos")]
-fn claim_this_machine() {
+fn claim_this_login() {
     let Some(path) = single_instance::agent_lock_path(compiled_api_base_url()) else {
         // No data directory means no lock. An agent that cannot collect is
         // worse than two that can, so run and make the gap visible.
@@ -4532,13 +4532,24 @@ fn claim_this_machine() {
     // `launchctl kickstart -k` kills the running agent and starts its
     // replacement at once, and the dead process releases its lock a moment
     // later. Retry across that handover before concluding another agent owns
-    // the machine.
+    // this login. Five attempts 400 ms apart sleep four times, so the loser
+    // concedes after 1.6 s.
     match single_instance::claim_agent_lock(&path, 5, std::time::Duration::from_millis(400)) {
         single_instance::Claim::Held(file) => {
-            let _ = AGENT_LOCK.set(file);
+            // A full cell hands the file straight back inside `Err`, where
+            // `let _ =` would drop it and close the fd. One caller reaches
+            // here today, so the cell is always empty. Report the second
+            // caller rather than swallow it: whoever adds one needs to see
+            // that this file, not the parked one, is the lock being closed.
+            if AGENT_LOCK.set(file).is_err() {
+                append_early_log(
+                    "[single_instance] the lock was claimed twice; the second file is closed",
+                );
+                sentry::capture_message("single_instance_lock_claimed_twice", Level::Warning);
+            }
         }
         single_instance::Claim::Taken => {
-            append_early_log("[single_instance] another agent holds this machine; exiting");
+            append_early_log("[single_instance] another agent already runs for this user; exiting");
             // Exit 0: the launchd job is `open -W`, which simply returns, so
             // KeepAlive does not spin on this.
             std::process::exit(0);
@@ -4617,12 +4628,12 @@ pub fn run() {
         }
     }
 
-    // Claim the machine before anything starts. This runs after the CLI seams,
+    // Claim this login before anything starts. This runs after the CLI seams,
     // so `--install-agent` and `--forget-credentials` never take the lock, and
     // before the Tauri builder, so a losing agent exits without ever reaching
     // the tray.
     #[cfg(target_os = "macos")]
-    claim_this_machine();
+    claim_this_login();
 
     // Runtime env, else the compile-time default build.rs baked in.
     let api_base = get_api_base_url();

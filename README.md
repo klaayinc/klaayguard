@@ -221,14 +221,18 @@ running with `KeepAlive`.
   redirect therefore stops collection at the first request, not only at the next
   update check.
 
-## One agent per machine
+## One agent per user
 
-Only one agent may run at a time, or the device reports its data twice and the
-two copies fight over the sign-in state.
+Only one agent may run per login account, or the device reports its data twice
+and the two copies fight over the sign-in state.
 
 - macOS claims an exclusive `flock` on
   `~/Library/Application Support/com.klaay.app/agent.lock` before it starts
   anything else. A second agent finds the lock held and exits.
+- The lock is per user, like the LaunchAgent above. Two accounts logged in at
+  once run two agents. A machine-wide lock would need a path every account can
+  write, and any account could take that lock first and leave the Mac with no
+  agent at all.
 - Linux and Windows use `tauri-plugin-single-instance`: a D-Bus name and a
   named mutex. Both are atomic, so neither needs the lock file.
 - The lock name follows the API base the build was compiled against, so a
