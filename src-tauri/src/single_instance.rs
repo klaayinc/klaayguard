@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! One agent per machine, claimed with an atomic file lock.
+//! One agent per user, claimed with an atomic file lock.
 //!
 //! `tauri-plugin-single-instance` guards macOS with a socket in `/tmp`, and it
 //! unlinks the path *before* it binds (`platform_impl/macos.rs:33-34`). Two
@@ -11,6 +11,17 @@
 //! `flock(LOCK_EX | LOCK_NB)` is one syscall, so exactly one caller wins. The
 //! kernel drops the lock when the holder dies, so there is no stale file to
 //! clean up and no path where an exiting agent strips a live agent's claim.
+//!
+//! The scope is one login account, not the whole Mac. The lock sits in the
+//! user's own data directory, and launchd starts the agent per GUI session
+//! (`gui/$UID`, `LimitLoadToSessionType Aqua`). Two accounts logged in at once
+//! therefore run two agents, each reporting under its own sign-in. That is a
+//! narrower guard than the `/tmp` socket it replaces, which was per machine.
+//!
+//! Widening it back would need a path every account can write. `/tmp` is that
+//! path, and any account there could take the lock first and hold it: every
+//! real agent would then read the machine as taken and exit, leaving the Mac
+//! unmonitored. No agent is worse than two, so the guard stays per user.
 //!
 //! Windows (a named mutex) and Linux (a D-Bus name) are already atomic, so they
 //! keep the plugin. This module serves macOS, and compiles under `test` so the
@@ -24,9 +35,9 @@ use std::time::Duration;
 /// What happened when this process tried to become the agent.
 #[derive(Debug)]
 pub(crate) enum Claim {
-    /// This process owns the machine. Hold the file for the whole process
-    /// lifetime: `flock` binds to the open file description, so dropping the
-    /// `File` releases the lock without a sound.
+    /// This process is the agent for this login. Hold the file for the whole
+    /// process lifetime: `flock` binds to the open file description, so
+    /// dropping the `File` releases the lock without a sound.
     Held(File),
     /// Another agent owns it. This process must exit.
     Taken,
@@ -59,7 +70,7 @@ pub(crate) fn agent_lock_path(api_base_url: &str) -> Option<PathBuf> {
 /// replacement at once, and the dead process releases its lock asynchronously.
 /// A single failed attempt therefore means "my predecessor is dying", not
 /// "another agent is healthy". Conceding immediately would turn a handover of a
-/// few hundred milliseconds into a machine with no agent at all.
+/// few hundred milliseconds into a login with no agent at all.
 ///
 /// `attempts` and `backoff` are parameters so the retry rule is testable
 /// without waiting on a real clock.
@@ -106,6 +117,34 @@ fn same_inode(file: &File, path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Runs between taking the lock and checking the inode. The window
+/// `same_inode` closes is only a few instructions wide, so a test cannot hit it
+/// by racing a thread; this seam lets one step into it exactly. Production
+/// compiles an empty function and the optimiser drops it.
+#[cfg(not(test))]
+#[inline]
+fn between_lock_and_check(_path: &Path) {}
+
+#[cfg(test)]
+type LockHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BETWEEN_LOCK_AND_CHECK: std::cell::RefCell<Option<LockHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn between_lock_and_check(path: &Path) {
+    // Take the hook out before calling it, so a hook that claims the lock again
+    // re-enters an empty seam instead of looping.
+    let hook = BETWEEN_LOCK_AND_CHECK.with(|h| h.borrow_mut().take());
+    if let Some(f) = hook {
+        f(path);
+        BETWEEN_LOCK_AND_CHECK.with(|h| *h.borrow_mut() = Some(f));
+    }
+}
+
 /// One attempt: `Ok(Some(file))` holds it, `Ok(None)` means someone else does
 /// (or the file was replaced), `Err` means the lock could not be evaluated.
 fn try_claim(path: &Path) -> std::io::Result<Option<File>> {
@@ -131,6 +170,8 @@ fn try_claim(path: &Path) -> std::io::Result<Option<File>> {
         }
         return Err(std::io::Error::from_raw_os_error(e as i32));
     }
+
+    between_lock_and_check(path);
 
     if !same_inode(&file, path)? {
         return Ok(None);
@@ -161,8 +202,16 @@ mod tests {
 
     const NOW: Duration = Duration::from_millis(0);
 
+    fn set_between_lock_and_check(f: impl Fn(&Path) + 'static) {
+        BETWEEN_LOCK_AND_CHECK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    fn clear_between_lock_and_check() {
+        BETWEEN_LOCK_AND_CHECK.with(|h| *h.borrow_mut() = None);
+    }
+
     /// The defect this module exists to close: a second agent must not be able
-    /// to claim a machine that already has one.
+    /// to claim a login that already has one.
     #[test]
     fn a_second_claim_on_the_same_path_is_refused() {
         let path = unique_path("agent.lock");
@@ -170,7 +219,7 @@ mod tests {
 
         match claim_agent_lock(&path, 1, NOW) {
             Claim::Taken => {}
-            other => panic!("a second agent claimed the same machine: {other:?}"),
+            other => panic!("a second agent claimed the same login: {other:?}"),
         }
 
         drop(first);
@@ -213,7 +262,7 @@ mod tests {
     /// succeeds on an orphaned inode nobody will ever look up again, so without
     /// this check it would run beside the agent holding the live one.
     #[test]
-    fn a_lock_on_a_replaced_file_is_not_the_machines_lock() {
+    fn a_lock_on_a_replaced_file_is_not_the_live_lock() {
         let path = unique_path("agent.lock");
         let orphan = held(claim_agent_lock(&path, 1, NOW));
 
@@ -223,7 +272,7 @@ mod tests {
 
         assert!(
             !same_inode(&orphan, &path).unwrap(),
-            "a lock on a replaced file was mistaken for the machine's lock"
+            "a lock on a replaced file was mistaken for the live lock"
         );
 
         drop(orphan);
@@ -232,7 +281,7 @@ mod tests {
 
     /// The path vanishing is the same loss, and must read the same way.
     #[test]
-    fn a_lock_on_a_deleted_file_is_not_the_machines_lock() {
+    fn a_lock_on_a_deleted_file_is_not_the_live_lock() {
         let path = unique_path("agent.lock");
         let orphan = held(claim_agent_lock(&path, 1, NOW));
 
@@ -240,10 +289,36 @@ mod tests {
 
         assert!(
             !same_inode(&orphan, &path).unwrap(),
-            "a lock on a deleted file was mistaken for the machine's lock"
+            "a lock on a deleted file was mistaken for the live lock"
         );
 
         drop(orphan);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The same loss, driven through the claim path instead of asserted on
+    /// `same_inode` alone. The two tests above call `same_inode` directly, so
+    /// deleting its caller in `try_claim` leaves them green while a second
+    /// agent walks in beside the first. This one goes red.
+    #[test]
+    fn a_claim_that_loses_its_file_before_the_check_concedes() {
+        let path = unique_path("agent.lock");
+        let replaced = path.clone();
+
+        // Stand in for the process that overtakes this one: the claim locks
+        // the inode it opened, and the name then points somewhere else.
+        set_between_lock_and_check(move |_| {
+            std::fs::remove_file(&replaced).unwrap();
+            std::fs::write(&replaced, b"").unwrap();
+        });
+        let claim = claim_agent_lock(&path, 1, NOW);
+        clear_between_lock_and_check();
+
+        match claim {
+            Claim::Taken => {}
+            other => panic!("a lock on an orphaned inode was read as the live lock: {other:?}"),
+        }
+
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
