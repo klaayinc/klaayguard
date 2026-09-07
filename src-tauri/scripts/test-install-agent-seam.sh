@@ -30,10 +30,10 @@ cargo build --bin KlaayGuard >/dev/null
 # Move any existing plist aside and put it back on exit, so a file found after
 # the run is attributable to it, and a developer Mac keeps the LaunchAgent it
 # depends on.
-SAVED="$(mktemp -d)/plist"
 if [ -f "$PLIST" ]; then
-  mv "$PLIST" "$SAVED"
-  restore_plist() { rm -f "$PLIST"; mv "$SAVED" "$PLIST"; }
+  SAVED_DIR="$(mktemp -d)"
+  mv "$PLIST" "$SAVED_DIR/plist"
+  restore_plist() { rm -f "$PLIST"; mv "$SAVED_DIR/plist" "$PLIST"; rmdir "$SAVED_DIR"; }
 else
   restore_plist() { rm -f "$PLIST"; }
 fi

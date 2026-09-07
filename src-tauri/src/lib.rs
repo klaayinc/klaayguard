@@ -2841,6 +2841,21 @@ fn may_write_launch_agent(
     installed && current_exe.starts_with(installed_bundle)
 }
 
+/// The API base to write into the LaunchAgent.
+///
+/// Always the compiled value. The plist hands the agent `VITE_API_BASE_URL`, so
+/// an agent that resolved this through `get_api_base_url` would write back
+/// whatever the plist already held: one wrong value would survive every restart
+/// and every update, because each run rewrites it and the content check finds
+/// nothing to change.
+///
+/// This exists as its own function so a test can set that variable and prove the
+/// choice ignores it. Inlining the call made the rule untestable.
+#[cfg(any(target_os = "macos", test))]
+fn plist_api_base() -> String {
+    compiled_api_base_url().to_string()
+}
+
 /// Build the launchd plist. Pure, so every rule it encodes is testable without
 /// touching `~/Library/LaunchAgents` or running `launchctl`.
 ///
@@ -2903,11 +2918,9 @@ async fn install_launch_agent() -> Result<String, String> {
     }
     let app_path = app_bundle_path.to_string_lossy().to_string();
 
-    // The compiled server, never the injected one. The plist hands the agent
-    // VITE_API_BASE_URL, so reading that back would write whatever the plist
-    // already held and a wrong value could never heal. `compiled_api_base_url`
-    // is the same value the single-instance lock keys on; they must not drift.
-    let api_base_for_plist = compiled_api_base_url();
+    // The compiled server, never the injected one — see `plist_api_base`. It is
+    // the same value the single-instance lock keys on; they must not drift.
+    let api_base_for_plist = plist_api_base();
 
     let log_dir = home_dir.join("Library/Logs/KlaayGuard");
     fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create log directory: {}", e))?;
@@ -2916,7 +2929,7 @@ async fn install_launch_agent() -> Result<String, String> {
         label,
         &app_path,
         &log_dir.to_string_lossy(),
-        api_base_for_plist,
+        &api_base_for_plist,
     );
 
     let mut needs_reload = true;
@@ -2936,39 +2949,36 @@ async fn install_launch_agent() -> Result<String, String> {
     fs::write(&plist_path, plist_content)
         .map_err(|e| format!("Failed to write plist file: {}", e))?;
 
-    if installed_exists {
-        if needs_reload {
-            let _ = std::process::Command::new("launchctl")
-                .args(["bootout", &format!("{}/{}", domain, label)])
-                .output();
-        }
-
-        // Enable the label BEFORE bootstrap. If it was left `disabled` in launchd's
-        // override DB (e.g. by a prior `bootout`/`disable`), bootstrap fails with
-        // "Input/output error" and RunAtLoad never fires at login. Enabling afterwards
-        // can never recover, because bootstrap's failure returns early.
+    // No `installed_exists` check here. The guard above returns early unless the
+    // app is installed, so by this point it always is.
+    if needs_reload {
         let _ = std::process::Command::new("launchctl")
-            .args(["enable", &format!("{}/{}", domain, label)])
+            .args(["bootout", &format!("{}/{}", domain, label)])
             .output();
-
-        let output = std::process::Command::new("launchctl")
-            .args(["bootstrap", &domain, plist_path.to_str().unwrap()])
-            .output()
-            .map_err(|e| format!("Failed to bootstrap launch agent: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("EEXIST") && !stderr.contains("already loaded") {
-                return Err(format!("Failed to bootstrap launch agent: {}", stderr));
-            }
-        }
-
-        let _ = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
-            .output();
-    } else {
-        // Not installed under /Applications; skip bootstrap to avoid immediate launch errors in dev.
-        // launchd will load the agent at next login.
     }
+
+    // Enable the label BEFORE bootstrap. If it was left `disabled` in launchd's
+    // override DB (e.g. by a prior `bootout`/`disable`), bootstrap fails with
+    // "Input/output error" and RunAtLoad never fires at login. Enabling afterwards
+    // can never recover, because bootstrap's failure returns early.
+    let _ = std::process::Command::new("launchctl")
+        .args(["enable", &format!("{}/{}", domain, label)])
+        .output();
+
+    let output = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, plist_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("Failed to bootstrap launch agent: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("EEXIST") && !stderr.contains("already loaded") {
+            return Err(format!("Failed to bootstrap launch agent: {}", stderr));
+        }
+    }
+
+    let _ = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
+        .output();
 
     Ok("Launch agent installed successfully".to_string())
 }
@@ -4489,9 +4499,9 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
 /// injects, and any build can rewrite that plist. Two production agents reading
 /// two different injected values would take two different locks and both run.
 ///
-/// Only macOS claims the lock, so only macOS compiles this. Adding `test` to the
-/// gate would build it unused on the Linux CI runner, which denies warnings.
-#[cfg(target_os = "macos")]
+/// `plist_api_base` calls this under `any(macos, test)`, so it is used on the
+/// Linux CI runner too and no dead-code warning fires there.
+#[cfg(any(target_os = "macos", test))]
 fn compiled_api_base_url() -> &'static str {
     option_env!("APP_DEFAULT_API_BASE_URL").unwrap_or("https://api.klaay.com")
 }
@@ -5099,6 +5109,27 @@ mod happy_path_tests {
             installed,
             false
         ));
+    }
+
+    // Half of what this fix is for: "a wrong value could never heal". The plist
+    // injects VITE_API_BASE_URL into the agent it starts, so resolving the
+    // plist's own base through the environment would write back whatever the
+    // file already held. Set the variable and prove the choice ignores it.
+    //
+    // Safe to touch the process environment here: no other test reaches
+    // `get_api_base_url`, directly or through `keychain::api_base`.
+    #[test]
+    fn the_launch_agent_ignores_an_injected_server() {
+        let injected = "http://localhost:54524";
+        std::env::set_var("VITE_API_BASE_URL", injected);
+        let chosen = plist_api_base();
+        std::env::remove_var("VITE_API_BASE_URL");
+
+        assert_ne!(
+            chosen, injected,
+            "the plist copied the injected server, so a wrong value can never heal"
+        );
+        assert_eq!(chosen, compiled_api_base_url());
     }
 
     #[test]
