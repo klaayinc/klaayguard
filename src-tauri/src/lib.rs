@@ -15,6 +15,10 @@
 
 mod keychain;
 mod sign_in;
+// macOS claims its single-instance lock here. `test` is in the gate so the
+// Linux CI runner, which is the only one that runs `cargo test`, exercises it.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+mod single_instance;
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -4294,8 +4298,51 @@ async fn replace_application(
 
     result?;
 
-    log::info!("🎉 Application updated successfully! Restarting...");
-    app.restart();
+    match update_relaunch(std::env::var("KLAAYGUARD_LAUNCHD").as_deref() == Ok("1")) {
+        Relaunch::LeaveItToLaunchd => {
+            log::info!("🎉 Updated; exiting so launchd relaunches the new build");
+            // `app.exit` always ends the process with status 0: the requested
+            // code reaches RunEvent::ExitRequested and is then dropped for
+            // ControlFlow::Exit, which tao defines as ExitWithCode(0). That is
+            // correct here only while KeepAlive is unconditional. A plist that
+            // moves to KeepAlive={SuccessfulExit:false} must stop using
+            // app.exit, or launchd will never bring the agent back.
+            app.exit(0);
+            Ok(())
+        }
+        Relaunch::RestartSelf => {
+            log::info!("🎉 Application updated successfully! Restarting...");
+            app.restart();
+        }
+    }
+}
+
+/// Who brings the agent back after an update installs.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum Relaunch {
+    /// Exit and let the launchd `KeepAlive` job start the new build.
+    LeaveItToLaunchd,
+    /// Nothing else supervises this process, so it restarts itself.
+    RestartSelf,
+}
+
+/// One relauncher only. Under launchd the LaunchAgent wrapper runs `open -W`
+/// with `KeepAlive`, so this process exiting IS the relaunch; restarting
+/// ourselves as well spawns a second agent in the same instant, and two
+/// simultaneous starts race past the single-instance guard (PROD-4603, seen in
+/// production on 2026-09-05: adjacent PIDs, two tray icons). Outside launchd
+/// nothing else relaunches us, so there `restart()` stays.
+///
+/// `under_launchd` is a parameter rather than an env read, so both arms are
+/// pinned by tests without touching the process environment.
+#[cfg(any(target_os = "macos", test))]
+fn update_relaunch(under_launchd: bool) -> Relaunch {
+    if under_launchd {
+        Relaunch::LeaveItToLaunchd
+    } else {
+        Relaunch::RestartSelf
+    }
 }
 fn update_check_interval_seconds() -> u64 {
     env_seconds("KLAAYGUARD_UPDATE_INTERVAL_SECONDS", 6 * 60 * 60)
@@ -4401,6 +4448,69 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
     }
 }
 
+/// The API base this build was compiled against.
+///
+/// The single-instance lock keys on this, never on `get_api_base_url()`. That
+/// one prefers the runtime `VITE_API_BASE_URL`, which the LaunchAgent plist
+/// injects, and any build can rewrite that plist. Two production agents reading
+/// two different injected values would take two different locks and both run.
+///
+/// Only macOS claims the lock, so only macOS compiles this. Adding `test` to the
+/// gate would build it unused on the Linux CI runner, which denies warnings.
+#[cfg(target_os = "macos")]
+fn compiled_api_base_url() -> &'static str {
+    option_env!("APP_DEFAULT_API_BASE_URL").unwrap_or("https://api.klaay.com")
+}
+
+/// The lock this agent holds for as long as it runs. `flock` binds to the open
+/// file description, so the lock lives exactly as long as this `File`; letting
+/// it drop would release the machine without a sound.
+#[cfg(target_os = "macos")]
+static AGENT_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Claim this machine, or exit because another agent already holds it.
+///
+/// Runs before Tauri, so it reports through `append_early_log` rather than the
+/// plugin logger.
+#[cfg(target_os = "macos")]
+fn claim_this_machine() {
+    let Some(path) = single_instance::agent_lock_path(compiled_api_base_url()) else {
+        // No data directory means no lock. An agent that cannot collect is
+        // worse than two that can, so run and make the gap visible.
+        append_early_log("[single_instance] no data directory for the lock; running unguarded");
+        sentry::capture_message(
+            "single_instance_lock_unavailable: no data dir",
+            Level::Warning,
+        );
+        return;
+    };
+
+    // `launchctl kickstart -k` kills the running agent and starts its
+    // replacement at once, and the dead process releases its lock a moment
+    // later. Retry across that handover before concluding another agent owns
+    // the machine.
+    match single_instance::claim_agent_lock(&path, 5, std::time::Duration::from_millis(400)) {
+        single_instance::Claim::Held(file) => {
+            let _ = AGENT_LOCK.set(file);
+        }
+        single_instance::Claim::Taken => {
+            append_early_log("[single_instance] another agent holds this machine; exiting");
+            // Exit 0: the launchd job is `open -W`, which simply returns, so
+            // KeepAlive does not spin on this.
+            std::process::exit(0);
+        }
+        single_instance::Claim::Unavailable(why) => {
+            append_early_log(&format!(
+                "[single_instance] lock could not be evaluated ({why}); running unguarded"
+            ));
+            sentry::capture_message(
+                &format!("single_instance_lock_unavailable: {why}"),
+                Level::Warning,
+            );
+        }
+    }
+}
+
 /// Main entry point for the KlaayGuard security monitoring application.
 ///
 /// This function initializes the Tauri application with security-focused configuration:
@@ -4463,6 +4573,13 @@ pub fn run() {
         }
     }
 
+    // Claim the machine before anything starts. This runs after the CLI seams,
+    // so `--install-agent` and `--forget-credentials` never take the lock, and
+    // before the Tauri builder, so a losing agent exits without ever reaching
+    // the tray.
+    #[cfg(target_os = "macos")]
+    claim_this_machine();
+
     // Runtime env, else the compile-time default build.rs baked in.
     let api_base = get_api_base_url();
     let frontend = get_frontend_url();
@@ -4494,14 +4611,22 @@ pub fn run() {
         tray_watcher_present: std::sync::atomic::AtomicBool::new(true),
     });
 
+    // Only the non-macOS arm below mutates this, so macOS binds it immutably.
+    #[cfg(not(target_os = "macos"))]
     let mut builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = tauri::Builder::default();
 
-    // Single-instance keys on the bundle identifier, and on macOS the plugin
-    // offers no override (`dbus_id` is Linux only). A development build would
-    // therefore see the installed agent's socket and exit on startup, which
-    // makes the sign-in flow impossible to test on a machine that runs the
-    // agent. Production registers it exactly as before; a build pointed
-    // elsewhere skips it and may run alongside.
+    // macOS claimed its lock above, before Tauri existed. The plugin's macOS
+    // guard unlinks its socket before it binds, so two agents that start
+    // together both win it (PROD-4603).
+    //
+    // Linux and Windows keep the plugin: a D-Bus name and a named mutex are
+    // both atomic, so neither has the defect. They also keep the
+    // production-only gate, because the plugin keys on the bundle identifier
+    // and offers no per-target override on Windows — a development build would
+    // otherwise see the installed agent and exit on startup.
+    #[cfg(not(target_os = "macos"))]
     if keychain::is_production_target(&get_api_base_url()) {
         // Must init first, so a second launch exits before the other plugins
         // spin up. Tauri documents this ordering.
@@ -4841,6 +4966,15 @@ mod update_selection_tests {
         // Without /UPDATE the template runs the WebView2 bootstrapper section
         // and re-creates shortcuts, as for a fresh install.
         assert!(args.contains(&"/UPDATE"));
+    }
+
+    // PROD-4603: the update ended with app.restart() while the launchd
+    // KeepAlive job also relaunched the agent the moment the old process
+    // exited. Two relaunchers, two agents. Under launchd there must be one.
+    #[test]
+    fn only_launchd_relaunches_a_supervised_agent() {
+        assert_eq!(update_relaunch(true), Relaunch::LeaveItToLaunchd);
+        assert_eq!(update_relaunch(false), Relaunch::RestartSelf);
     }
 
     #[test]
