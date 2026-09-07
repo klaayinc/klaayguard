@@ -208,6 +208,18 @@ running with `KeepAlive`.
 - The agent is per-user. It runs only while that user is logged in.
 - The `bootstrap` step is skipped when the app is not under `/Applications`.
   Launch from `/Applications`, not from Downloads.
+- Only the bundle the LaunchAgent points at writes it. A build running from
+  anywhere else — a developer binary, a copy on a mounted disk image — leaves it
+  alone, and says so in the log.
+- The LaunchAgent records the API base the app was **compiled** with, never the
+  one in the environment. It injects `VITE_API_BASE_URL` into the agent it
+  starts, so reading that back would write whatever the file already held, and a
+  wrong value could never correct itself.
+- A redirected agent also loses its credential. The keychain service name is
+  chosen by the API base, and a non-production URL gets a hashed suffix, so the
+  agent looks for its token under a name that holds nothing and finds none. A
+  redirect therefore stops collection at the first request, not only at the next
+  update check.
 
 ## One agent per user
 
