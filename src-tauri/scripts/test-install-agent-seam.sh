@@ -13,6 +13,9 @@ cd "$(dirname "$0")/.."
 
 BIN="target/debug/KlaayGuard"
 PLIST="$HOME/Library/LaunchAgents/com.klaay.klaayguard.plist"
+# A plain `cargo build` bakes in the production API base, so the lock this
+# binary would claim is the unsuffixed one. The seam must exit before it.
+LOCK="$HOME/Library/Application Support/com.klaay.app/agent.lock"
 
 echo "==> Building debug binary"
 cargo build --bin KlaayGuard >/dev/null
@@ -40,6 +43,11 @@ run_with_timeout() {
   wait "$pid"
 }
 
+# A production agent already running on this Mac holds the same lock, so its
+# presence says nothing about the seam. Only judge a lock this run created.
+lock_before=no
+[ -e "$LOCK" ] && lock_before=yes
+
 echo "==> Running '$BIN --install-agent' (must exit within 10s)"
 set +e
 run_with_timeout 10 "$BIN" --install-agent
@@ -62,4 +70,16 @@ if [ ! -f "$PLIST" ]; then
   exit 1
 fi
 
-echo "PASS: seam exited promptly (code $code) and wrote the LaunchAgent plist"
+#  3. it must NOT claim the single-instance lock. The .pkg postinstall runs this
+#     seam while the previous agent is still up; a seam that took the lock would
+#     either kill the install or leave the lock held by a process that has
+#     already exited.
+if [ "$lock_before" = no ] && [ -e "$LOCK" ]; then
+  echo "FAIL: the seam claimed the single-instance lock at $LOCK"
+  exit 1
+fi
+if [ "$lock_before" = yes ]; then
+  echo "note: a lock already existed before this run; skipping the lock check"
+fi
+
+echo "PASS: seam exited promptly (code $code), wrote the LaunchAgent plist, and took no lock"

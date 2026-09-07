@@ -76,6 +76,42 @@ jobs:
         working-directory: src-tauri
         run: cargo deny check licenses
 
+  test-macos:
+    # The Linux job above never compiles `#[cfg(target_os = "macos")]` code, so
+    # until this job existed the macOS tests were written but never run. The
+    # single-instance lock and the launchd plist both live behind that gate.
+    name: Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Fetch osquery sidecar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: rake
+
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: cargo clippy (deny warnings)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Proves the .pkg postinstall's seam still exits without entering the
+      # event loop, and that it takes no single-instance lock.
+      - name: --install-agent seam
+        working-directory: src-tauri
+        run: bash scripts/test-install-agent-seam.sh
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
