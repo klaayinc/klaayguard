@@ -215,6 +215,11 @@ running with `KeepAlive`.
   one in the environment. It injects `VITE_API_BASE_URL` into the agent it
   starts, so reading that back would write whatever the file already held, and a
   wrong value could never correct itself.
+- A redirected agent also loses its credential. The keychain service name is
+  chosen by the API base, and a non-production URL gets a hashed suffix, so the
+  agent looks for its token under a name that holds nothing and finds none. A
+  redirect therefore stops collection at the first request, not only at the next
+  update check.
 
 ## One agent per machine
 

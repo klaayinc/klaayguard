@@ -2817,67 +2817,58 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Installs a launch agent for automatic startup on macOS.
+/// Whether this process may write the shared LaunchAgent.
 ///
-/// This function creates a launchd plist file in the user's LaunchAgents directory
-/// and loads it to ensure the app starts automatically on login. This is a mandatory
-/// security feature that cannot be disabled by users. When the app is not installed
-/// under /Applications (a dev binary, a launch from the mounted DMG) the plist is
-/// written inert (no RunAtLoad, no KeepAlive): a KeepAlive job pointing at a path
-/// that is gone at next login makes launchd respawn `open` every ThrottleInterval
-/// seconds, forever.
-/// Whether the process running from `current_exe` may write the LaunchAgent
-/// for the bundle at `app_path`.
+/// Two rules, and both must hold.
 ///
-/// Only the bundle the plist points at may describe it. The plist is one file
-/// with one label, shared by every build on the machine, and it names both the
-/// app to launch and the API base to inject. A build running from somewhere
-/// else — a developer binary, a copy on a mounted disk image, an old bundle in
-/// the Trash — would otherwise point launchd at the installed app while
-/// injecting its own server.
+/// The plist is one file with one label, shared by every build on the machine,
+/// and it names both the app to launch and the API base to inject. Whoever
+/// writes it decides both, so only a binary inside `installed_bundle` may. A
+/// developer binary, a copy on a mounted disk image, or an old bundle in the
+/// Trash would otherwise aim launchd at the installed app while handing it a
+/// different server.
+///
+/// `installed` must also hold. With no app in `/Applications` the plist has
+/// nothing to start, and any path it named would be gone by the next login.
+/// Without this the guard binds nothing in that state, because the caller then
+/// derives the app path from the running binary and every build matches itself.
 #[cfg(any(target_os = "macos", test))]
-fn may_write_launch_agent(current_exe: &std::path::Path, app_path: &std::path::Path) -> bool {
-    current_exe.starts_with(app_path)
-}
-
-/// The API base to write into the LaunchAgent.
-///
-/// Always the value this build was compiled with, never the one in the
-/// environment. The plist injects `VITE_API_BASE_URL` into the agent it starts,
-/// so an agent that read the runtime value would render back whatever the plist
-/// already held. A wrong value would then survive every restart and every
-/// update, because each run rewrites the same wrong value and the content check
-/// finds nothing to change.
-///
-/// `runtime_env` is taken and ignored on purpose: the signature records that
-/// the value exists and must not be used.
-#[cfg(any(target_os = "macos", test))]
-fn launch_agent_api_base<'a>(runtime_env: Option<&str>, compiled: &'a str) -> &'a str {
-    let _ = runtime_env;
-    compiled
+fn may_write_launch_agent(
+    current_exe: &std::path::Path,
+    installed_bundle: &std::path::Path,
+    installed: bool,
+) -> bool {
+    installed && current_exe.starts_with(installed_bundle)
 }
 
 /// Build the launchd plist. Pure, so every rule it encodes is testable without
 /// touching `~/Library/LaunchAgents` or running `launchctl`.
+///
+/// `RunAtLoad` and `KeepAlive` are always true: the file is written only for an
+/// app that is installed, so the job it describes always has something to run.
 #[cfg(any(target_os = "macos", test))]
-fn render_launch_agent_plist(
-    label: &str,
-    app_path: &str,
-    log_dir: &str,
-    api_base: &str,
-    installed: bool,
-) -> String {
-    let flag = if installed { "<true/>" } else { "<false/>" };
+fn render_launch_agent_plist(label: &str, app_path: &str, log_dir: &str, api_base: &str) -> String {
     include_str!("../resources/com.klaay.klaayguard.plist")
         .replace("__LABEL__", label)
         .replace("__OPEN_PATH__", "/usr/bin/open")
-        .replace("__RUN_AT_LOAD__", flag)
-        .replace("__KEEP_ALIVE__", flag)
+        .replace("__RUN_AT_LOAD__", "<true/>")
+        .replace("__KEEP_ALIVE__", "<true/>")
         .replace("__APP_PATH__", &xml_escape(app_path))
         .replace("__VITE_API_BASE_URL__", &xml_escape(api_base))
         .replace("__LOG_DIR__", &xml_escape(log_dir))
 }
 
+/// Installs a launch agent for automatic startup on macOS.
+///
+/// This function creates a launchd plist file in the user's LaunchAgents directory
+/// and loads it to ensure the app starts automatically on login. This is a mandatory
+/// security feature that cannot be disabled by users.
+///
+/// It writes nothing unless the running binary is the installed app under
+/// `/Applications` — see `may_write_launch_agent`. A KeepAlive job pointing at a
+/// path that is gone at next login makes launchd respawn every ThrottleInterval
+/// seconds, forever, and a foreign writer can redirect the installed agent to
+/// its own server.
 #[cfg(target_os = "macos")]
 async fn install_launch_agent() -> Result<String, String> {
     use std::fs;
@@ -2897,36 +2888,26 @@ async fn install_launch_agent() -> Result<String, String> {
     let app_bundle_path = std::path::Path::new("/Applications/KlaayGuard.app");
     let installed_exists = app_bundle_path.exists();
 
-    // Render plist
-    let app_path: String = if installed_exists {
-        "/Applications/KlaayGuard.app".to_string()
-    } else {
-        current_exe
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/Applications/KlaayGuard.app".to_string())
-    };
-    // Only the bundle the plist points at may describe it. A build running from
-    // anywhere else would aim launchd at the installed app while injecting its
-    // own server, and the installed app has no way to tell or to recover.
-    if !may_write_launch_agent(&current_exe, std::path::Path::new(&app_path)) {
+    if !may_write_launch_agent(&current_exe, app_bundle_path, installed_exists) {
         let msg = format!(
-            "not writing the LaunchAgent for {}: this build runs from {:?}",
-            app_path, current_exe
+            "not writing the LaunchAgent: this build runs from {:?}, and the installed app is {}",
+            current_exe,
+            if installed_exists {
+                "elsewhere"
+            } else {
+                "missing"
+            }
         );
         log::info!("{}", msg);
         return Ok(msg);
     }
+    let app_path = app_bundle_path.to_string_lossy().to_string();
 
     // The compiled server, never the injected one. The plist hands the agent
     // VITE_API_BASE_URL, so reading that back would write whatever the plist
-    // already held and a wrong value could never heal.
-    let api_base_for_plist = launch_agent_api_base(
-        std::env::var("VITE_API_BASE_URL").ok().as_deref(),
-        option_env!("APP_DEFAULT_API_BASE_URL").unwrap_or("https://api.klaay.com"),
-    );
+    // already held and a wrong value could never heal. `compiled_api_base_url`
+    // is the same value the single-instance lock keys on; they must not drift.
+    let api_base_for_plist = compiled_api_base_url();
 
     let log_dir = home_dir.join("Library/Logs/KlaayGuard");
     fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create log directory: {}", e))?;
@@ -2936,7 +2917,6 @@ async fn install_launch_agent() -> Result<String, String> {
         &app_path,
         &log_dir.to_string_lossy(),
         api_base_for_plist,
-        installed_exists,
     );
 
     let mut needs_reload = true;
@@ -5073,7 +5053,8 @@ mod happy_path_tests {
         // The installed app describing itself.
         assert!(may_write_launch_agent(
             Path::new("/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
-            installed
+            installed,
+            true
         ));
 
         // A developer build must not point launchd at the installed app and
@@ -5081,34 +5062,43 @@ mod happy_path_tests {
         // talking to a localhost port that nothing listens on.
         assert!(!may_write_launch_agent(
             Path::new("/Users/dev/src/klaayguard/src-tauri/target/debug/KlaayGuard"),
-            installed
+            installed,
+            true
         ));
 
         // A copy on a mounted disk image, or one in the Trash, is not the
         // installed app either.
         assert!(!may_write_launch_agent(
             Path::new("/Volumes/KlaayGuard/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
-            installed
+            installed,
+            true
         ));
         assert!(!may_write_launch_agent(
             Path::new("/Users/dev/.Trash/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
-            installed
+            installed,
+            true
         ));
     }
 
-    // The plist injects VITE_API_BASE_URL into the agent it starts. An agent
-    // that rendered the plist from that same variable would write back whatever
-    // it was handed, so one wrong value would never heal.
+    // With no app in /Applications the plist has nothing to start, and whatever
+    // path it named would be gone by the next login. PROD-4626 puts a Mac in
+    // exactly that state: the installer relocates the bundle into a developer
+    // checkout and leaves /Applications empty. Nobody writes the file then.
     #[test]
-    fn the_launch_agent_records_the_compiled_server_not_the_injected_one() {
-        assert_eq!(
-            launch_agent_api_base(Some("http://localhost:54524"), "https://api.klaay.com"),
-            "https://api.klaay.com"
-        );
-        assert_eq!(
-            launch_agent_api_base(None, "https://api.klaay.dev"),
-            "https://api.klaay.dev"
-        );
+    fn nobody_writes_the_launch_agent_when_no_app_is_installed() {
+        use std::path::Path;
+        let installed = Path::new("/Applications/KlaayGuard.app");
+
+        assert!(!may_write_launch_agent(
+            Path::new("/Users/dev/src/klaayguard/src-tauri/target/debug/KlaayGuard"),
+            installed,
+            false
+        ));
+        assert!(!may_write_launch_agent(
+            Path::new("/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
+            installed,
+            false
+        ));
     }
 
     #[test]
@@ -5118,41 +5108,28 @@ mod happy_path_tests {
             "/Applications/KlaayGuard.app",
             "/Users/dev/Library/Logs/KlaayGuard",
             "https://api.klaay.com",
-            true,
         );
         assert!(plist.contains("<string>com.klaay.klaayguard</string>"));
         assert!(plist.contains("<string>/Applications/KlaayGuard.app</string>"));
         assert!(plist.contains("<string>https://api.klaay.com</string>"));
         assert!(plist.contains("<key>KLAAYGUARD_LAUNCHD</key>"));
+        // The file is written only for an installed app, so the job always runs
+        // at login and stays up.
+        assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
         // Every placeholder is filled, or launchd rejects the file.
         assert!(!plist.contains("__"), "an unfilled placeholder remains");
-    }
-
-    // A bundle outside /Applications is gone by the next login, and a KeepAlive
-    // job pointing at a missing path makes launchd respawn forever.
-    #[test]
-    fn an_uninstalled_bundle_gets_an_inert_launch_agent() {
-        let live =
-            render_launch_agent_plist("l", "/Applications/KlaayGuard.app", "/log", "u", true);
-        let inert = render_launch_agent_plist("l", "/tmp/build/KlaayGuard.app", "/log", "u", false);
-
-        assert!(live.contains("<key>RunAtLoad</key>\n    <true/>"));
-        assert!(live.contains("<key>KeepAlive</key>\n    <true/>"));
-        assert!(inert.contains("<key>RunAtLoad</key>\n    <false/>"));
-        assert!(inert.contains("<key>KeepAlive</key>\n    <false/>"));
     }
 
     #[test]
     fn a_hostile_path_cannot_inject_launchd_keys() {
         let plist = render_launch_agent_plist(
             "com.klaay.klaayguard",
-            "/Applications/</string><key>RunAtLoad</key><true/><string>.app",
+            "/Applications/</string><key>ThrottleInterval</key><integer>0</integer><string>.app",
             "/log",
             "https://api.klaay.com",
-            false,
         );
-        // The injected key must not survive as markup.
-        assert!(!plist.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(!plist.contains("<key>ThrottleInterval</key>\n    <integer>0</integer>"));
         assert!(plist.contains("&lt;/string&gt;"));
     }
 

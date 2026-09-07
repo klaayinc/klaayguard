@@ -20,11 +20,27 @@ LOCK="$HOME/Library/Application Support/com.klaay.app/agent.lock"
 echo "==> Building debug binary"
 cargo build --bin KlaayGuard >/dev/null
 
-# Remove any pre-existing plist so its presence is attributable to this run,
-# and the one this run writes on exit: launchd would otherwise load it at the
-# next login.
-rm -f "$PLIST"
-trap 'rm -f "$PLIST"' EXIT
+# The debug binary is not the installed app, so the seam writes the plist only
+# on a machine with no app in /Applications. That is the CI runner. A developer
+# Mac with the app installed gets the opposite result, and this script must not
+# destroy the LaunchAgent that machine depends on.
+APP="/Applications/KlaayGuard.app"
+if [ -d "$APP" ]; then
+  expect_plist=no
+else
+  expect_plist=yes
+fi
+
+# Move any existing plist aside and put it back on exit, so its presence is
+# attributable to this run and the machine keeps what it had.
+SAVED="$(mktemp -d)/plist"
+if [ -f "$PLIST" ]; then
+  mv "$PLIST" "$SAVED"
+  restore_plist() { rm -f "$PLIST"; mv "$SAVED" "$PLIST"; }
+else
+  restore_plist() { rm -f "$PLIST"; }
+fi
+trap restore_plist EXIT
 
 # Portable 10s timeout (macOS has no GNU `timeout`): run in background, poll,
 # then kill if it's still alive. A killed process yields code 124.
@@ -56,8 +72,10 @@ set -e
 
 # Contract of the seam:
 #  1. it must NOT fall into the Tauri event loop (would be killed at 124), and
-#  2. it must render + write the LaunchAgent plist to disk (RunAtLoad loads it at
-#     next login even if the live `launchctl bootstrap` can't reach a GUI session).
+#  2. it must write the LaunchAgent plist only when this binary IS the installed
+#     app. With no app in /Applications the seam writes the file; with one
+#     installed, this debug build is a foreign writer and must refuse, or a
+#     developer build could redirect the installed agent to its own server.
 # The bootstrap/kickstart step is best-effort and only succeeds inside a GUI
 # session (the .pkg postinstall guarantees that via `launchctl asuser`); from a
 # headless shell it returns EIO, so we don't assert exit 0 here.
@@ -65,8 +83,12 @@ if [ "$code" -eq 124 ]; then
   echo "FAIL: binary did not exit within 10s (fell into the event loop)"
   exit 1
 fi
-if [ ! -f "$PLIST" ]; then
-  echo "FAIL: LaunchAgent plist was not written to $PLIST (exit code $code)"
+if [ "$expect_plist" = yes ] && [ ! -f "$PLIST" ]; then
+  echo "FAIL: no app in $APP, so the seam had to write $PLIST (exit code $code)"
+  exit 1
+fi
+if [ "$expect_plist" = no ] && [ -f "$PLIST" ]; then
+  echo "FAIL: $APP is installed, so this debug build had to refuse to write $PLIST"
   exit 1
 fi
 
@@ -82,4 +104,8 @@ if [ "$lock_before" = yes ]; then
   echo "note: a lock already existed before this run; skipping the lock check"
 fi
 
-echo "PASS: seam exited promptly (code $code), wrote the LaunchAgent plist, and took no lock"
+if [ "$expect_plist" = yes ]; then
+  echo "PASS: seam exited promptly (code $code), wrote the LaunchAgent plist, and took no lock"
+else
+  echo "PASS: seam exited promptly (code $code), refused to write a foreign LaunchAgent, and took no lock"
+fi
