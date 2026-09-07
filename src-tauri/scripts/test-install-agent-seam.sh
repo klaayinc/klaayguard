@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# Verifies the `--install-agent` CLI seam: the binary must register the launchd
-# LaunchAgent and EXIT PROMPTLY, without entering the Tauri event loop.
+# Verifies the `--install-agent` CLI seam on the debug binary. Two rules.
 #
+# It must EXIT PROMPTLY, without entering the Tauri event loop.
 # RED (before the seam exists): `--install-agent` is ignored, the app launches
-# the tray UI and never exits, so `timeout` kills it -> exit 124 -> FAIL. This is
-# an observable failure, not an infinite hang.
-# GREEN (after the seam): the binary exits 0 within a couple seconds and the
-# LaunchAgent plist is present.
+# the tray UI and never exits, so the timeout kills it -> exit 124 -> FAIL. That
+# is an observable failure, not an infinite hang.
+#
+# It must WRITE NOTHING. Only the app inside /Applications/KlaayGuard.app may
+# write the shared LaunchAgent, and `target/debug/KlaayGuard` never is — on a
+# runner because no app is installed, on a developer Mac because the installed
+# app is a different binary. Either way the seam refuses.
+#
+# So this script does not cover the successful write. That path belongs to the
+# installed app, and the rules it follows are unit tested:
+# `may_write_launch_agent` and `render_launch_agent_plist`.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -20,19 +27,9 @@ LOCK="$HOME/Library/Application Support/com.klaay.app/agent.lock"
 echo "==> Building debug binary"
 cargo build --bin KlaayGuard >/dev/null
 
-# The debug binary is not the installed app, so the seam writes the plist only
-# on a machine with no app in /Applications. That is the CI runner. A developer
-# Mac with the app installed gets the opposite result, and this script must not
-# destroy the LaunchAgent that machine depends on.
-APP="/Applications/KlaayGuard.app"
-if [ -d "$APP" ]; then
-  expect_plist=no
-else
-  expect_plist=yes
-fi
-
-# Move any existing plist aside and put it back on exit, so its presence is
-# attributable to this run and the machine keeps what it had.
+# Move any existing plist aside and put it back on exit, so a file found after
+# the run is attributable to it, and a developer Mac keeps the LaunchAgent it
+# depends on.
 SAVED="$(mktemp -d)/plist"
 if [ -f "$PLIST" ]; then
   mv "$PLIST" "$SAVED"
@@ -70,12 +67,6 @@ run_with_timeout 10 "$BIN" --install-agent
 code=$?
 set -e
 
-# Contract of the seam:
-#  1. it must NOT fall into the Tauri event loop (would be killed at 124), and
-#  2. it must write the LaunchAgent plist only when this binary IS the installed
-#     app. With no app in /Applications the seam writes the file; with one
-#     installed, this debug build is a foreign writer and must refuse, or a
-#     developer build could redirect the installed agent to its own server.
 # The bootstrap/kickstart step is best-effort and only succeeds inside a GUI
 # session (the .pkg postinstall guarantees that via `launchctl asuser`); from a
 # headless shell it returns EIO, so we don't assert exit 0 here.
@@ -83,12 +74,8 @@ if [ "$code" -eq 124 ]; then
   echo "FAIL: binary did not exit within 10s (fell into the event loop)"
   exit 1
 fi
-if [ "$expect_plist" = yes ] && [ ! -f "$PLIST" ]; then
-  echo "FAIL: no app in $APP, so the seam had to write $PLIST (exit code $code)"
-  exit 1
-fi
-if [ "$expect_plist" = no ] && [ -f "$PLIST" ]; then
-  echo "FAIL: $APP is installed, so this debug build had to refuse to write $PLIST"
+if [ -f "$PLIST" ]; then
+  echo "FAIL: the debug binary is not the installed app, so it had to leave $PLIST alone"
   exit 1
 fi
 
@@ -104,8 +91,4 @@ if [ "$lock_before" = yes ]; then
   echo "note: a lock already existed before this run; skipping the lock check"
 fi
 
-if [ "$expect_plist" = yes ]; then
-  echo "PASS: seam exited promptly (code $code), wrote the LaunchAgent plist, and took no lock"
-else
-  echo "PASS: seam exited promptly (code $code), refused to write a foreign LaunchAgent, and took no lock"
-fi
+echo "PASS: seam exited promptly (code $code), wrote no LaunchAgent, and took no lock"
