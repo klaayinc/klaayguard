@@ -31,7 +31,10 @@ for fn in stop_running_agent ensure_agent_running launch_agent main; do
   fi
 done
 
-workdir="$(mktemp -d)"
+# Guarded, because line 17 carries no `-e`. With `mktemp` failed and `workdir`
+# empty, `installed` resolves to the real /Applications binary and `cc`
+# overwrites it. The cleanup below then runs `pkill -f "^/"`: every process.
+workdir="$(mktemp -d)" || { echo "FAIL: mktemp -d failed; refusing to run with an empty workdir"; exit 1; }
 cleanup() {
   pkill -f "^$workdir/" 2>/dev/null || true
   rm -rf "$workdir"
@@ -76,12 +79,53 @@ if ! alive "$elsewhere_pid"; then
 fi
 kill "$elsewhere_pid" 2>/dev/null || true
 
+# The cap is on the clock. Each tick forks `sleep` and `pgrep`, so a count of
+# ticks overruns its stated seconds by two to three times. The Installer bar
+# sits for the whole of it.
+echo "==> stop_running_agent must force an agent that ignores SIGTERM, within its cap"
+printf '#include <signal.h>\n#include <unistd.h>\nint main(void){signal(SIGTERM,SIG_IGN);for(;;)pause();return 0;}\n' > "$workdir/stubborn.c"
+stubborn="$workdir/stubborn/KlaayGuard"
+mkdir -p "$(dirname "$stubborn")"
+cc -o "$stubborn" "$workdir/stubborn.c" || { echo "FAIL: could not build the stubborn agent"; exit 1; }
+"$stubborn" & stubborn_pid=$!
+disown "$stubborn_pid"   # no "Killed: 9" job notice; bash still reaps it
+sleep 0.5
+alive "$stubborn_pid" || { echo "FAIL: the stubborn agent did not start"; exit 1; }
+STOP_WAIT_SECONDS=2   # the real default is 5
+before=$SECONDS
+stop_running_agent "$(id -u)" "$stubborn"
+elapsed=$((SECONDS - before))
+sleep 0.2
+if alive "$stubborn_pid"; then
+  echo "FAIL: an agent that ignores SIGTERM still runs after the stop"
+  exit 1
+fi
+if [ "$elapsed" -gt 4 ]; then
+  echo "FAIL: a ${STOP_WAIT_SECONDS}s cap took ${elapsed}s; the cap counts ticks, not seconds"
+  exit 1
+fi
+
 # Stopping is half the job. Every launchd step in `main` is best-effort, so an
 # install whose bootstrap and kickstart both fail must not end quietly with no
 # agent: that is worse than the stale build this script replaces. Both arms are
 # asserted, because a launcher that reports success while starting nothing is
 # the failure that hides.
-AGENT_WAIT_TICKS=5   # 0.5s per wait; the real default is 10s
+AGENT_WAIT_SECONDS=2   # per wait; the real default is 10
+
+# The wait gives up on the clock too. `ensure_agent_running` waits twice, so a
+# tick count that overran would hold the Installer bar for about a minute on a
+# Mac where no agent returns.
+echo "==> wait_for_agent must give up on the clock, not on a tick count"
+before=$SECONDS
+if wait_for_agent "$(id -u)" "$installed"; then
+  echo "FAIL: wait_for_agent saw an agent, and none runs"
+  exit 1
+fi
+elapsed=$((SECONDS - before))
+if [ "$elapsed" -gt 3 ]; then
+  echo "FAIL: a ${AGENT_WAIT_SECONDS}s wait took ${elapsed}s; the cap counts ticks, not seconds"
+  exit 1
+fi
 
 echo "==> ensure_agent_running must report failure when nothing starts one"
 launch_agent() { :; }
@@ -150,8 +194,24 @@ case "$launch_line" in
     exit 1
     ;;
 esac
+# `-W` would wait for the app to exit, and hold the installer with it. The
+# no-hang argument rests on its absence; the plist carries it, this must not.
+case "$launch_line" in
+  *" -W"*)
+    echo "FAIL: the launch passes -W to open, which waits for the app to exit and hangs the installer"
+    exit 1
+    ;;
+esac
 grep -q 'head -c 400 "\$launch_err"' "$POSTINSTALL" \
   || { echo "FAIL: the captured stderr never reaches the log"; exit 1; }
+# A failed `mktemp` must not stop the launch. With `launch_err` empty the
+# redirect fails, bash never runs the command, and the log names a status the
+# launch never produced.
+mktemp_line=$(printf '%s\n' "$launcher" | grep '^[[:space:]]*launch_err=.*mktemp')
+case "$mktemp_line" in
+  *'||'*) ;;
+  *) echo "FAIL: launch_agent does not guard a failed mktemp; the redirect fails and the launch never runs"; exit 1 ;;
+esac
 
 # Order matters as much as the call. Stopping the agent after the kickstart
 # leaves the wrapper attached to the old process again.

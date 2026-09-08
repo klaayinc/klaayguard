@@ -16,8 +16,12 @@ BIN="$APP/Contents/MacOS/KlaayGuard"
 
 log() { /usr/bin/logger -t com.klaay.klaayguard.postinstall "$1"; echo "$1"; }
 
-# How long to wait for an agent to appear, in 0.1 s ticks. The test shortens it.
-AGENT_WAIT_TICKS="${AGENT_WAIT_TICKS:-100}"
+# How long to wait, in seconds, for the old agent to leave and for a new one to
+# appear. Both caps are on the clock, never on a tick count. Each tick forks
+# `sleep` and `pgrep`: 100 ticks of 0.1 s measured 18 to 27 s. The Installer
+# bar sits for the whole of it. The test shortens both.
+STOP_WAIT_SECONDS="${STOP_WAIT_SECONDS:-5}"
+AGENT_WAIT_SECONDS="${AGENT_WAIT_SECONDS:-10}"
 
 # Stop the agent this install replaces, so the new binary is the one that runs.
 #
@@ -41,7 +45,7 @@ AGENT_WAIT_TICKS="${AGENT_WAIT_TICKS:-100}"
 stop_running_agent() {
   local uid="$1"
   local exe="$2"
-  local waited
+  local started
 
   /usr/bin/pkill -u "$uid" -f "^$exe" 2>/dev/null || return 0
 
@@ -50,15 +54,14 @@ stop_running_agent() {
   # the lock for 1.6 s (single_instance.rs), and this waits longer, so the
   # handover does not depend on that retry. Insist with SIGKILL at the end: an
   # agent that will not leave must not keep the new build out.
-  waited=0
+  started=$SECONDS
   while /usr/bin/pgrep -u "$uid" -f "^$exe" >/dev/null 2>&1; do
-    if [ "$waited" -ge 50 ]; then
-      log "postinstall: the old agent ignored SIGTERM for 5s; forcing"
+    if [ $((SECONDS - started)) -ge "$STOP_WAIT_SECONDS" ]; then
+      log "postinstall: the old agent ignored SIGTERM for ${STOP_WAIT_SECONDS}s; forcing"
       /usr/bin/pkill -9 -u "$uid" -f "^$exe" 2>/dev/null || true
       break
     fi
     /bin/sleep 0.1
-    waited=$((waited + 1))
   done
   log "postinstall: stopped the agent this install replaces"
 }
@@ -67,11 +70,10 @@ stop_running_agent() {
 wait_for_agent() {
   local uid="$1"
   local exe="$2"
-  local waited=0
-  while [ "$waited" -lt "$AGENT_WAIT_TICKS" ]; do
+  local started=$SECONDS
+  while [ $((SECONDS - started)) -lt "$AGENT_WAIT_SECONDS" ]; do
     /usr/bin/pgrep -u "$uid" -f "^$exe" >/dev/null 2>&1 && return 0
     /bin/sleep 0.1
-    waited=$((waited + 1))
   done
   return 1
 }
@@ -96,14 +98,22 @@ wait_for_agent() {
 # returns at once, but a launcher that leaves a child holding the inherited
 # descriptors makes `$(...)` block on the read: the very hang `-g -j` avoids.
 launch_agent() {
-  local launch_err
-  launch_err="$(/usr/bin/mktemp -t klaayguard-open)"
+  local launch_err launch_status
+  # A failed `mktemp` must not stop the launch: with `launch_err` empty the
+  # redirect fails and bash never runs the command. Fall back to /dev/null and
+  # say so, or a reader takes a bare status line for an empty stderr.
+  launch_err="$(/usr/bin/mktemp -t klaayguard-open)" || {
+    log "postinstall: mktemp failed; the launch runs without keeping its stderr"
+    launch_err=/dev/null
+  }
   /bin/launchctl asuser "$1" /usr/bin/sudo -H -u "$2" /usr/bin/open -g -j -a "$3" 2>"$launch_err"
   launch_status=$?
   if [ "$launch_status" -ne 0 ]; then
     log "postinstall: the launch chain exited $launch_status: $(/usr/bin/head -c 400 "$launch_err" 2>/dev/null | /usr/bin/tr '\n' ' ')"
   fi
-  /bin/rm -f "$launch_err"
+  if [ "$launch_err" != /dev/null ]; then
+    /bin/rm -f "$launch_err"
+  fi
 }
 
 # Make sure the install leaves an agent running, and say so when it does not.
