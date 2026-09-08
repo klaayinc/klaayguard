@@ -38,6 +38,18 @@ agent_pids() {
   done
 }
 
+# Whether an agent runs this binary, waiting for one to appear. `runuser` forks,
+# so the replacement arrives a moment after the start returns.
+wait_for_agent() {
+  waited=0
+  while [ "$waited" -lt 50 ]; do
+    [ -n "$(agent_pids "$1")" ] && return 0
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
 # Restart every agent that runs the binary this package just replaced.
 #
 # The install writes the new file and leaves the old process on the old inode.
@@ -95,6 +107,15 @@ restart_running_agents() {
       PATH=/usr/local/bin:/usr/bin:/bin \
       "$@" "$bin" >/dev/null 2>&1 &
   done
+
+  # The start runs detached with its output discarded, so neither its exit code
+  # nor its error reaches this script. Without this check a PAM denial would
+  # kill the agent, start nothing, log a restart that never happened, and exit
+  # 0 — the one path that leaves the machine worse than it was found, because
+  # the old agent at least still reported.
+  wait_for_agent "$bin" && return 0
+  log "postinst: ERROR the agent did not come back; this machine reports nothing until the next login"
+  return 1
 }
 
 main() {

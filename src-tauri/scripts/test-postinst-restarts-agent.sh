@@ -177,6 +177,40 @@ if ! alive "$elsewhere_pid"; then
   exit 1
 fi
 
+# The start runs behind `setsid ... &` with its output discarded, so neither the
+# exit code nor the error reaches this script. A PAM denial would therefore kill
+# the agent, start nothing, log a restart that did not happen, and exit 0 — the
+# one path where this change leaves the machine worse than it found it.
+echo "==> a restart that fails must be reported, not logged as done"
+mkdir -p "$workdir/fakebin"
+printf '#!/bin/sh\nexit 1\n' > "$workdir/fakebin/runuser"
+chmod +x "$workdir/fakebin/runuser"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "klaayguard://sign-in" &
+sleep 0.6
+doomed_pid="$(agent_pids "$installed" | head -1)"
+[ -n "$doomed_pid" ] || { echo "FAIL: could not start the agent for the failure case"; exit 1; }
+
+failure_output=$(PATH="$workdir/fakebin:$PATH" restart_running_agents "$installed" 2>&1)
+failure_code=$?
+
+if [ "$failure_code" -eq 0 ]; then
+  echo "FAIL: the restart failed and restart_running_agents reported success"
+  echo "      output was: $failure_output"
+  exit 1
+fi
+case "$failure_output" in
+  *ERROR*) ;;
+  *)
+    echo "FAIL: nothing in the log says the agent never came back"
+    echo "      output was: $failure_output"
+    exit 1
+    ;;
+esac
+if [ -n "$(agent_pids "$installed")" ]; then
+  echo "FAIL: the failure case left an agent running; the test proved nothing"
+  exit 1
+fi
+
 echo "==> a removal must stop the agent it deletes"
 (
   # A fresh shell: the postremove defines its own agent_pids, and sourcing both
