@@ -267,6 +267,37 @@ esac
 pkill -f "^$installed" 2>/dev/null || true
 sleep 0.3
 
+# One user can hold two agents — two seats on one login. The check is per killed
+# pid, so a single replacement must not answer for both of them.
+echo "==> two agents for one user must not collapse into one answer"
+rm -f "$workdir/runuser.count"
+cat > "$workdir/fakebin/runuser" <<FAKE
+#!/bin/sh
+# Succeed once, then fail: one replacement arrives, the other never does.
+n=\$(cat "$workdir/runuser.count" 2>/dev/null || echo 0)
+n=\$((n + 1))
+echo "\$n" > "$workdir/runuser.count"
+[ "\$n" -ge 2 ] && exit 1
+exec "$REAL_RUNUSER" "\$@"
+FAKE
+chmod +x "$workdir/fakebin/runuser"
+
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" &
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" seat-two &
+sleep 0.8
+[ "$(agent_pids "$installed" | wc -l)" -eq 2 ] \
+  || { echo "FAIL: expected two agents for one user, got $(agent_pids "$installed" | wc -l)"; exit 1; }
+
+seats_output=$(PATH="$workdir/fakebin:$PATH" restart_running_agents "$installed" 2>&1)
+seats_code=$?
+if [ "$seats_code" -eq 0 ]; then
+  echo "FAIL: one of the user's two agents never came back and the install reported success"
+  echo "      output was: $seats_output"
+  exit 1
+fi
+pkill -f "^$installed" 2>/dev/null || true
+sleep 0.3
+
 # The failure case above leaves nothing at the installed path, so without a
 # fresh agent here `stop_running_agents` would run on an empty list and the
 # block would pass without doing anything.

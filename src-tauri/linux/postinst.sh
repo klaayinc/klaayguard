@@ -46,16 +46,28 @@ agent_pids() {
 # covers the process that survived SIGKILL: its old pid does not count as the
 # replacement.
 #
+# One replacement may answer for one killed agent, never for two. A user can
+# hold two seats, and without the claimed list a single new process would
+# satisfy both checks while one of the two never came back.
+#
 # `runuser` forks, so the new agent arrives a moment after the start returns.
+# Echoes the pid it claims, so the caller can add it to that list.
 wait_for_new_agent() {
   nbin="$1"
   nuser="$2"
   noldpid="$3"
+  nclaimed="$4"
   nwaited=0
   while [ "$nwaited" -lt 50 ]; do
     for npid in $(agent_pids "$nbin"); do
       [ "$npid" = "$noldpid" ] && continue
-      [ "$(stat -c %U "/proc/$npid" 2>/dev/null)" = "$nuser" ] && return 0
+      case " $nclaimed " in
+        *" $npid "*) continue ;;
+      esac
+      if [ "$(stat -c %U "/proc/$npid" 2>/dev/null)" = "$nuser" ]; then
+        echo "$npid"
+        return 0
+      fi
     done
     sleep 0.1
     nwaited=$((nwaited + 1))
@@ -148,11 +160,20 @@ restart_running_agents() {
   #
   # Check every session, not the machine. One user's restart can fail while
   # another's works, and a machine-wide question answers yes to that.
+  # Seed the claimed list with every pid killed here. A process that survives
+  # SIGKILL must not pass as somebody's replacement either.
   missing=0
+  claimed=""
+  for entry in $restarted; do
+    claimed="$claimed ${entry##*:}"
+  done
   for entry in $restarted; do
     ruser="${entry%%:*}"
     rpid="${entry##*:}"
-    wait_for_new_agent "$bin" "$ruser" "$rpid" && continue
+    if newpid=$(wait_for_new_agent "$bin" "$ruser" "$rpid" "$claimed"); then
+      claimed="$claimed $newpid"
+      continue
+    fi
     log "postinst: ERROR the agent for $ruser did not come back; that session reports nothing until the next login"
     missing=1
   done
