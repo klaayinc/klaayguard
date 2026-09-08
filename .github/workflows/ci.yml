@@ -226,6 +226,9 @@ jobs:
   bundle-windows:
     name: Bundle check (Windows NSIS)
     runs-on: windows-latest
+    # The check drives a real installer. A dialog nobody can answer would
+    # otherwise hold the runner for the six-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

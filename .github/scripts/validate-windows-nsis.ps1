@@ -32,9 +32,22 @@ else { Fail "klaayguard-osqueryi.exe is missing from the installer" }
 # /S is the same flag the self-updater uses, so this proves the update path.
 # No /R: the installer must leave an agent running without being asked, the
 # same guarantee the macOS postinstall and the Linux postinst carry.
-$proc = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
-if ($proc.ExitCode -eq 0) { Pass "silent install exits 0" }
-else { Fail "silent install exited $($proc.ExitCode)" }
+# Never wait on an installer without a deadline. A modal dialog nobody can
+# answer looks exactly like a slow runner, so an unbounded wait spends the whole
+# job timeout in silence. A bounded one names the problem and moves on.
+function Invoke-Installer([string]$Path, [string[]]$Arguments, [int]$TimeoutSeconds = 240) {
+    $p = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru
+    if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+        Fail "'$Path $($Arguments -join ' ')' did not finish in $TimeoutSeconds s; it is waiting for an answer nobody can give"
+        try { $p.Kill() } catch { }
+        return $null
+    }
+    return $p
+}
+
+$proc = Invoke-Installer $Installer @("/S")
+if ($proc -and $proc.ExitCode -eq 0) { Pass "silent install exits 0" }
+elseif ($proc) { Fail "silent install exited $($proc.ExitCode)" }
 
 # Wait for a process to appear, and return it. The installer starts the agent
 # through the shell, so it arrives a moment after the installer exits.
@@ -107,8 +120,11 @@ if ($installDir -and (Test-Path "$installDir\KlaayGuard.exe")) {
 # machine would keep reporting from the old build until the user logged out.
 if ($agent) {
     $oldPid = $agent[0].Id
-    $proc = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
-    if ($proc.ExitCode -ne 0) { Fail "the re-install exited $($proc.ExitCode)" }
+    # /S /UPDATE is what the self-updater runs, minus the /R that asks the
+    # template to restart the app. /UPDATE also skips the WebView2 bootstrapper,
+    # whose error path is a modal dialog with no one to answer it.
+    $proc = Invoke-Installer $Installer @("/S", "/UPDATE")
+    if ($proc -and $proc.ExitCode -ne 0) { Fail "the re-install exited $($proc.ExitCode)" }
 
     $deadline = (Get-Date).AddSeconds(60)
     do {
@@ -134,7 +150,7 @@ Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue | Stop-Process -Force
 # The NSIS uninstaller copies itself to a temp directory and returns at once,
 # so poll for the cleanup instead of trusting the exit code.
 if ($installDir -and (Test-Path "$installDir\uninstall.exe")) {
-    Start-Process -FilePath "$installDir\uninstall.exe" -ArgumentList "/S" -Wait
+    Invoke-Installer "$installDir\uninstall.exe" @("/S") | Out-Null
     $deadline = (Get-Date).AddSeconds(90)
     do {
         Start-Sleep -Seconds 2
