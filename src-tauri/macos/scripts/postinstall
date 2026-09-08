@@ -1,9 +1,10 @@
 #!/bin/bash
 # macOS .pkg postinstall — runs as root after KlaayGuard.app is placed in
-# /Applications. It registers the launchd LaunchAgent for the logged-in GUI user
-# by invoking the app's own `--install-agent` seam inside that user's GUI
-# session, so the security agent is running immediately after install instead of
-# waiting for the user to remember to launch it.
+# /Applications. It stops the agent this install replaces, then registers the
+# launchd LaunchAgent for the logged-in GUI user by invoking the app's own
+# `--install-agent` seam inside that user's GUI session, so the security agent
+# is running immediately after install instead of waiting for the user to
+# remember to launch it.
 #
 # This MUST always exit 0: a non-zero postinstall fails the whole installation.
 # Every failure path is best-effort because the app also self-installs the agent
@@ -15,44 +16,99 @@ BIN="$APP/Contents/MacOS/KlaayGuard"
 
 log() { /usr/bin/logger -t com.klaay.klaayguard.postinstall "$1"; echo "$1"; }
 
-if [ ! -x "$BIN" ]; then
-  log "postinstall: binary not found at $BIN; skipping agent setup"
+# Stop the agent this install replaces, so the new binary is the one that runs.
+#
+# `launchctl kickstart -k` cannot do this. The launchd job is `/usr/bin/open`,
+# and LaunchServices starts the app as a separate process with no parent link,
+# so the kill lands on the wrapper and the old binary keeps running. The
+# wrapper's replacement then finds that live instance and reactivates it instead
+# of launching the new bundle: the Mac reports posture from the old build until
+# the user logs out. The .dmg self-update path does not need this — there the
+# app exits itself (`update_relaunch` in lib.rs).
+#
+# The pattern anchors on the installed executable's path, never the process
+# name. A developer build runs from another path with its own single-instance
+# lock, and killing by name would take that too.
+stop_running_agent() {
+  local uid="$1"
+  local exe="$2"
+  local waited
+
+  /usr/bin/pkill -u "$uid" -f "^$exe" 2>/dev/null || return 0
+
+  # SIGTERM is sent; wait for the process to go so it releases the
+  # single-instance lock before the replacement claims it. The new agent retries
+  # the lock for 1.6 s (single_instance.rs), and this waits longer, so the
+  # handover does not depend on that retry. Insist with SIGKILL at the end: an
+  # agent that will not leave must not keep the new build out.
+  waited=0
+  while /usr/bin/pgrep -u "$uid" -f "^$exe" >/dev/null 2>&1; do
+    if [ "$waited" -ge 50 ]; then
+      log "postinstall: the old agent ignored SIGTERM for 5s; forcing"
+      /usr/bin/pkill -9 -u "$uid" -f "^$exe" 2>/dev/null || true
+      break
+    fi
+    /bin/sleep 0.1
+    waited=$((waited + 1))
+  done
+  log "postinstall: stopped the agent this install replaces"
+}
+
+main() {
+  if [ ! -x "$BIN" ]; then
+    log "postinstall: binary not found at $BIN; skipping agent setup"
+    exit 0
+  fi
+
+  # The human at the GUI, not the installer's root context.
+  CONSOLE_USER=$(/usr/bin/stat -f "%Su" /dev/console 2>/dev/null || true)
+  if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
+    # No GUI user (e.g. an MDM install at the login window). The plist's RunAtLoad
+    # and the app's first-launch self-install both cover this case.
+    log "postinstall: no console user; agent will register at next user launch"
+    exit 0
+  fi
+
+  CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)
+  if [ -z "$CONSOLE_UID" ]; then
+    log "postinstall: could not resolve uid for $CONSOLE_USER; skipping"
+    exit 0
+  fi
+
+  PLIST="/Users/$CONSOLE_USER/Library/LaunchAgents/com.klaay.klaayguard.plist"
+  log "postinstall: registering LaunchAgent for $CONSOLE_USER (uid $CONSOLE_UID)"
+
+  # Step 0 — stop the old agent first. Every step below starts the job again, and
+  # each one is a no-op for the new build while the old process still holds the
+  # bundle's LaunchServices registration.
+  stop_running_agent "$CONSOLE_UID" "$BIN"
+
+  # Step 1 — render + write the plist as the user. The seam also tries to bootstrap,
+  # but that inner bootstrap runs behind `sudo -u`, which drops the Aqua-session Mach
+  # bootstrap port and fails with EIO. We ignore that; step 2 does the bootstrap right.
+  # -H: macOS sudoers keeps the caller's HOME (env_keep), and the seam resolves
+  # the LaunchAgents path through HOME, so without it a root or admin HOME
+  # would send the plist to the wrong user.
+  /bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -H -u "$CONSOLE_USER" "$BIN" --install-agent \
+    || log "postinstall: install-agent seam did not finish cleanly; trying launchctl directly"
+
+  # Step 2 — enable, then bootstrap. `enable` is the critical step: if the label was
+  # ever left `disabled` in launchd's override DB, both bootstrap AND RunAtLoad-at-login
+  # are blocked until it's re-enabled. Enable must come before bootstrap.
+  /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl enable "gui/$CONSOLE_UID/com.klaay.klaayguard" 2>/dev/null || true
+  /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" 2>/dev/null \
+    || log "postinstall: live bootstrap deferred; enabled label will load at next login (RunAtLoad)"
+
+  # Step 3 — kickstart restarts the `open` wrapper. With the old app already
+  # stopped, its `open -a` has no live instance to reactivate, so it launches the
+  # bundle this install just wrote.
+  /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.klaay.klaayguard" 2>/dev/null || true
+
   exit 0
-fi
+}
 
-# The human at the GUI, not the installer's root context.
-CONSOLE_USER=$(/usr/bin/stat -f "%Su" /dev/console 2>/dev/null || true)
-if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
-  # No GUI user (e.g. an MDM install at the login window). The plist's RunAtLoad
-  # and the app's first-launch self-install both cover this case.
-  log "postinstall: no console user; agent will register at next user launch"
-  exit 0
-fi
-
-CONSOLE_UID=$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null || true)
-if [ -z "$CONSOLE_UID" ]; then
-  log "postinstall: could not resolve uid for $CONSOLE_USER; skipping"
-  exit 0
-fi
-
-PLIST="/Users/$CONSOLE_USER/Library/LaunchAgents/com.klaay.klaayguard.plist"
-log "postinstall: registering LaunchAgent for $CONSOLE_USER (uid $CONSOLE_UID)"
-
-# Step 1 — render + write the plist as the user. The seam also tries to bootstrap,
-# but that inner bootstrap runs behind `sudo -u`, which drops the Aqua-session Mach
-# bootstrap port and fails with EIO. We ignore that; step 2 does the bootstrap right.
-# -H: macOS sudoers keeps the caller's HOME (env_keep), and the seam resolves
-# the LaunchAgents path through HOME, so without it a root or admin HOME
-# would send the plist to the wrong user.
-/bin/launchctl asuser "$CONSOLE_UID" /usr/bin/sudo -H -u "$CONSOLE_USER" "$BIN" --install-agent \
-  || log "postinstall: install-agent seam did not finish cleanly; trying launchctl directly"
-
-# Step 2 — enable, then bootstrap. `enable` is the critical step: if the label was
-# ever left `disabled` in launchd's override DB, both bootstrap AND RunAtLoad-at-login
-# are blocked until it's re-enabled. Enable must come before bootstrap.
-/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl enable "gui/$CONSOLE_UID/com.klaay.klaayguard" 2>/dev/null || true
-/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" 2>/dev/null \
-  || log "postinstall: live bootstrap deferred; enabled label will load at next login (RunAtLoad)"
-/bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.klaay.klaayguard" 2>/dev/null || true
-
-exit 0
+# Run the install only when the installer executes this file. The test sources it
+# to exercise `stop_running_agent` on its own, and then $0 names the test.
+case "${0##*/}" in
+  postinstall) main ;;
+esac
