@@ -43,6 +43,9 @@ pub struct AppState {
     pub last_focus_at: RwLock<Option<Instant>>, // debounce for the sign-in nudge
     /// The device identity, resolved once per process (persisted by keychain).
     pub device_identity: RwLock<Option<String>>,
+    /// The signed-in person's name, or their email when the account carries no
+    /// name. `None` until the API names them, and again after a sign out.
+    pub user_label: RwLock<Option<String>>,
     /// Woken when a token is (re)acquired, so a collection runs at once.
     pub token_acquired: tokio::sync::Notify,
     /// Linux: whether the tray icon built, and whether a StatusNotifier host
@@ -1770,24 +1773,85 @@ fn http_client(overall: Option<Duration>) -> reqwest::Client {
     builder.build().expect("reqwest client")
 }
 
-/// Returns true only when the API positively rejects the token (401/403). Network
-/// errors, timeouts, or any other status return false ("not definitely invalid") so a
-/// transient blip never blocks a legitimate sign-in — the collection loop's own 401
-/// handling stays the backstop for a token that later turns out bad.
-async fn token_definitely_invalid(base: &str, token: &str) -> bool {
+/// What `GET /me` says about a token.
+enum Identity {
+    /// The API positively rejects it (401/403).
+    Rejected,
+    /// The API accepts it. The label names the holder, when the reply carries
+    /// a name or an email to name them by.
+    Accepted(Option<String>),
+    /// Nothing conclusive: a network error, a timeout, any other status. The
+    /// callers treat this as "not definitely invalid", so a transient blip never
+    /// blocks a legitimate sign-in — the collection loop's own 401 handling stays
+    /// the backstop for a token that later turns out bad.
+    Unknown,
+}
+
+/// Ask the API who holds this token. One request answers both questions the
+/// agent has: whether the token still works, and whose name to put in the tray.
+async fn fetch_identity(base: &str, token: &str) -> Identity {
     let client = http_client(Some(Duration::from_secs(10)));
-    match client
+    let response = match client
         .get(format!("{}/me", base))
         .bearer_auth(token)
         .send()
         .await
     {
-        Ok(resp) => matches!(
-            resp.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ),
-        Err(_) => false,
+        Ok(response) => response,
+        Err(_) => return Identity::Unknown,
+    };
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Identity::Rejected;
     }
+    if !response.status().is_success() {
+        return Identity::Unknown;
+    }
+    match response.json::<Value>().await {
+        Ok(body) => Identity::Accepted(identity_label(&body)),
+        Err(_) => Identity::Unknown,
+    }
+}
+
+/// The line the tray shows for the signed-in person, read from a `/me` reply:
+/// their name, or their email when the account carries no name. `None` when the
+/// reply carries neither, so the menu drops the line instead of showing a blank
+/// one.
+fn identity_label(me: &Value) -> Option<String> {
+    let attributes = me.pointer("/data/attributes")?;
+    let field = |key: &str| {
+        attributes
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let name = [field("first_name"), field("last_name")]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !name.is_empty() {
+        return Some(name);
+    }
+    field("email").map(str::to_string)
+}
+
+/// Name the holder of the token this process already has. The sign-in path
+/// learns the name from the check it already makes; a start with a stored token
+/// makes no such check, so it asks here.
+fn refresh_identity(state: &Arc<AppState>) {
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(token) = lock_read(&state.auth_token).clone() else {
+            return;
+        };
+        if let Identity::Accepted(label) = fetch_identity(&state.api_base_url, &token).await {
+            *lock_write(&state.user_label) = label;
+        }
+    });
 }
 
 /// Store a token the loopback exchange just returned, once the API accepts
@@ -1799,12 +1863,16 @@ fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
     let app = app.clone();
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
-        if token_definitely_invalid(&state.api_base_url, &tok).await {
+        let identity = fetch_identity(&state.api_base_url, &tok).await;
+        if matches!(identity, Identity::Rejected) {
             log::warn!("sign_in_token_rejected_by_api length={}", tok.len());
             add_breadcrumb("auth", "sign_in_token_rejected", Level::Warning);
             sentry::capture_message("sign_in_token_rejected", Level::Warning);
             let _ = app.emit("auth:status", json!({ "authenticated": false }));
             return;
+        }
+        if let Identity::Accepted(label) = identity {
+            *lock_write(&state.user_label) = label;
         }
         *lock_write(&state.auth_token) = Some(tok.clone());
         state.token_acquired.notify_one();
@@ -3425,6 +3493,11 @@ fn open_sign_in(app: &tauri::AppHandle) {
 /// Handles + assets for keeping the tray in sync with auth state.
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
+    /// The line naming the signed-in person, added at the top of the menu only
+    /// once the API has named them.
+    user: tauri::menu::MenuItem<tauri::Wry>,
+    /// Whether `user` is in the menu right now.
+    user_shown: std::sync::atomic::AtomicBool,
     /// The "Sign out" item, added to the menu only while signed in.
     sign_out: tauri::menu::MenuItem<tauri::Wry>,
     /// The tray menu itself, so "Sign out" can be added and removed at runtime.
@@ -3481,11 +3554,29 @@ fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
         ("Sign in".to_string(), true)
     };
     let signed_in = !enabled;
+    let user_label = lock_read(&state.user_label).clone();
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray.item.set_text(&text);
             let _ = tray.item.set_enabled(enabled);
+            // The name line sits above every other item, and joins the menu
+            // only once the API has named the person. Its text is set before
+            // it joins, so the line never shows up blank.
+            let show_user = user_label.is_some();
+            if let Some(label) = &user_label {
+                let _ = tray.user.set_text(label);
+            }
+            let was_shown = tray
+                .user_shown
+                .swap(show_user, std::sync::atomic::Ordering::Relaxed);
+            if was_shown != show_user {
+                let _ = if show_user {
+                    tray.menu.prepend(&tray.user)
+                } else {
+                    tray.menu.remove(&tray.user)
+                };
+            }
             // On an auth-state flip, swap the status dot and add or remove the
             // "Sign out" item. "Sign out" shows only while signed in, appended
             // last so it sits at the very bottom of the menu.
@@ -3522,6 +3613,8 @@ const SIGN_OUT_LABEL: &str = "Sign out";
 /// start WILL sign back in, so that is reported, not shrugged off.
 fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
     *lock_write(&state.auth_token) = None;
+    // Nobody is signed in, so the menu names nobody. refresh_tray drops the line.
+    *lock_write(&state.user_label) = None;
     match keychain::delete_token() {
         Ok(()) => log::info!("user signed out from the tray"),
         Err(e) => {
@@ -4483,6 +4576,7 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
     };
     if authed {
         log::info!("KlaayGuard started - authenticated, collecting in background");
+        refresh_identity(&state);
     } else {
         log::info!("KlaayGuard started - sign-in required");
     }
@@ -4659,6 +4753,7 @@ pub fn run() {
         last_attempt_at: RwLock::new(None),
         last_focus_at: RwLock::new(None),
         device_identity: RwLock::new(None),
+        user_label: RwLock::new(None),
         token_acquired: tokio::sync::Notify::new(),
         // Assume a usable tray until setup proves otherwise, so a nudge that
         // somehow runs first does not open a window on a healthy desktop.
@@ -4742,10 +4837,18 @@ pub fn run() {
             // Tray menu first, in a neutral state, so the icon is up before any
             // credential-store, D-Bus, or network work; the tray clock flips it
             // to the real state within a second. A live auth/countdown item, an
-            // Employee Hub link, and a version line. "Sign out" is appended
-            // below the version only while signed in (see refresh_tray), so it
-            // sits at the very bottom, away from the other clickable items. No
-            // quit.
+            // Employee Hub link, and a version line. The name line is prepended
+            // above them once the API names the person, and "Sign out" is
+            // appended below the version only while signed in (see
+            // refresh_tray), so it sits at the very bottom, away from the other
+            // clickable items. No quit.
+            let user_i = tauri::menu::MenuItem::with_id(
+                app,
+                "user",
+                "",
+                false,
+                None::<&str>,
+            )?;
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
@@ -4808,6 +4911,8 @@ pub fn run() {
                     .build(app)?;
                 app.manage(TrayMenu {
                     item: item.clone(),
+                    user: user_i.clone(),
+                    user_shown: std::sync::atomic::AtomicBool::new(false),
                     sign_out: sign_out_i.clone(),
                     menu: menu.clone(),
                     tray,
@@ -4896,6 +5001,72 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod identity_label_tests {
+    use super::*;
+
+    fn me(attributes: Value) -> Value {
+        json!({ "data": { "type": "me", "id": "1", "attributes": attributes } })
+    }
+
+    #[test]
+    fn names_the_person_by_first_and_last_name() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil",
+                "last_name": "Kampp",
+                "email": "rdk@klaay.com"
+            }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // A directory that carries only one of the two names still names the
+    // person. The email is the fallback, not the second choice.
+    #[test]
+    fn one_name_is_a_name() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil",
+                "last_name": null,
+                "email": "rdk@klaay.com"
+            }))),
+            Some("Emil".to_string())
+        );
+    }
+
+    // The columns are self-managed and reach the API as typed, so blank and
+    // padded values are what a real account gives.
+    #[test]
+    fn falls_back_to_the_email_when_no_name_is_given() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "  ",
+                "last_name": "",
+                "email": "rdk@klaay.com"
+            }))),
+            Some("rdk@klaay.com".to_string())
+        );
+    }
+
+    #[test]
+    fn trims_the_names_it_shows() {
+        assert_eq!(
+            identity_label(&me(
+                json!({ "first_name": " Emil ", "last_name": " Kampp " })
+            )),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // Nothing to show beats a blank line in the menu.
+    #[test]
+    fn names_nobody_when_the_reply_carries_neither() {
+        assert_eq!(identity_label(&me(json!({}))), None);
+        assert_eq!(identity_label(&json!({})), None);
+    }
 }
 
 #[cfg(test)]

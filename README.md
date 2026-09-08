@@ -56,9 +56,9 @@ Key properties:
 - **osquery is bundled.** It ships as a Tauri sidecar named
   `klaayguard-osqueryi`, so it never collides with a system osquery install.
   The agent needs no admin rights to run.
-- **Tray only.** The menu shows sign-in state (green/red dot), a countdown to
-  the next fetch, and an Employee Hub link. There is no Quit and no Sign-out
-  item, by design.
+- **Tray only.** The menu shows sign-in state (green/red dot), the signed-in
+  person, a countdown to the next fetch, and an Employee Hub link. "Sign out"
+  shows at the bottom while signed in. There is no Quit, by design.
 
 ## Download
 
