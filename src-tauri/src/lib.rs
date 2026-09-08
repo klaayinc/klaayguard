@@ -55,6 +55,33 @@ pub struct AppState {
     pub tray_watcher_present: std::sync::atomic::AtomicBool,
 }
 
+impl AppState {
+    /// Take up a session: the token, and the name of whoever holds it. The two
+    /// always move together. A token the API could not name carries no name, so
+    /// the last holder never sits above this one.
+    fn adopt_session(&self, token: String, label: Option<String>) {
+        *lock_write(&self.auth_token) = Some(token);
+        *lock_write(&self.user_label) = label;
+    }
+
+    /// Drop the session. Every path that stops using a token calls this, so the
+    /// tray never names a person the agent no longer reports for.
+    fn clear_session(&self) {
+        *lock_write(&self.auth_token) = None;
+        *lock_write(&self.user_label) = None;
+    }
+
+    /// Name the holder of `token`, but only while that token is still the live
+    /// one. A `/me` reply that lands after a sign out describes a session that
+    /// has ended, and must not name it.
+    fn name_holder_of(&self, token: Option<&str>, label: Option<String>) {
+        if lock_read(&self.auth_token).as_deref() != token {
+            return;
+        }
+        *lock_write(&self.user_label) = label;
+    }
+}
+
 /// Read an AppState lock. A poisoned lock cannot hold a half-updated value
 /// here (each section is one assignment or clone), so recover the guard
 /// instead of propagating another thread's panic.
@@ -1781,9 +1808,9 @@ enum Identity {
     /// a name or an email to name them by.
     Accepted(Option<String>),
     /// Nothing conclusive: a network error, a timeout, any other status. The
-    /// callers treat this as "not definitely invalid", so a transient blip never
-    /// blocks a legitimate sign-in — the collection loop's own 401 handling stays
-    /// the backstop for a token that later turns out bad.
+    /// callers read this as "not definitely invalid". A transient blip must
+    /// never block a legitimate sign-in. The collection loop's own 401 handling
+    /// stays the backstop for a token that later turns out bad.
     Unknown,
 }
 
@@ -1815,6 +1842,32 @@ async fn fetch_identity(base: &str, token: &str) -> Identity {
     }
 }
 
+/// How many characters of a name the tray shows. Nobody validates the length of
+/// a name: the person types it, and the API stores what they type. A menu item
+/// is one short line, so cut the rest.
+const LABEL_MAX_CHARS: usize = 48;
+
+/// One line of plain text, safe to hand a menu item. Control characters become
+/// spaces, so a newline cannot paint a second line that reads like another menu
+/// item. Runs of space collapse to one.
+fn one_line(value: &str) -> String {
+    value
+        .split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Cut a label to `LABEL_MAX_CHARS`, always on a character boundary, and mark
+/// the cut. `chars` counts code points, so a name of emoji never splits one.
+fn cap_label(label: String) -> String {
+    if label.chars().count() <= LABEL_MAX_CHARS {
+        return label;
+    }
+    let kept: String = label.chars().take(LABEL_MAX_CHARS - 1).collect();
+    format!("{kept}…")
+}
+
 /// The line the tray shows for the signed-in person, read from a `/me` reply:
 /// their name, or their email when the account carries no name. `None` when the
 /// reply carries neither, so the menu drops the line instead of showing a blank
@@ -1825,7 +1878,7 @@ fn identity_label(me: &Value) -> Option<String> {
         attributes
             .get(key)
             .and_then(|value| value.as_str())
-            .map(str::trim)
+            .map(one_line)
             .filter(|value| !value.is_empty())
     };
     let name = [field("first_name"), field("last_name")]
@@ -1834,9 +1887,9 @@ fn identity_label(me: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     if !name.is_empty() {
-        return Some(name);
+        return Some(cap_label(name));
     }
-    field("email").map(str::to_string)
+    field("email").map(cap_label)
 }
 
 /// Name the holder of the token this process already has. The sign-in path
@@ -1849,7 +1902,7 @@ fn refresh_identity(state: &Arc<AppState>) {
             return;
         };
         if let Identity::Accepted(label) = fetch_identity(&state.api_base_url, &token).await {
-            *lock_write(&state.user_label) = label;
+            state.name_holder_of(Some(&token), label);
         }
     });
 }
@@ -1871,10 +1924,14 @@ fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
             let _ = app.emit("auth:status", json!({ "authenticated": false }));
             return;
         }
-        if let Identity::Accepted(label) = identity {
-            *lock_write(&state.user_label) = label;
-        }
-        *lock_write(&state.auth_token) = Some(tok.clone());
+        // A `/me` blip names nobody. Adopt the token anyway; the collection
+        // loop's own 401 handling stays the backstop. Adopt it unnamed, so the
+        // previous holder's name never sits above this session.
+        let label = match identity {
+            Identity::Accepted(label) => label,
+            _ => None,
+        };
+        state.adopt_session(tok.clone(), label);
         state.token_acquired.notify_one();
 
         // The keyring is the primary store. Without a Secret Service daemon
@@ -1994,7 +2051,9 @@ fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) {
     // pops a second OS prompt on unsigned builds, and the stale token is harmless
     // (the next sign-in overwrites it, or shadows it through the file store, which
     // `keychain::load_token` reads first). Just clear it in memory and prompt re-login.
-    *lock_write(&state.auth_token) = None;
+    // The name goes with it: the dot turns red, so the tray must stop naming
+    // anybody.
+    state.clear_session();
     log::warn!("Authentication invalidated; notifying user to re-sign-in");
     notify_signin_needed(app, state);
     let _ = app.emit("auth:invalidated", ());
@@ -3612,9 +3671,8 @@ const SIGN_OUT_LABEL: &str = "Sign out";
 /// one, so the next start does not reuse it; if the store refuses, the next
 /// start WILL sign back in, so that is reported, not shrugged off.
 fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    *lock_write(&state.auth_token) = None;
     // Nobody is signed in, so the menu names nobody. refresh_tray drops the line.
-    *lock_write(&state.user_label) = None;
+    state.clear_session();
     match keychain::delete_token() {
         Ok(()) => log::info!("user signed out from the tray"),
         Err(e) => {
@@ -5037,8 +5095,8 @@ mod identity_label_tests {
         );
     }
 
-    // The columns are self-managed and reach the API as typed, so blank and
-    // padded values are what a real account gives.
+    // The API serves the account-scoped directory name and falls back to the
+    // self-managed column, so blank and padded values both reach this code.
     #[test]
     fn falls_back_to_the_email_when_no_name_is_given() {
         assert_eq!(
@@ -5066,6 +5124,131 @@ mod identity_label_tests {
     fn names_nobody_when_the_reply_carries_neither() {
         assert_eq!(identity_label(&me(json!({}))), None);
         assert_eq!(identity_label(&json!({})), None);
+    }
+
+    // Nobody validates the length of a name: the person types it, and the API
+    // stores what they type. A menu item cannot show a paragraph.
+    #[test]
+    fn caps_a_name_that_would_swamp_the_menu() {
+        let label = identity_label(&me(json!({ "first_name": "a".repeat(801) })))
+            .expect("a name that long still names somebody");
+        assert!(
+            label.chars().count() <= LABEL_MAX_CHARS,
+            "kept {} characters",
+            label.chars().count()
+        );
+        assert!(label.ends_with('…'));
+    }
+
+    // Cut on a character boundary, never inside one. A name of 801 emoji must
+    // not panic and must not split a code point.
+    #[test]
+    fn caps_a_long_name_without_splitting_a_character() {
+        let label =
+            identity_label(&me(json!({ "first_name": "😀".repeat(801) }))).expect("emoji name");
+        assert!(label.chars().count() <= LABEL_MAX_CHARS);
+        assert!(label.starts_with('😀'));
+    }
+
+    // A newline inside a name paints a second line in the tray that reads like
+    // another menu item. Flatten it.
+    #[test]
+    fn flattens_a_name_that_carries_a_newline() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\nSign out",
+                "last_name": "Kampp"
+            }))),
+            Some("Emil Sign out Kampp".to_string())
+        );
+    }
+
+    // Emoji, joined sequences and right-to-left text are not control
+    // characters. They reach the tray whole.
+    #[test]
+    fn passes_emoji_and_right_to_left_text_through() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "👨‍👩‍👧‍👦", "last_name": "أحمد" }))),
+            Some("👨‍👩‍👧‍👦 أحمد".to_string())
+        );
+    }
+}
+
+// The name and the token move together. A name that outlives the session that
+// earned it names the wrong person, and the tray has no way to know.
+#[cfg(test)]
+mod session_label_tests {
+    use super::*;
+
+    fn state() -> Arc<AppState> {
+        Arc::new(AppState {
+            auth_token: RwLock::new(None),
+            api_base_url: "http://127.0.0.1:0".to_string(),
+            last_attempt_at: RwLock::new(None),
+            last_focus_at: RwLock::new(None),
+            device_identity: RwLock::new(None),
+            user_label: RwLock::new(None),
+            token_acquired: tokio::sync::Notify::new(),
+            tray_built: std::sync::atomic::AtomicBool::new(true),
+            tray_watcher_present: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    #[test]
+    fn adopting_a_session_names_its_holder() {
+        let state = state();
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+        assert_eq!(*lock_read(&state.auth_token), Some("alice-token".into()));
+    }
+
+    // A 401 from the collection loop drops the token. The dot turns red, so the
+    // name must go too.
+    #[test]
+    fn clearing_a_session_drops_the_name_with_the_token() {
+        let state = state();
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        state.clear_session();
+        assert_eq!(*lock_read(&state.user_label), None);
+        assert_eq!(*lock_read(&state.auth_token), None);
+    }
+
+    // The hand-down case. Bob signs in on Alice's Mac and `/me` fails, so the
+    // API names nobody. The tray must not keep naming Alice.
+    #[test]
+    fn an_unnamed_session_never_inherits_the_last_name() {
+        let state = state();
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        state.adopt_session("bob-token".into(), None);
+        assert_eq!(*lock_read(&state.user_label), None);
+        assert_eq!(*lock_read(&state.auth_token), Some("bob-token".into()));
+    }
+
+    // A sign out during the `/me` round trip wins. The reply that lands after
+    // it describes a session that no longer exists.
+    #[test]
+    fn a_late_reply_never_names_a_session_that_ended() {
+        let state = state();
+        state.adopt_session("alice-token".into(), None);
+        let carried = lock_read(&state.auth_token).clone();
+        state.clear_session();
+        state.name_holder_of(carried.as_deref(), Some("Alice Andersen".into()));
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    #[test]
+    fn a_reply_for_the_live_session_names_it() {
+        let state = state();
+        state.adopt_session("alice-token".into(), None);
+        let carried = lock_read(&state.auth_token).clone();
+        state.name_holder_of(carried.as_deref(), Some("Alice Andersen".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
     }
 }
 
