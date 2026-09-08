@@ -24,9 +24,9 @@ test -f "$POSTINSTALL" || { echo "FAIL: $POSTINSTALL not found"; exit 1; }
 # Both seams must exist before sourcing: `stop_running_agent` is what this test
 # exercises, and `main` is what keeps the install body from running when the
 # file is sourced.
-for fn in stop_running_agent main; do
+for fn in stop_running_agent ensure_agent_running launch_agent main; do
   if ! grep -q "^${fn}()" "$POSTINSTALL"; then
-    echo "FAIL: $POSTINSTALL defines no ${fn}(); the installer cannot stop the old agent"
+    echo "FAIL: $POSTINSTALL defines no ${fn}(); the installer cannot stop and replace the old agent"
     exit 1
   fi
 done
@@ -76,6 +76,27 @@ if ! alive "$elsewhere_pid"; then
 fi
 kill "$elsewhere_pid" 2>/dev/null || true
 
+# Stopping is half the job. Every launchd step in `main` is best-effort, so an
+# install whose bootstrap and kickstart both fail must not end quietly with no
+# agent: that is worse than the stale build this script replaces. Both arms are
+# asserted, because a launcher that reports success while starting nothing is
+# the failure that hides.
+AGENT_WAIT_TICKS=5   # 0.5s per wait; the real default is 10s
+
+echo "==> ensure_agent_running must report failure when nothing starts one"
+launch_agent() { :; }
+if ensure_agent_running "$(id -u)" "$installed" "$workdir/KlaayGuard.app"; then
+  echo "FAIL: the installer reported success with no agent running"
+  exit 1
+fi
+
+echo "==> and must report success once a launcher starts one"
+launch_agent() { "$installed" & }
+if ! ensure_agent_running "$(id -u)" "$installed" "$workdir/KlaayGuard.app"; then
+  echo "FAIL: an agent runs, and the installer still reported failure"
+  exit 1
+fi
+
 # Order matters as much as the call. Stopping the agent after the kickstart
 # leaves the wrapper attached to the old process again.
 echo "==> main must stop the agent before it kickstarts the job"
@@ -91,4 +112,15 @@ if [ -n "$kick_line" ] && [ "$stop_line" -gt "$kick_line" ]; then
   exit 1
 fi
 
-echo "PASS: the installer stops the agent it replaces, spares other builds, and stops it before the kickstart"
+echo "==> and must check the agent came back, after the kickstart"
+ensure_line=$(grep -n "^[[:space:]]*ensure_agent_running " "$POSTINSTALL" | head -1 | cut -d: -f1)
+if [ -z "$ensure_line" ]; then
+  echo "FAIL: main never calls ensure_agent_running; a failed restart leaves the Mac unmonitored in silence"
+  exit 1
+fi
+if [ -n "$kick_line" ] && [ "$ensure_line" -lt "$kick_line" ]; then
+  echo "FAIL: ensure_agent_running (line $ensure_line) runs before kickstart (line $kick_line)"
+  exit 1
+fi
+
+echo "PASS: the installer stops the agent it replaces, spares other builds, and reports when none comes back"

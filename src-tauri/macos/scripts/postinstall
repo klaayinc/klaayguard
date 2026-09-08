@@ -16,6 +16,9 @@ BIN="$APP/Contents/MacOS/KlaayGuard"
 
 log() { /usr/bin/logger -t com.klaay.klaayguard.postinstall "$1"; echo "$1"; }
 
+# How long to wait for an agent to appear, in 0.1 s ticks. The test shortens it.
+AGENT_WAIT_TICKS="${AGENT_WAIT_TICKS:-100}"
+
 # Stop the agent this install replaces, so the new binary is the one that runs.
 #
 # `launchctl kickstart -k` cannot do this. The launchd job is `/usr/bin/open`,
@@ -29,6 +32,12 @@ log() { /usr/bin/logger -t com.klaay.klaayguard.postinstall "$1"; echo "$1"; }
 # The pattern anchors on the installed executable's path, never the process
 # name. A developer build runs from another path with its own single-instance
 # lock, and killing by name would take that too.
+#
+# The scope is the console user, and stays there on purpose. `single_instance.rs`
+# keeps one agent per login, not per Mac, so with fast user switching a second
+# logged-in account keeps its own agent on the old build until that account's
+# next login. Widening the stop would reach across accounts the installer's
+# console user does not own.
 stop_running_agent() {
   local uid="$1"
   local exe="$2"
@@ -52,6 +61,50 @@ stop_running_agent() {
     waited=$((waited + 1))
   done
   log "postinstall: stopped the agent this install replaces"
+}
+
+# Whether an agent runs for this login, waiting for one to appear.
+wait_for_agent() {
+  local uid="$1"
+  local exe="$2"
+  local waited=0
+  while [ "$waited" -lt "$AGENT_WAIT_TICKS" ]; do
+    /usr/bin/pgrep -u "$uid" -f "^$exe" >/dev/null 2>&1 && return 0
+    /bin/sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# The last-resort start, when launchd brought nothing back. A separate function
+# so the test can drive both outcomes.
+launch_agent() {
+  /bin/launchctl asuser "$1" /usr/bin/open -g -j -a "$2" 2>/dev/null || true
+}
+
+# Make sure the install leaves an agent running, and say so when it does not.
+#
+# The stop above is unconditional, and every launchd step below it is
+# best-effort: the seam, the bootstrap, and the kickstart all discard their
+# result. Without this check a Mac where all three fail ends the install with no
+# agent and no message — worse than the stale build the stop exists to replace,
+# because the machine reports nothing at all until the next login.
+#
+# Returns 1 when nothing runs. The caller still exits 0: a non-zero postinstall
+# fails the whole installation, and a failed restart must not undo a good one.
+ensure_agent_running() {
+  local uid="$1"
+  local exe="$2"
+  local app="$3"
+
+  wait_for_agent "$uid" "$exe" && return 0
+
+  log "postinstall: no agent after the kickstart; opening the app directly"
+  launch_agent "$uid" "$app"
+  wait_for_agent "$uid" "$exe" && return 0
+
+  log "postinstall: ERROR no agent runs after the install; this Mac reports nothing until the next login"
+  return 1
 }
 
 main() {
@@ -103,6 +156,11 @@ main() {
   # stopped, its `open -a` has no live instance to reactivate, so it launches the
   # bundle this install just wrote.
   /bin/launchctl asuser "$CONSOLE_UID" /bin/launchctl kickstart -k "gui/$CONSOLE_UID/com.klaay.klaayguard" 2>/dev/null || true
+
+  # Step 4 — confirm one came back. Every step above hides its own failure, so
+  # this is the only thing standing between a failed restart and a silent, blind
+  # Mac. It never fails the install; it starts the app itself and logs an error.
+  ensure_agent_running "$CONSOLE_UID" "$BIN" "$APP" || true
 
   exit 0
 }
