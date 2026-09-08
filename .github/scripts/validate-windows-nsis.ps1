@@ -30,10 +30,31 @@ else { Fail "klaayguard-osqueryi.exe is missing from the installer" }
 
 # --- 2. Silent install --------------------------------------------------------
 # /S is the same flag the self-updater uses, so this proves the update path.
-# No /R: the agent must not start on a headless runner.
+# No /R: the installer must leave an agent running without being asked, the
+# same guarantee the macOS postinstall and the Linux postinst carry.
 $proc = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
 if ($proc.ExitCode -eq 0) { Pass "silent install exits 0" }
 else { Fail "silent install exited $($proc.ExitCode)" }
+
+# Wait for a process to appear, and return it. The installer starts the agent
+# through the shell, so it arrives a moment after the installer exits.
+function Wait-ForAgent([int]$Seconds = 60) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    do {
+        $p = Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue
+        if ($p) { return $p }
+        Start-Sleep -Seconds 1
+    } until ((Get-Date) -gt $deadline)
+    return $null
+}
+
+# --- 2a. The install leaves an agent running ---------------------------------
+# A security agent that waits for the next logon leaves the machine unmonitored
+# until then. The installer stops the old process before it writes the files,
+# so it owes the machine a running replacement.
+$agent = Wait-ForAgent
+if ($agent) { Pass "an agent runs after the install (pid $($agent[0].Id))" }
+else { Fail "no KlaayGuard process after the install; the machine is unmonitored until the next logon" }
 
 # --- 3. Registry -------------------------------------------------------------
 # The Run value comes from our NSIS_HOOK_POSTINSTALL. Its absence means the
@@ -79,7 +100,37 @@ if ($installDir -and (Test-Path "$installDir\KlaayGuard.exe")) {
     Fail "cannot find the installed KlaayGuard.exe"
 }
 
+# --- 4a. A re-install replaces the running agent ------------------------------
+# The question this section answers: does installing the latest version over a
+# running agent take over from it? Windows cannot overwrite a running .exe, so
+# the installer stops the old process first. If it ever stopped doing that, the
+# machine would keep reporting from the old build until the user logged out.
+if ($agent) {
+    $oldPid = $agent[0].Id
+    $proc = Start-Process -FilePath $Installer -ArgumentList "/S" -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { Fail "the re-install exited $($proc.ExitCode)" }
+
+    $deadline = (Get-Date).AddSeconds(60)
+    do {
+        Start-Sleep -Seconds 1
+        $oldGone = -not (Get-Process -Id $oldPid -ErrorAction SilentlyContinue)
+    } until ($oldGone -or (Get-Date) -gt $deadline)
+
+    if ($oldGone) { Pass "the re-install stopped the old agent (pid $oldPid)" }
+    else { Fail "the old agent (pid $oldPid) survived the re-install; the new binary never runs" }
+
+    $fresh = Wait-ForAgent
+    if ($fresh -and ($fresh.Id -notcontains $oldPid)) { Pass "a new agent runs after the re-install (pid $($fresh[0].Id))" }
+    elseif (-not $fresh) { Fail "no agent runs after the re-install" }
+    else { Fail "the agent after the re-install is still the old process $oldPid" }
+} else {
+    Fail "no running agent to re-install over; the check above already failed"
+}
+
 # --- 5. Silent uninstall ------------------------------------------------------
+# Stop the agent first. The uninstaller does it too, but an explicit stop keeps
+# the file checks below about uninstall, not about a timing race.
+Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 # The NSIS uninstaller copies itself to a temp directory and returns at once,
 # so poll for the cleanup instead of trusting the exit code.
 if ($installDir -and (Test-Path "$installDir\uninstall.exe")) {
