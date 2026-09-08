@@ -116,6 +116,43 @@ case "$launcher" in
   *) echo "FAIL: launch_agent does not wrap in sudo -u; asuser alone starts the agent as root"; exit 1 ;;
 esac
 
+# The open question this launcher exists under is whether the bootstrap-port
+# failure that step 1 describes also reaches `open`. The EIO text answers that;
+# the exit status does not, and the status cannot even say which of launchctl,
+# sudo or open produced it. Keep the diagnostic.
+#
+# The stderr must go to a file rather than through a pipe: `open -g -j` returns
+# at once, but a launcher that leaves a child holding the inherited descriptors
+# makes a command substitution block, which is the hang `-g -j` exists to avoid.
+echo "==> launch_agent must keep the diagnostic, not only the number"
+# The launch line itself, not the whole body: a `2>/dev/null` on a later
+# housekeeping command is fine, one on the launch throws the evidence away.
+launch_line=$(printf '%s\n' "$launcher" | grep '/usr/bin/open')
+case "$launch_line" in
+  *"2>/dev/null"*)
+    echo "FAIL: the launch sends stderr to /dev/null; the EIO text is the evidence and the number is not"
+    exit 1
+    ;;
+esac
+case "$launch_line" in
+  *'2>"$launch_err"'*) ;;
+  *) echo "FAIL: the launch does not capture stderr to a file: [$launch_line]"; exit 1 ;;
+esac
+case "$launcher" in
+  *'launch_status=$?'*) ;;
+  *) echo "FAIL: launch_agent does not capture the exit status"; exit 1 ;;
+esac
+# A command substitution around the launch would block on the inherited
+# descriptors, which is the hang `-g -j` exists to avoid.
+case "$launch_line" in
+  *'$('*)
+    echo "FAIL: the launch runs inside a command substitution, which can block on a child holding the descriptors"
+    exit 1
+    ;;
+esac
+grep -q 'head -c 400 "\$launch_err"' "$POSTINSTALL" \
+  || { echo "FAIL: the captured stderr never reaches the log"; exit 1; }
+
 # Order matters as much as the call. Stopping the agent after the kickstart
 # leaves the wrapper attached to the old process again.
 echo "==> main must stop the agent before it kickstarts the job"
