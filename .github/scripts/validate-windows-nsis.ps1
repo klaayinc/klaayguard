@@ -66,8 +66,15 @@ function Wait-ForAgent([int]$Seconds = 60) {
 # until then. The installer stops the old process before it writes the files,
 # so it owes the machine a running replacement.
 $agent = Wait-ForAgent
-if ($agent) { Pass "an agent runs after the install (pid $($agent[0].Id))" }
-else { Fail "no KlaayGuard process after the install; the machine is unmonitored until the next logon" }
+if (-not $agent) {
+    Fail "no KlaayGuard process after the install; the machine is unmonitored until the next logon"
+} elseif (@($agent).Count -ne 1) {
+    # Two agents is PROD-4603: two tray icons, the device double-reporting every
+    # 15 minutes. The mutex absorbs a double start only for a production build.
+    Fail "$(@($agent).Count) KlaayGuard processes run after the install; exactly one must"
+} else {
+    Pass "exactly one agent runs after the install (pid $($agent[0].Id))"
+}
 
 # --- 3. Registry -------------------------------------------------------------
 # The Run value comes from our NSIS_HOOK_POSTINSTALL. Its absence means the
@@ -136,9 +143,10 @@ if ($agent) {
     else { Fail "the old agent (pid $oldPid) survived the re-install; the new binary never runs" }
 
     $fresh = Wait-ForAgent
-    if ($fresh -and ($fresh.Id -notcontains $oldPid)) { Pass "a new agent runs after the re-install (pid $($fresh[0].Id))" }
-    elseif (-not $fresh) { Fail "no agent runs after the re-install" }
-    else { Fail "the agent after the re-install is still the old process $oldPid" }
+    if (-not $fresh) { Fail "no agent runs after the re-install" }
+    elseif ($fresh.Id -contains $oldPid) { Fail "the agent after the re-install is still the old process $oldPid" }
+    elseif (@($fresh).Count -ne 1) { Fail "$(@($fresh).Count) agents run after the re-install; exactly one must" }
+    else { Pass "exactly one new agent runs after the re-install (pid $($fresh[0].Id))" }
 } else {
     Fail "no running agent to re-install over; the check above already failed"
 }
