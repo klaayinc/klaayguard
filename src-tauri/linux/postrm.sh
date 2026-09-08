@@ -34,7 +34,13 @@ agent_pids() {
 stop_running_agents() {
   bin="$1"
   pids=$(agent_pids "$bin")
-  [ -n "$pids" ] || return 0
+  if [ -z "$pids" ]; then
+    # "Nothing was running" and "I cannot see it" arrive here the same way:
+    # root without CAP_SYS_PTRACE reads an empty exe link for another user's
+    # process. Say which line ran, so the silence is not the answer.
+    log "postrm: no agent runs $bin; nothing to stop"
+    return 0
+  fi
 
   for pid in $pids; do
     kill "$pid" 2>/dev/null || true
@@ -52,6 +58,14 @@ stop_running_agents() {
     sleep 0.1
     waited=$((waited + 1))
   done
+
+  # Report what happened, not what was attempted. The loop above breaks after
+  # the force-kill without re-reading, so the old success line printed even when
+  # the agent was still there.
+  if [ -n "$(agent_pids "$bin")" ]; then
+    log "postrm: ERROR an agent still runs the deleted $bin"
+    return 1
+  fi
   log "postrm: stopped the agent this removal deleted"
 }
 

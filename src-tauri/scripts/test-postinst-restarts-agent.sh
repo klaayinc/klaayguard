@@ -61,9 +61,12 @@ for f in "$POSTINST" "$POSTRM"; do
 done
 
 workdir="$(mktemp -d)"
+created_user=no
 cleanup() {
   pkill -f "$workdir" 2>/dev/null || true
-  userdel -r "$TEST_USER" 2>/dev/null || true
+  # Only an account this run created. A developer whose machine already has one
+  # by this name must not lose it, and its home directory, to a test.
+  [ "$created_user" = yes ] && userdel -r "$TEST_USER" 2>/dev/null
   rm -rf "$workdir"
 }
 trap cleanup EXIT
@@ -71,8 +74,11 @@ trap cleanup EXIT
 # The agent runs as a person, not as root. `runuser` only switches user when it
 # has one to switch to, so a root-only test never exercises the PAM path that
 # production depends on.
-id "$TEST_USER" >/dev/null 2>&1 || useradd -m -s /bin/sh "$TEST_USER" \
-  || { echo "FAIL: could not create the unprivileged test user"; exit 1; }
+if ! id "$TEST_USER" >/dev/null 2>&1; then
+  useradd -m -s /bin/sh "$TEST_USER" \
+    || { echo "FAIL: could not create the unprivileged test user"; exit 1; }
+  created_user=yes
+fi
 chmod 755 "$workdir"
 
 # A real ELF binary, not a shell script: the rule under test reads
@@ -228,9 +234,49 @@ if ! alive "$elsewhere_pid"; then
   exit 1
 fi
 
-echo "==> an upgrade must not take the removal path"
-grep -q 'remove | purge | 0' "$POSTRM" \
-  || { echo "FAIL: postrm does not limit the stop to a real removal"; exit 1; }
+# Source text would pass even if the case were rewritten to include `upgrade`.
+# Drive `main` with each argument the package managers really pass, against a
+# live agent, and read what survives.
+echo "==> only a real removal may take the removal path"
+survives_main() { # script-lib, arg..., -> "STOPPED" or "SURVIVES"
+  local lib="$1"; shift
+  runuser -u "$TEST_USER" -- "$installed" "klaayguard://sign-in" &
+  sleep 0.5
+  [ -n "$(agent_pids "$installed")" ] || { echo "COULD-NOT-START"; return; }
+  # Point the sourced copy at the stand-in. The assignment lands in this
+  # subshell only, and `main` reads AGENT_BIN when it is called.
+  ( . "$lib"; AGENT_BIN="$installed"; set +e; main "$@" ) >/dev/null 2>&1
+  if [ -n "$(agent_pids "$installed")" ]; then echo "SURVIVES"; else echo "STOPPED"; fi
+  pkill -f "^$installed" 2>/dev/null || true
+  sleep 0.2
+}
+
+for case_row in "remove:STOPPED" "purge:STOPPED" "0:STOPPED" \
+                "upgrade 1.2.3:SURVIVES" "failed-upgrade 1.2.3:SURVIVES" \
+                "abort-upgrade 1.2.3:SURVIVES" "1:SURVIVES" ":SURVIVES"; do
+  args="${case_row%:*}"
+  want="${case_row##*:}"
+  # shellcheck disable=SC2086
+  got=$(survives_main "$workdir/postrm.lib" $args)
+  if [ "$got" != "$want" ]; then
+    echo "FAIL: postrm main '$args' gave $got, expected $want"
+    exit 1
+  fi
+done
+
+# The install side has the mirror rule: dpkg calls it to undo a failed
+# operation, and there the binary on disk never changed.
+echo "==> and only a real configure may restart the agent"
+runuser -u "$TEST_USER" -- "$installed" "klaayguard://sign-in" &
+sleep 0.5
+abort_pid="$(agent_pids "$installed" | head -1)"
+[ -n "$abort_pid" ] || { echo "FAIL: could not start the agent for the abort case"; exit 1; }
+( . "$workdir/postinst.lib"; AGENT_BIN="$installed"; set +e; main abort-upgrade 1.2.3 ) >/dev/null 2>&1
+if [ "$(agent_pids "$installed" | head -1)" != "$abort_pid" ]; then
+  echo "FAIL: postinst restarted a healthy agent on abort-upgrade"
+  exit 1
+fi
+pkill -f "^$installed" 2>/dev/null || true
 
 echo "==> the desktop database refresh must survive in both scripts"
 for f in "$POSTINST" "$POSTRM"; do

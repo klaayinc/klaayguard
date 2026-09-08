@@ -70,8 +70,15 @@ restart_running_agents() {
   bin="$1"
   command -v runuser >/dev/null 2>&1 || { log "postinst: no runuser; leaving the running agent alone"; return 0; }
 
+  # Say so. "No agent was running" and "I cannot see the agent" reach this line
+  # the same way: root without CAP_SYS_PTRACE reads an empty exe link for
+  # another user's process. dpkg's root has that capability, so the silence was
+  # the defect rather than the blindness.
   pids=$(agent_pids "$bin")
-  [ -n "$pids" ] || return 0
+  if [ -z "$pids" ]; then
+    log "postinst: no agent runs $bin; nothing to restart"
+    return 0
+  fi
 
   for pid in $pids; do
     user=$(stat -c %U "/proc/$pid" 2>/dev/null || true)
@@ -93,6 +100,16 @@ restart_running_agents() {
       if [ "$waited" -ge 50 ]; then
         log "postinst: agent $pid ignored SIGTERM for 5s; forcing"
         kill -9 "$pid" 2>/dev/null || true
+        # Wait for the kill to land. Starting the replacement while the old
+        # process still holds the plugin's bus name makes the *new* agent the
+        # one that exits, leaving the deleted-inode build in charge.
+        forced=0
+        while kill -0 "$pid" 2>/dev/null && [ "$forced" -lt 20 ]; do
+          sleep 0.1
+          forced=$((forced + 1))
+        done
+        kill -0 "$pid" 2>/dev/null &&
+          log "postinst: ERROR agent $pid survived SIGKILL; the replacement may lose the single-instance name"
         break
       fi
       sleep 0.1
@@ -124,7 +141,18 @@ main() {
   update-desktop-database -q /usr/share/applications || true
   gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
 
-  restart_running_agents "$AGENT_BIN" || true
+  # Only where the binary changed. dpkg also calls this script to undo a failed
+  # operation (`abort-remove`, `abort-upgrade`) and to answer a trigger, and on
+  # those the file on disk is the one the running agent already started from.
+  # Restarting there interrupts a healthy agent for nothing.
+  case "${1:-configure}" in
+    configure | 1 | 2)
+      restart_running_agents "$AGENT_BIN" || true
+      ;;
+    *)
+      log "postinst: called as '${1:-}'; the binary did not change, so the agent keeps running"
+      ;;
+  esac
 }
 
 # The shipped script carries no way to switch this off. The test sources a copy
