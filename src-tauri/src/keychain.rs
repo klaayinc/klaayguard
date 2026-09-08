@@ -31,8 +31,9 @@ fn keychain_service_for(api_base_url: &str) -> String {
 }
 
 /// `None` for production, so its names stay byte-identical to what already
-/// exists on disk and in the keychain.
-fn target_suffix(api_base_url: &str) -> Option<String> {
+/// exists on disk and in the keychain. The single-instance lock reuses this so
+/// one rule decides which builds share state and which stand apart.
+pub(crate) fn target_suffix(api_base_url: &str) -> Option<String> {
     let normalised = api_base_url.trim_end_matches('/');
     if normalised == PRODUCTION_API_BASE {
         return None;
@@ -48,6 +49,11 @@ fn api_base() -> String {
 /// Whether this build talks to production. Callers outside this module use it
 /// to keep production behaviour identical while letting a development build
 /// stand apart - see the single-instance registration in `lib.rs`.
+///
+/// macOS no longer needs it: it claims a lock file named by `target_suffix`
+/// instead of registering the plugin, so the same rule reaches it by a
+/// different road.
+#[cfg(any(not(target_os = "macos"), test))]
 pub(crate) fn is_production_target(api_base_url: &str) -> bool {
     target_suffix(api_base_url).is_none()
 }

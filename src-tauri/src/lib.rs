@@ -15,6 +15,10 @@
 
 mod keychain;
 mod sign_in;
+// macOS claims its single-instance lock here. `test` is in the gate so the
+// Linux CI runner, which is the only one that runs `cargo test`, exercises it.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+mod single_instance;
 use sentry::{self, Level};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2804,7 +2808,7 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
 /// Minimal XML text/attribute escaping for values interpolated into the plist
 /// template. Keeps a stray `&`/`<`/`>` (or an injected `</string>…`) in a path or URL
 /// from corrupting — or injecting keys into — the generated launchd plist.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -2813,15 +2817,73 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Whether this process may write the shared LaunchAgent.
+///
+/// Two rules, and both must hold.
+///
+/// The plist is one file with one label, shared by every build on the machine,
+/// and it names both the app to launch and the API base to inject. Whoever
+/// writes it decides both, so only a binary inside `installed_bundle` may. A
+/// developer binary, a copy on a mounted disk image, or an old bundle in the
+/// Trash would otherwise aim launchd at the installed app while handing it a
+/// different server.
+///
+/// `installed` must also hold. With no app in `/Applications` the plist has
+/// nothing to start, and any path it named would be gone by the next login.
+/// Without this the guard binds nothing in that state, because the caller then
+/// derives the app path from the running binary and every build matches itself.
+#[cfg(any(target_os = "macos", test))]
+fn may_write_launch_agent(
+    current_exe: &std::path::Path,
+    installed_bundle: &std::path::Path,
+    installed: bool,
+) -> bool {
+    installed && current_exe.starts_with(installed_bundle)
+}
+
+/// The API base to write into the LaunchAgent.
+///
+/// Always the compiled value. The plist hands the agent `VITE_API_BASE_URL`, so
+/// an agent that resolved this through `get_api_base_url` would write back
+/// whatever the plist already held: one wrong value would survive every restart
+/// and every update, because each run rewrites it and the content check finds
+/// nothing to change.
+///
+/// This exists as its own function so a test can set that variable and prove the
+/// choice ignores it. Inlining the call made the rule untestable.
+#[cfg(any(target_os = "macos", test))]
+fn plist_api_base() -> String {
+    compiled_api_base_url().to_string()
+}
+
+/// Build the launchd plist. Pure, so every rule it encodes is testable without
+/// touching `~/Library/LaunchAgents` or running `launchctl`.
+///
+/// `RunAtLoad` and `KeepAlive` are always true: the file is written only for an
+/// app that is installed, so the job it describes always has something to run.
+#[cfg(any(target_os = "macos", test))]
+fn render_launch_agent_plist(label: &str, app_path: &str, log_dir: &str, api_base: &str) -> String {
+    include_str!("../resources/com.klaay.klaayguard.plist")
+        .replace("__LABEL__", label)
+        .replace("__OPEN_PATH__", "/usr/bin/open")
+        .replace("__RUN_AT_LOAD__", "<true/>")
+        .replace("__KEEP_ALIVE__", "<true/>")
+        .replace("__APP_PATH__", &xml_escape(app_path))
+        .replace("__VITE_API_BASE_URL__", &xml_escape(api_base))
+        .replace("__LOG_DIR__", &xml_escape(log_dir))
+}
+
 /// Installs a launch agent for automatic startup on macOS.
 ///
 /// This function creates a launchd plist file in the user's LaunchAgents directory
 /// and loads it to ensure the app starts automatically on login. This is a mandatory
-/// security feature that cannot be disabled by users. When the app is not installed
-/// under /Applications (a dev binary, a launch from the mounted DMG) the plist is
-/// written inert (no RunAtLoad, no KeepAlive): a KeepAlive job pointing at a path
-/// that is gone at next login makes launchd respawn `open` every ThrottleInterval
-/// seconds, forever.
+/// security feature that cannot be disabled by users.
+///
+/// It writes nothing unless the running binary is the installed app under
+/// `/Applications` — see `may_write_launch_agent`. A KeepAlive job pointing at a
+/// path that is gone at next login makes launchd respawn every ThrottleInterval
+/// seconds, forever, and a foreign writer can redirect the installed agent to
+/// its own server.
 #[cfg(target_os = "macos")]
 async fn install_launch_agent() -> Result<String, String> {
     use std::fs;
@@ -2841,45 +2903,34 @@ async fn install_launch_agent() -> Result<String, String> {
     let app_bundle_path = std::path::Path::new("/Applications/KlaayGuard.app");
     let installed_exists = app_bundle_path.exists();
 
-    // Render plist
-    let app_path: String = if installed_exists {
-        "/Applications/KlaayGuard.app".to_string()
-    } else {
-        current_exe
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/Applications/KlaayGuard.app".to_string())
-    };
-    // Determine API base for env injection in LaunchAgent
-    let api_base_for_plist = get_api_base_url();
+    if !may_write_launch_agent(&current_exe, app_bundle_path, installed_exists) {
+        let msg = format!(
+            "not writing the LaunchAgent: this build runs from {:?}, and the installed app is {}",
+            current_exe,
+            if installed_exists {
+                "elsewhere"
+            } else {
+                "missing"
+            }
+        );
+        log::info!("{}", msg);
+        return Ok(msg);
+    }
+    let app_path = app_bundle_path.to_string_lossy().to_string();
+
+    // The compiled server, never the injected one — see `plist_api_base`. It is
+    // the same value the single-instance lock keys on; they must not drift.
+    let api_base_for_plist = plist_api_base();
 
     let log_dir = home_dir.join("Library/Logs/KlaayGuard");
     fs::create_dir_all(&log_dir).map_err(|e| format!("Failed to create log directory: {}", e))?;
 
-    let plist_content = include_str!("../resources/com.klaay.klaayguard.plist")
-        .replace("__LABEL__", label)
-        .replace("__OPEN_PATH__", "/usr/bin/open")
-        .replace(
-            "__RUN_AT_LOAD__",
-            if installed_exists {
-                "<true/>"
-            } else {
-                "<false/>"
-            },
-        )
-        .replace(
-            "__KEEP_ALIVE__",
-            if installed_exists {
-                "<true/>"
-            } else {
-                "<false/>"
-            },
-        )
-        .replace("__APP_PATH__", &xml_escape(&app_path))
-        .replace("__VITE_API_BASE_URL__", &xml_escape(&api_base_for_plist))
-        .replace("__LOG_DIR__", &xml_escape(&log_dir.to_string_lossy()));
+    let plist_content = render_launch_agent_plist(
+        label,
+        &app_path,
+        &log_dir.to_string_lossy(),
+        &api_base_for_plist,
+    );
 
     let mut needs_reload = true;
     if let Ok(existing) = fs::read_to_string(&plist_path) {
@@ -2898,39 +2949,36 @@ async fn install_launch_agent() -> Result<String, String> {
     fs::write(&plist_path, plist_content)
         .map_err(|e| format!("Failed to write plist file: {}", e))?;
 
-    if installed_exists {
-        if needs_reload {
-            let _ = std::process::Command::new("launchctl")
-                .args(["bootout", &format!("{}/{}", domain, label)])
-                .output();
-        }
-
-        // Enable the label BEFORE bootstrap. If it was left `disabled` in launchd's
-        // override DB (e.g. by a prior `bootout`/`disable`), bootstrap fails with
-        // "Input/output error" and RunAtLoad never fires at login. Enabling afterwards
-        // can never recover, because bootstrap's failure returns early.
+    // No `installed_exists` check here. The guard above returns early unless the
+    // app is installed, so by this point it always is.
+    if needs_reload {
         let _ = std::process::Command::new("launchctl")
-            .args(["enable", &format!("{}/{}", domain, label)])
+            .args(["bootout", &format!("{}/{}", domain, label)])
             .output();
-
-        let output = std::process::Command::new("launchctl")
-            .args(["bootstrap", &domain, plist_path.to_str().unwrap()])
-            .output()
-            .map_err(|e| format!("Failed to bootstrap launch agent: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.contains("EEXIST") && !stderr.contains("already loaded") {
-                return Err(format!("Failed to bootstrap launch agent: {}", stderr));
-            }
-        }
-
-        let _ = std::process::Command::new("launchctl")
-            .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
-            .output();
-    } else {
-        // Not installed under /Applications; skip bootstrap to avoid immediate launch errors in dev.
-        // launchd will load the agent at next login.
     }
+
+    // Enable the label BEFORE bootstrap. If it was left `disabled` in launchd's
+    // override DB (e.g. by a prior `bootout`/`disable`), bootstrap fails with
+    // "Input/output error" and RunAtLoad never fires at login. Enabling afterwards
+    // can never recover, because bootstrap's failure returns early.
+    let _ = std::process::Command::new("launchctl")
+        .args(["enable", &format!("{}/{}", domain, label)])
+        .output();
+
+    let output = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain, plist_path.to_str().unwrap()])
+        .output()
+        .map_err(|e| format!("Failed to bootstrap launch agent: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("EEXIST") && !stderr.contains("already loaded") {
+            return Err(format!("Failed to bootstrap launch agent: {}", stderr));
+        }
+    }
+
+    let _ = std::process::Command::new("launchctl")
+        .args(["kickstart", "-k", &format!("{}/{}", domain, label)])
+        .output();
 
     Ok("Launch agent installed successfully".to_string())
 }
@@ -4294,8 +4342,51 @@ async fn replace_application(
 
     result?;
 
-    log::info!("🎉 Application updated successfully! Restarting...");
-    app.restart();
+    match update_relaunch(std::env::var("KLAAYGUARD_LAUNCHD").as_deref() == Ok("1")) {
+        Relaunch::LeaveItToLaunchd => {
+            log::info!("🎉 Updated; exiting so launchd relaunches the new build");
+            // `app.exit` always ends the process with status 0: the requested
+            // code reaches RunEvent::ExitRequested and is then dropped for
+            // ControlFlow::Exit, which tao defines as ExitWithCode(0). That is
+            // correct here only while KeepAlive is unconditional. A plist that
+            // moves to KeepAlive={SuccessfulExit:false} must stop using
+            // app.exit, or launchd will never bring the agent back.
+            app.exit(0);
+            Ok(())
+        }
+        Relaunch::RestartSelf => {
+            log::info!("🎉 Application updated successfully! Restarting...");
+            app.restart();
+        }
+    }
+}
+
+/// Who brings the agent back after an update installs.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum Relaunch {
+    /// Exit and let the launchd `KeepAlive` job start the new build.
+    LeaveItToLaunchd,
+    /// Nothing else supervises this process, so it restarts itself.
+    RestartSelf,
+}
+
+/// One relauncher only. Under launchd the LaunchAgent wrapper runs `open -W`
+/// with `KeepAlive`, so this process exiting IS the relaunch; restarting
+/// ourselves as well spawns a second agent in the same instant, and two
+/// simultaneous starts race past the single-instance guard (PROD-4603, seen in
+/// production on 2026-09-05: adjacent PIDs, two tray icons). Outside launchd
+/// nothing else relaunches us, so there `restart()` stays.
+///
+/// `under_launchd` is a parameter rather than an env read, so both arms are
+/// pinned by tests without touching the process environment.
+#[cfg(any(target_os = "macos", test))]
+fn update_relaunch(under_launchd: bool) -> Relaunch {
+    if under_launchd {
+        Relaunch::LeaveItToLaunchd
+    } else {
+        Relaunch::RestartSelf
+    }
 }
 fn update_check_interval_seconds() -> u64 {
     env_seconds("KLAAYGUARD_UPDATE_INTERVAL_SECONDS", 6 * 60 * 60)
@@ -4401,6 +4492,80 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
     }
 }
 
+/// The API base this build was compiled against.
+///
+/// The single-instance lock keys on this, never on `get_api_base_url()`. That
+/// one prefers the runtime `VITE_API_BASE_URL`, which the LaunchAgent plist
+/// injects, and any build can rewrite that plist. Two production agents reading
+/// two different injected values would take two different locks and both run.
+///
+/// `plist_api_base` calls this under `any(macos, test)`, so it is used on the
+/// Linux CI runner too and no dead-code warning fires there.
+#[cfg(any(target_os = "macos", test))]
+fn compiled_api_base_url() -> &'static str {
+    option_env!("APP_DEFAULT_API_BASE_URL").unwrap_or("https://api.klaay.com")
+}
+
+/// The lock this agent holds for as long as it runs. `flock` binds to the open
+/// file description, so the lock lives exactly as long as this `File`; letting
+/// it drop would release this login without a sound.
+#[cfg(target_os = "macos")]
+static AGENT_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Claim this login, or exit because another agent already holds it.
+///
+/// Runs before Tauri, so it reports through `append_early_log` rather than the
+/// plugin logger.
+#[cfg(target_os = "macos")]
+fn claim_this_login() {
+    let Some(path) = single_instance::agent_lock_path(compiled_api_base_url()) else {
+        // No data directory means no lock. An agent that cannot collect is
+        // worse than two that can, so run and make the gap visible.
+        append_early_log("[single_instance] no data directory for the lock; running unguarded");
+        sentry::capture_message(
+            "single_instance_lock_unavailable: no data dir",
+            Level::Warning,
+        );
+        return;
+    };
+
+    // `launchctl kickstart -k` kills the running agent and starts its
+    // replacement at once, and the dead process releases its lock a moment
+    // later. Retry across that handover before concluding another agent owns
+    // this login. Five attempts 400 ms apart sleep four times, so the loser
+    // concedes after 1.6 s.
+    match single_instance::claim_agent_lock(&path, 5, std::time::Duration::from_millis(400)) {
+        single_instance::Claim::Held(file) => {
+            // A full cell hands the file straight back inside `Err`, where
+            // `let _ =` would drop it and close the fd. One caller reaches
+            // here today, so the cell is always empty. Report the second
+            // caller rather than swallow it: whoever adds one needs to see
+            // that this file, not the parked one, is the lock being closed.
+            if AGENT_LOCK.set(file).is_err() {
+                append_early_log(
+                    "[single_instance] the lock was claimed twice; the second file is closed",
+                );
+                sentry::capture_message("single_instance_lock_claimed_twice", Level::Warning);
+            }
+        }
+        single_instance::Claim::Taken => {
+            append_early_log("[single_instance] another agent already runs for this user; exiting");
+            // Exit 0: the launchd job is `open -W`, which simply returns, so
+            // KeepAlive does not spin on this.
+            std::process::exit(0);
+        }
+        single_instance::Claim::Unavailable(why) => {
+            append_early_log(&format!(
+                "[single_instance] lock could not be evaluated ({why}); running unguarded"
+            ));
+            sentry::capture_message(
+                &format!("single_instance_lock_unavailable: {why}"),
+                Level::Warning,
+            );
+        }
+    }
+}
+
 /// Main entry point for the KlaayGuard security monitoring application.
 ///
 /// This function initializes the Tauri application with security-focused configuration:
@@ -4463,6 +4628,13 @@ pub fn run() {
         }
     }
 
+    // Claim this login before anything starts. This runs after the CLI seams,
+    // so `--install-agent` and `--forget-credentials` never take the lock, and
+    // before the Tauri builder, so a losing agent exits without ever reaching
+    // the tray.
+    #[cfg(target_os = "macos")]
+    claim_this_login();
+
     // Runtime env, else the compile-time default build.rs baked in.
     let api_base = get_api_base_url();
     let frontend = get_frontend_url();
@@ -4494,14 +4666,22 @@ pub fn run() {
         tray_watcher_present: std::sync::atomic::AtomicBool::new(true),
     });
 
+    // Only the non-macOS arm below mutates this, so macOS binds it immutably.
+    #[cfg(not(target_os = "macos"))]
     let mut builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = tauri::Builder::default();
 
-    // Single-instance keys on the bundle identifier, and on macOS the plugin
-    // offers no override (`dbus_id` is Linux only). A development build would
-    // therefore see the installed agent's socket and exit on startup, which
-    // makes the sign-in flow impossible to test on a machine that runs the
-    // agent. Production registers it exactly as before; a build pointed
-    // elsewhere skips it and may run alongside.
+    // macOS claimed its lock above, before Tauri existed. The plugin's macOS
+    // guard unlinks its socket before it binds, so two agents that start
+    // together both win it (PROD-4603).
+    //
+    // Linux and Windows keep the plugin: a D-Bus name and a named mutex are
+    // both atomic, so neither has the defect. They also keep the
+    // production-only gate, because the plugin keys on the bundle identifier
+    // and offers no per-target override on Windows — a development build would
+    // otherwise see the installed agent and exit on startup.
+    #[cfg(not(target_os = "macos"))]
     if keychain::is_production_target(&get_api_base_url()) {
         // Must init first, so a second launch exits before the other plugins
         // spin up. Tauri documents this ordering.
@@ -4843,6 +5023,15 @@ mod update_selection_tests {
         assert!(args.contains(&"/UPDATE"));
     }
 
+    // PROD-4603: the update ended with app.restart() while the launchd
+    // KeepAlive job also relaunched the agent the moment the old process
+    // exited. Two relaunchers, two agents. Under launchd there must be one.
+    #[test]
+    fn only_launchd_relaunches_a_supervised_agent() {
+        assert_eq!(update_relaunch(true), Relaunch::LeaveItToLaunchd);
+        assert_eq!(update_relaunch(false), Relaunch::RestartSelf);
+    }
+
     #[test]
     fn update_requires_checksum_everywhere_but_macos() {
         // macOS has codesign and Gatekeeper after the hash. Linux and Windows
@@ -4874,7 +5063,118 @@ mod update_selection_tests {
 mod happy_path_tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
+    // The LaunchAgent plist is one shared file. It names the app to launch and
+    // injects the API base that app then talks to. Whoever writes it decides
+    // both, so only the app it points at may write it.
+    #[test]
+    fn only_the_installed_app_writes_its_own_launch_agent() {
+        use std::path::Path;
+        let installed = Path::new("/Applications/KlaayGuard.app");
+
+        // The installed app describing itself.
+        assert!(may_write_launch_agent(
+            Path::new("/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
+            installed,
+            true
+        ));
+
+        // A developer build must not point launchd at the installed app and
+        // inject its own server. This is how a production install ends up
+        // talking to a localhost port that nothing listens on.
+        assert!(!may_write_launch_agent(
+            Path::new("/Users/dev/src/klaayguard/src-tauri/target/debug/KlaayGuard"),
+            installed,
+            true
+        ));
+
+        // A copy on a mounted disk image, or one in the Trash, is not the
+        // installed app either.
+        assert!(!may_write_launch_agent(
+            Path::new("/Volumes/KlaayGuard/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
+            installed,
+            true
+        ));
+        assert!(!may_write_launch_agent(
+            Path::new("/Users/dev/.Trash/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
+            installed,
+            true
+        ));
+    }
+
+    // With no app in /Applications the plist has nothing to start, and whatever
+    // path it named would be gone by the next login. PROD-4626 puts a Mac in
+    // exactly that state: the installer relocates the bundle into a developer
+    // checkout and leaves /Applications empty. Nobody writes the file then.
+    #[test]
+    fn nobody_writes_the_launch_agent_when_no_app_is_installed() {
+        use std::path::Path;
+        let installed = Path::new("/Applications/KlaayGuard.app");
+
+        assert!(!may_write_launch_agent(
+            Path::new("/Users/dev/src/klaayguard/src-tauri/target/debug/KlaayGuard"),
+            installed,
+            false
+        ));
+        assert!(!may_write_launch_agent(
+            Path::new("/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
+            installed,
+            false
+        ));
+    }
+
+    // Half of what this fix is for: "a wrong value could never heal". The plist
+    // injects VITE_API_BASE_URL into the agent it starts, so resolving the
+    // plist's own base through the environment would write back whatever the
+    // file already held. Set the variable and prove the choice ignores it.
+    //
+    // Safe to touch the process environment here: no other test reaches
+    // `get_api_base_url`, directly or through `keychain::api_base`.
+    #[test]
+    fn the_launch_agent_ignores_an_injected_server() {
+        let injected = "http://localhost:54524";
+        std::env::set_var("VITE_API_BASE_URL", injected);
+        let chosen = plist_api_base();
+        std::env::remove_var("VITE_API_BASE_URL");
+
+        assert_ne!(
+            chosen, injected,
+            "the plist copied the injected server, so a wrong value can never heal"
+        );
+        assert_eq!(chosen, compiled_api_base_url());
+    }
+
+    #[test]
+    fn the_launch_agent_starts_the_app_and_carries_its_server() {
+        let plist = render_launch_agent_plist(
+            "com.klaay.klaayguard",
+            "/Applications/KlaayGuard.app",
+            "/Users/dev/Library/Logs/KlaayGuard",
+            "https://api.klaay.com",
+        );
+        assert!(plist.contains("<string>com.klaay.klaayguard</string>"));
+        assert!(plist.contains("<string>/Applications/KlaayGuard.app</string>"));
+        assert!(plist.contains("<string>https://api.klaay.com</string>"));
+        assert!(plist.contains("<key>KLAAYGUARD_LAUNCHD</key>"));
+        // The file is written only for an installed app, so the job always runs
+        // at login and stays up.
+        assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
+        // Every placeholder is filled, or launchd rejects the file.
+        assert!(!plist.contains("__"), "an unfilled placeholder remains");
+    }
+
+    #[test]
+    fn a_hostile_path_cannot_inject_launchd_keys() {
+        let plist = render_launch_agent_plist(
+            "com.klaay.klaayguard",
+            "/Applications/</string><key>ThrottleInterval</key><integer>0</integer><string>.app",
+            "/log",
+            "https://api.klaay.com",
+        );
+        assert!(!plist.contains("<key>ThrottleInterval</key>\n    <integer>0</integer>"));
+        assert!(plist.contains("&lt;/string&gt;"));
+    }
+
     #[test]
     fn xml_escape_neutralizes_plist_injection() {
         assert_eq!(

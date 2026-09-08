@@ -208,6 +208,37 @@ running with `KeepAlive`.
 - The agent is per-user. It runs only while that user is logged in.
 - The `bootstrap` step is skipped when the app is not under `/Applications`.
   Launch from `/Applications`, not from Downloads.
+- Only the bundle the LaunchAgent points at writes it. A build running from
+  anywhere else — a developer binary, a copy on a mounted disk image — leaves it
+  alone, and says so in the log.
+- The LaunchAgent records the API base the app was **compiled** with, never the
+  one in the environment. It injects `VITE_API_BASE_URL` into the agent it
+  starts, so reading that back would write whatever the file already held, and a
+  wrong value could never correct itself.
+- A redirected agent also loses its credential. The keychain service name is
+  chosen by the API base, and a non-production URL gets a hashed suffix, so the
+  agent looks for its token under a name that holds nothing and finds none. A
+  redirect therefore stops collection at the first request, not only at the next
+  update check.
+
+## One agent per user
+
+Only one agent may run per login account, or the device reports its data twice
+and the two copies fight over the sign-in state.
+
+- macOS claims an exclusive `flock` on
+  `~/Library/Application Support/com.klaay.app/agent.lock` before it starts
+  anything else. A second agent finds the lock held and exits.
+- The lock is per user, like the LaunchAgent above. Two accounts logged in at
+  once run two agents. A machine-wide lock would need a path every account can
+  write, and any account could take that lock first and leave the Mac with no
+  agent at all.
+- Linux and Windows use `tauri-plugin-single-instance`: a D-Bus name and a
+  named mutex. Both are atomic, so neither needs the lock file.
+- The lock name follows the API base the build was compiled against, so a
+  development build runs alongside the installed production agent.
+- The kernel releases the lock when the agent exits, so a crash never leaves a
+  stale lock behind.
 
 ## Automatic startup on Windows
 
@@ -237,7 +268,9 @@ staged installer and checks the hash again before it runs it.
 
 If any check fails, the running agent stays untouched. On success:
 
-- macOS replaces `/Applications/KlaayGuard.app` and restarts the agent.
+- macOS replaces `/Applications/KlaayGuard.app`. Under launchd the agent exits
+  and `KeepAlive` starts the new build; outside launchd it restarts itself.
+  Exactly one of the two relaunches, never both.
 - Linux replaces the AppImage file and restarts the agent.
 - Windows runs the new installer with `/S /R`. The installer stops the old
   agent, installs over it, and starts the new one.
