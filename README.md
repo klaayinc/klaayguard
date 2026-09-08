@@ -251,6 +251,21 @@ agent at each logon.
 - The uninstaller removes the value.
 - `src-tauri/windows/hooks.nsi` holds the write and the removal.
 
+A silent or passive install also starts the agent at once, so a machine does
+not wait for its next logon. That start needs a shell window, which an install
+running as SYSTEM does not have.
+
+### Installer exit code 1000
+
+The installer exits `1000` when the files landed but the agent did not start.
+The install is good. The agent starts at the next logon from the `Run` value.
+
+Map `1000` in your deployment tool, because the tool decides pass or fail from
+this number and does not know it. In Microsoft Intune, add it to the app's
+return-code table as **Success**, or as **Retry** to try again sooner. Windows
+Installer codes do not apply here: this is an NSIS package, where `0` is
+success, `1` is a user abort and `2` is a failed install.
+
 ## Automatic updates
 
 The agent checks `GET /klaayguard/updates/latest` at startup and then every

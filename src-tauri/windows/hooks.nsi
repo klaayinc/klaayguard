@@ -60,6 +60,12 @@
         ; uses 1 for a user abort and 2 for a failed install. A tool that reads
         ; it learns the files landed and the agent did not start, which is
         ; neither of those.
+        ;
+        ; This does not contradict rejecting an abort above. An abort stops the
+        ; install and leaves the machine without the new files; this finishes
+        ; the install and marks it. Both are non-zero, so a deployment tool
+        ; still needs the mapping — the README's "Installer exit code 1000"
+        ; section tells the admin to add it, since nothing else can.
         SetErrorLevel 1000
         DetailPrint "KlaayGuard: the agent did not start; it starts at the next logon"
         Push $0
