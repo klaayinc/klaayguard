@@ -85,17 +85,36 @@ AGENT_WAIT_TICKS=5   # 0.5s per wait; the real default is 10s
 
 echo "==> ensure_agent_running must report failure when nothing starts one"
 launch_agent() { :; }
-if ensure_agent_running "$(id -u)" "$installed" "$workdir/KlaayGuard.app"; then
+if ensure_agent_running "$(id -u)" "$installed" "$(id -un)" "$workdir/KlaayGuard.app"; then
   echo "FAIL: the installer reported success with no agent running"
   exit 1
 fi
 
 echo "==> and must report success once a launcher starts one"
 launch_agent() { "$installed" & }
-if ! ensure_agent_running "$(id -u)" "$installed" "$workdir/KlaayGuard.app"; then
+if ! ensure_agent_running "$(id -u)" "$installed" "$(id -un)" "$workdir/KlaayGuard.app"; then
   echo "FAIL: an agent runs, and the installer still reported failure"
   exit 1
 fi
+
+# `man launchctl` on asuser: "It does not modify the process' credentials (UID,
+# GID, etc.)". A bare `asuser` therefore starts the agent as root, which
+# resolves HOME to root's — a different single-instance lock and a different
+# credential store than `single_instance.rs` intends — and `pgrep -u "$uid"`
+# never sees it, so the check above would report a failure that did not happen.
+#
+# Proving the credential change needs root and a live GUI session, which no
+# runner has. Assert the wrapping instead: the same one the step-1 call carries.
+echo "==> launch_agent must start the app as the console user, not as root"
+launcher=$(awk '/^launch_agent\(\)/,/^}/' "$POSTINSTALL")
+case "$launcher" in
+  *"launchctl asuser"*) ;;
+  *) echo "FAIL: launch_agent no longer goes through launchctl asuser"; exit 1 ;;
+esac
+case "$launcher" in
+  *sudo*-u*) ;;
+  *) echo "FAIL: launch_agent does not wrap in sudo -u; asuser alone starts the agent as root"; exit 1 ;;
+esac
 
 # Order matters as much as the call. Stopping the agent after the kickstart
 # leaves the wrapper attached to the old process again.
@@ -121,6 +140,38 @@ fi
 if [ -n "$kick_line" ] && [ "$ensure_line" -lt "$kick_line" ]; then
   echo "FAIL: ensure_agent_running (line $ensure_line) runs before kickstart (line $kick_line)"
   exit 1
+fi
+
+echo "==> and must arm that check before it stops anything"
+# A cancelled or killed installer would otherwise keep the stop and lose the
+# start, leaving the Mac with no agent and no message.
+trap_line=$(grep -n "^[[:space:]]*trap .*ensure_agent_running" "$POSTINSTALL" | head -1 | cut -d: -f1)
+if [ -z "$trap_line" ]; then
+  echo "FAIL: main arms no trap; an interrupted install keeps the stop and loses the start"
+  exit 1
+fi
+if [ "$trap_line" -gt "$stop_line" ]; then
+  echo "FAIL: the trap (line $trap_line) is armed after the stop (line $stop_line)"
+  exit 1
+fi
+
+# The name guard turns this file into a library when it is not called
+# `postinstall`. If the positive arm ever stopped matching, the installer would
+# do nothing at all and still exit 0.
+echo "==> the name guard must run main when the file is named postinstall"
+if [ -x /Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard ]; then
+  echo "note: KlaayGuard is installed on this Mac; skipping rather than running a real install"
+else
+  cp "$POSTINSTALL" "$workdir/postinstall"
+  guard_out=$(bash "$workdir/postinstall" 2>&1)
+  case "$guard_out" in
+    *"binary not found"*) ;;
+    *)
+      echo "FAIL: the name guard did not run main; the installer would do nothing and exit 0"
+      echo "      output was: $guard_out"
+      exit 1
+      ;;
+  esac
 fi
 
 echo "PASS: the installer stops the agent it replaces, spares other builds, and reports when none comes back"

@@ -78,8 +78,15 @@ wait_for_agent() {
 
 # The last-resort start, when launchd brought nothing back. A separate function
 # so the test can drive both outcomes.
+#
+# `asuser` alone is not enough, and `man launchctl` says why: "It does not
+# modify the process' credentials (UID, GID, etc.)". A bare `asuser` starts the
+# agent as root. Root's HOME then resolves a different single-instance lock and
+# a different credential store than the one `single_instance.rs` intends, and
+# `pgrep -u "$uid"` cannot see a root-owned process, so the check below would
+# report a failure after a launch that did happen. Step 1 wraps the same way.
 launch_agent() {
-  /bin/launchctl asuser "$1" /usr/bin/open -g -j -a "$2" 2>/dev/null || true
+  /bin/launchctl asuser "$1" /usr/bin/sudo -H -u "$2" /usr/bin/open -g -j -a "$3" 2>/dev/null || true
 }
 
 # Make sure the install leaves an agent running, and say so when it does not.
@@ -95,12 +102,13 @@ launch_agent() {
 ensure_agent_running() {
   local uid="$1"
   local exe="$2"
-  local app="$3"
+  local user="$3"
+  local app="$4"
 
   wait_for_agent "$uid" "$exe" && return 0
 
   log "postinstall: no agent after the kickstart; opening the app directly"
-  launch_agent "$uid" "$app"
+  launch_agent "$uid" "$user" "$app"
   wait_for_agent "$uid" "$exe" && return 0
 
   log "postinstall: ERROR no agent runs after the install; this Mac reports nothing until the next login"
@@ -131,6 +139,11 @@ main() {
   PLIST="/Users/$CONSOLE_USER/Library/LaunchAgents/com.klaay.klaayguard.plist"
   log "postinstall: registering LaunchAgent for $CONSOLE_USER (uid $CONSOLE_UID)"
 
+  # Arm the check before anything stops. An installer cancelled or killed
+  # between the stop and step 4 would otherwise keep the stop and lose the
+  # start, and leave the Mac with no agent and no message.
+  trap 'ensure_agent_running "$CONSOLE_UID" "$BIN" "$CONSOLE_USER" "$APP" || true' EXIT
+
   # Step 0 — stop the old agent first. Every step below starts the job again, and
   # each one is a no-op for the new build while the old process still holds the
   # bundle's LaunchServices registration.
@@ -160,7 +173,9 @@ main() {
   # Step 4 — confirm one came back. Every step above hides its own failure, so
   # this is the only thing standing between a failed restart and a silent, blind
   # Mac. It never fails the install; it starts the app itself and logs an error.
-  ensure_agent_running "$CONSOLE_UID" "$BIN" "$APP" || true
+  # Clear the trap first, so the check runs once rather than twice.
+  trap - EXIT
+  ensure_agent_running "$CONSOLE_UID" "$BIN" "$CONSOLE_USER" "$APP" || true
 
   exit 0
 }
