@@ -38,14 +38,27 @@ agent_pids() {
   done
 }
 
-# Whether an agent runs this binary, waiting for one to appear. `runuser` forks,
-# so the replacement arrives a moment after the start returns.
-wait_for_agent() {
-  waited=0
-  while [ "$waited" -lt 50 ]; do
-    [ -n "$(agent_pids "$1")" ] && return 0
+# Whether a *new* agent runs for one user, waiting for it to appear.
+#
+# "Is an agent running" is the wrong question. The loop below restarts one agent
+# per logged-in user, so on a machine with two sessions a check for any process
+# passes while one user's agent is gone. Excluding the pid that was killed also
+# covers the process that survived SIGKILL: its old pid does not count as the
+# replacement.
+#
+# `runuser` forks, so the new agent arrives a moment after the start returns.
+wait_for_new_agent() {
+  nbin="$1"
+  nuser="$2"
+  noldpid="$3"
+  nwaited=0
+  while [ "$nwaited" -lt 50 ]; do
+    for npid in $(agent_pids "$nbin"); do
+      [ "$npid" = "$noldpid" ] && continue
+      [ "$(stat -c %U "/proc/$npid" 2>/dev/null)" = "$nuser" ] && return 0
+    done
     sleep 0.1
-    waited=$((waited + 1))
+    nwaited=$((nwaited + 1))
   done
   return 1
 }
@@ -74,6 +87,7 @@ restart_running_agents() {
   # the same way: root without CAP_SYS_PTRACE reads an empty exe link for
   # another user's process. dpkg's root has that capability, so the silence was
   # the defect rather than the blindness.
+  restarted=""
   pids=$(agent_pids "$bin")
   if [ -z "$pids" ]; then
     log "postinst: no agent runs $bin; nothing to restart"
@@ -123,6 +137,7 @@ restart_running_agents() {
       HOME="$home" USER="$user" LOGNAME="$user" \
       PATH=/usr/local/bin:/usr/bin:/bin \
       "$@" "$bin" >/dev/null 2>&1 &
+    restarted="$restarted $user:$pid"
   done
 
   # The start runs detached with its output discarded, so neither its exit code
@@ -130,8 +145,18 @@ restart_running_agents() {
   # kill the agent, start nothing, log a restart that never happened, and exit
   # 0 — the one path that leaves the machine worse than it was found, because
   # the old agent at least still reported.
-  wait_for_agent "$bin" && return 0
-  log "postinst: ERROR the agent did not come back; this machine reports nothing until the next login"
+  #
+  # Check every session, not the machine. One user's restart can fail while
+  # another's works, and a machine-wide question answers yes to that.
+  missing=0
+  for entry in $restarted; do
+    ruser="${entry%%:*}"
+    rpid="${entry##*:}"
+    wait_for_new_agent "$bin" "$ruser" "$rpid" && continue
+    log "postinst: ERROR the agent for $ruser did not come back; that session reports nothing until the next login"
+    missing=1
+  done
+  [ "$missing" -eq 0 ] && return 0
   return 1
 }
 

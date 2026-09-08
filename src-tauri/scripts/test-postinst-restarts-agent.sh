@@ -27,6 +27,7 @@ cd "$(dirname "$0")/.."
 POSTINST="linux/postinst.sh"
 POSTRM="linux/postrm.sh"
 TEST_USER="klaayguard-test-agent"
+TEST_USER_B="klaayguard-test-agent-b"
 
 for f in "$POSTINST" "$POSTRM"; do
   test -f "$f" || { echo "FAIL: $f not found"; exit 1; }
@@ -62,11 +63,13 @@ done
 
 workdir="$(mktemp -d)"
 created_user=no
+created_user_b=no
 cleanup() {
   pkill -f "$workdir" 2>/dev/null || true
-  # Only an account this run created. A developer whose machine already has one
-  # by this name must not lose it, and its home directory, to a test.
+  # Only accounts this run created. A developer whose machine already has one
+  # by either name must not lose it, and its home directory, to a test.
   [ "$created_user" = yes ] && userdel -r "$TEST_USER" 2>/dev/null
+  [ "$created_user_b" = yes ] && userdel -r "$TEST_USER_B" 2>/dev/null
   rm -rf "$workdir"
 }
 trap cleanup EXIT
@@ -79,6 +82,14 @@ if ! id "$TEST_USER" >/dev/null 2>&1; then
     || { echo "FAIL: could not create the unprivileged test user"; exit 1; }
   created_user=yes
 fi
+# A second login, for the case where one session's restart works and another's
+# does not. One agent per user is what the loop restarts.
+if ! id "$TEST_USER_B" >/dev/null 2>&1; then
+  useradd -m -s /bin/sh "$TEST_USER_B" \
+    || { echo "FAIL: could not create the second unprivileged test user"; exit 1; }
+  created_user_b=yes
+fi
+REAL_RUNUSER="$(command -v runuser)"
 chmod 755 "$workdir"
 
 # A real ELF binary, not a shell script: the rule under test reads
@@ -217,7 +228,52 @@ if [ -n "$(agent_pids "$installed")" ]; then
   exit 1
 fi
 
+# One agent per user is what the loop restarts, so "an agent is running" is not
+# the same question as "every agent came back". On a machine with two sessions,
+# a restart that works for one user and fails for the other must still report
+# failure — otherwise the second user's machine is dark and the install says so
+# to no one.
+echo "==> every session's agent must come back, not just one"
+cat > "$workdir/fakebin/runuser" <<FAKE
+#!/bin/sh
+# Fail only for the second user, the way one session's PAM denial would.
+[ "\$2" = "$TEST_USER_B" ] && exit 1
+exec "$REAL_RUNUSER" "\$@"
+FAKE
+chmod +x "$workdir/fakebin/runuser"
+
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" &
+runuser -u "$TEST_USER_B" -- env DISPLAY=":98" "$installed" &
+sleep 0.8
+before_two="$(agent_pids "$installed" | tr '\n' ' ')"
+[ "$(agent_pids "$installed" | wc -l)" -eq 2 ] \
+  || { echo "FAIL: expected two agents for the two-session case, got [$before_two]"; exit 1; }
+
+two_output=$(PATH="$workdir/fakebin:$PATH" restart_running_agents "$installed" 2>&1)
+two_code=$?
+if [ "$two_code" -eq 0 ]; then
+  echo "FAIL: one session's agent never came back and the install reported success"
+  echo "      output was: $two_output"
+  exit 1
+fi
+case "$two_output" in
+  *"$TEST_USER_B"*) ;;
+  *)
+    echo "FAIL: the error does not name the session that lost its agent"
+    echo "      output was: $two_output"
+    exit 1
+    ;;
+esac
+pkill -f "^$installed" 2>/dev/null || true
+sleep 0.3
+
+# The failure case above leaves nothing at the installed path, so without a
+# fresh agent here `stop_running_agents` would run on an empty list and the
+# block would pass without doing anything.
 echo "==> a removal must stop the agent it deletes"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "klaayguard://sign-in" &
+sleep 0.6
+[ -n "$(agent_pids "$installed")" ] || { echo "FAIL: could not start the agent for the removal case"; exit 1; }
 (
   # A fresh shell: the postremove defines its own agent_pids, and sourcing both
   # in one shell would hide which copy the assertions exercise.
