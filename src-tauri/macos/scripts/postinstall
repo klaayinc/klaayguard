@@ -85,8 +85,15 @@ wait_for_agent() {
 # a different credential store than the one `single_instance.rs` intends, and
 # `pgrep -u "$uid"` cannot see a root-owned process, so the check below would
 # report a failure after a launch that did happen. Step 1 wraps the same way.
+#
+# The status is logged rather than dropped. `open` reaches LaunchServices
+# through the same bootstrap namespace that step 1's comment says `sudo -u`
+# disturbs, so this call may fail for that reason; if it ever does, the log says
+# what it returned instead of leaving only the ERROR that follows.
 launch_agent() {
-  /bin/launchctl asuser "$1" /usr/bin/sudo -H -u "$2" /usr/bin/open -g -j -a "$3" 2>/dev/null || true
+  /bin/launchctl asuser "$1" /usr/bin/sudo -H -u "$2" /usr/bin/open -g -j -a "$3" 2>/dev/null
+  launch_status=$?
+  [ "$launch_status" -eq 0 ] || log "postinstall: the direct open exited $launch_status"
 }
 
 # Make sure the install leaves an agent running, and say so when it does not.
@@ -139,7 +146,8 @@ main() {
   PLIST="/Users/$CONSOLE_USER/Library/LaunchAgents/com.klaay.klaayguard.plist"
   log "postinstall: registering LaunchAgent for $CONSOLE_USER (uid $CONSOLE_UID)"
 
-  # Arm the check before anything stops. An installer cancelled or killed
+  # Arm the check before anything stops. An installer cancelled, or killed with
+  # a signal a shell can catch,
   # between the stop and step 4 would otherwise keep the stop and lose the
   # start, and leave the Mac with no agent and no message.
   trap 'ensure_agent_running "$CONSOLE_UID" "$BIN" "$CONSOLE_USER" "$APP" || true' EXIT
