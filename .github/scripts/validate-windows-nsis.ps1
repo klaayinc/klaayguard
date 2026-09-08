@@ -30,8 +30,9 @@ else { Fail "klaayguard-osqueryi.exe is missing from the installer" }
 
 # --- 2. Silent install --------------------------------------------------------
 # /S is the same flag the self-updater uses, so this proves the update path.
-# No /R: the installer must leave an agent running without being asked, the
-# same guarantee the macOS postinstall and the Linux postinst carry.
+# No /R: the installer must leave an agent running without being asked. The
+# macOS postinstall carries the same guarantee today; the Linux postinst gets
+# it in the sibling pull request, which is still open.
 # Never wait on an installer without a deadline. A modal dialog nobody can
 # answer looks exactly like a slow runner, so an unbounded wait spends the whole
 # job timeout in silence. A bounded one names the problem and moves on.
@@ -39,7 +40,10 @@ function Invoke-Installer([string]$Path, [string[]]$Arguments, [int]$TimeoutSeco
     $p = Start-Process -FilePath $Path -ArgumentList $Arguments -PassThru
     if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
         Fail "'$Path $($Arguments -join ' ')' did not finish in $TimeoutSeconds s; it is waiting for an answer nobody can give"
-        try { $p.Kill() } catch { }
+        # A kill that fails leaves an installer still changing the machine while
+        # every later section reads it. Say so rather than carry on blind.
+        try { $p.Kill(); $p.WaitForExit(10000) | Out-Null }
+        catch { Fail "could not kill the stuck installer (pid $($p.Id)): $($_.Exception.Message)" }
         return $null
     }
     return $p
@@ -151,10 +155,33 @@ if ($agent) {
     Fail "no running agent to re-install over; the check above already failed"
 }
 
+# --- 4b. The real self-update command line ------------------------------------
+# Section 4a drops /R on purpose, to drive the new hook. This is the line every
+# existing customer takes on a self-update, where the template's .onInstSuccess
+# does the restart. Without it that path is asserted only by a unit test on the
+# flag list.
+$beforeUpdate = Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue
+$proc = Invoke-Installer $Installer @("/S", "/UPDATE", "/R")
+if ($proc -and $proc.ExitCode -ne 0) { Fail "the self-update command line exited $($proc.ExitCode)" }
+$afterUpdate = Wait-ForAgent
+if (-not $afterUpdate) {
+    Fail "no agent runs after '/S /UPDATE /R'; the self-update path leaves the machine unmonitored"
+} elseif (@($afterUpdate).Count -ne 1) {
+    Fail "$(@($afterUpdate).Count) agents run after '/S /UPDATE /R'; exactly one must"
+} elseif ($beforeUpdate -and ($afterUpdate.Id -contains $beforeUpdate[0].Id)) {
+    Fail "the self-update left the old agent (pid $($beforeUpdate[0].Id)) in place"
+} else {
+    Pass "the self-update command line restarts the agent (pid $($afterUpdate[0].Id))"
+}
+
 # --- 5. Silent uninstall ------------------------------------------------------
 # Stop the agent first. The uninstaller does it too, but an explicit stop keeps
-# the file checks below about uninstall, not about a timing race.
-Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+# the file checks below about uninstall, not about a timing race. A stop that
+# fails would otherwise resurface as a confusing file-still-there failure.
+foreach ($p in @(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue)) {
+    try { $p.Kill(); $p.WaitForExit(10000) | Out-Null }
+    catch { Fail "could not stop the agent (pid $($p.Id)) before the uninstall: $($_.Exception.Message)" }
+}
 # The NSIS uninstaller copies itself to a temp directory and returns at once,
 # so poll for the cleanup instead of trusting the exit code.
 if ($installDir -and (Test-Path "$installDir\uninstall.exe")) {
