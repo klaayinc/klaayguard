@@ -48,6 +48,19 @@
       nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" ""
       Pop $R9
       ${If} $R9 <> 0
+        ; The one shape that sets this flag is the least able to show it: an
+        ; elevated caller with no shell window, which is a management tool
+        ; running as SYSTEM. Such an install has no console for AttachConsole
+        ; and reads no install log, so the exit code is the only channel that
+        ; reaches it. SetErrorLevel marks the install without aborting it — the
+        ; files are in place and the Run key starts the agent at the next logon,
+        ; so failing the whole install would be a lie and would send a
+        ; management tool into a retry loop.
+        ; 1000 is ours, not a Windows Installer code: 0 is success, and NSIS
+        ; uses 1 for a user abort and 2 for a failed install. A tool that reads
+        ; it learns the files landed and the agent did not start, which is
+        ; neither of those.
+        SetErrorLevel 1000
         DetailPrint "KlaayGuard: the agent did not start; it starts at the next logon"
         Push $0
         System::Call 'kernel32::AttachConsole(i -1)i.r0'

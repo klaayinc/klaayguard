@@ -74,7 +74,15 @@ if (-not $agent) {
     Fail "no KlaayGuard process after the install; the machine is unmonitored until the next logon"
 } elseif (@($agent).Count -ne 1) {
     # Two agents is PROD-4603: two tray icons, the device double-reporting every
-    # 15 minutes. The mutex absorbs a double start only for a production build.
+    # 15 minutes.
+    #
+    # Know what this catches here. The job sets neither VITE_API_BASE_URL nor
+    # APP_DEFAULT_API_BASE_URL, so the build under test talks to production,
+    # `is_production_target` is true, and the single-instance mutex is
+    # registered. A second launch would exit on that mutex and this count would
+    # still read 1. So this guards the mutex against regression; it does not
+    # prove the installer starts the agent only once. The hook's own condition
+    # is what does that.
     Fail "$(@($agent).Count) KlaayGuard processes run after the install; exactly one must"
 } else {
     Pass "exactly one agent runs after the install (pid $($agent[0].Id))"
@@ -160,6 +168,11 @@ if ($agent) {
 # existing customer takes on a self-update, where the template's .onInstSuccess
 # does the restart. Without it that path is asserted only by a unit test on the
 # flag list.
+#
+# It is a smoke test of the command line, not of which code started the agent:
+# with /R present both starters are in play, so an inverted condition in the
+# hook would still leave one agent running and pass here. Section 4a is where
+# the hook itself is exercised.
 $beforeUpdate = Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue
 $proc = Invoke-Installer $Installer @("/S", "/UPDATE", "/R")
 if ($proc -and $proc.ExitCode -ne 0) { Fail "the self-update command line exited $($proc.ExitCode)" }
