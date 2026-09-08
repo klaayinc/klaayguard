@@ -219,6 +219,14 @@ jobs:
           test -n "$DEB"
           ./.github/scripts/validate-linux-deb.sh "$DEB"
 
+      # Proves the postinstall restarts the agent it replaces. Without that
+      # step a package upgrade leaves the old process running the old binary,
+      # and Linux has no supervisor to notice until the next login. Root,
+      # because the postinstall runs as root and starts the agent with runuser.
+      - name: postinst restarts the old agent
+        working-directory: src-tauri
+        run: sudo bash scripts/test-postinst-restarts-agent.sh
+
   # Build the Windows NSIS installer the way release does, then install it
   # silently on the runner and assert on the result: the Run key, the
   # klaayguard:// handler, the sidecar, and a clean uninstall. Every one of

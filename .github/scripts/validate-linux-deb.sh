@@ -82,6 +82,12 @@ if test -f control/postinst; then
   grep -q update-desktop-database control/postinst \
     && pass "postinst refreshes the desktop database" \
     || fail "postinst does not run update-desktop-database"
+  # An upgrade writes the new binary and leaves the old process on the old
+  # inode. Nothing else on Linux restarts this agent before the next login, so
+  # a package without this step ships a machine reporting from the old build.
+  grep -q restart_running_agents control/postinst \
+    && pass "postinst restarts the agent it replaces" \
+    || fail "postinst does not restart the running agent; an upgrade keeps the old build alive until logout"
 else
   fail "control archive has no postinst"
 fi
