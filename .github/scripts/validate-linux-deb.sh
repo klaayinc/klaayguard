@@ -92,6 +92,16 @@ else
   fail "control archive has no postinst"
 fi
 
+# Removal has the same hole in reverse: nothing supervises this agent, so an
+# uninstall that only deletes files leaves it collecting from a deleted inode.
+if test -f control/postrm; then
+  grep -q stop_running_agents control/postrm \
+    && pass "postrm stops the agent it deletes" \
+    || fail "postrm does not stop the running agent; apt remove leaves it running on a deleted binary"
+else
+  fail "control archive has no postrm"
+fi
+
 # The package must declare its runtime dependencies.
 grep -q '^Depends: ..*' control/control && pass "Depends declared" \
   || fail "control file declares no Depends"

@@ -11,13 +11,31 @@ AGENT_BIN=/usr/bin/KlaayGuard
 # The session variables the agent needs to reach the tray. The replacement
 # inherits them from the process it replaces, so it lands in the same session
 # whatever the desktop.
-AGENT_SESSION_VARS="DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_CURRENT_DESKTOP LANG KLAAYGUARD_TEST_MARK"
+AGENT_SESSION_VARS="DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_CURRENT_DESKTOP LANG"
 
 log() { logger -t klaayguard.postinst "$1" 2>/dev/null || true; echo "$1"; }
 
 # One variable out of a running process's environment.
 proc_env() {
   tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | sed -n "s/^$2=//p" | head -1
+}
+
+# Every process running this binary, whatever its arguments.
+#
+# `/proc/<pid>/exe` names the file the process runs, so an argument cannot hide
+# it. A command-line match can: the desktop entry is `Exec={{exec}} %U`, so a
+# launch carrying a URL has an argument, and an anchored pattern misses it.
+#
+# The link reads "<path> (deleted)" once the package replaces the file, which is
+# exactly the process this script exists to replace.
+agent_pids() {
+  bin="$1"
+  for proc in /proc/[0-9]*; do
+    exe=$(readlink "$proc/exe" 2>/dev/null) || continue
+    if [ "$exe" = "$bin" ] || [ "$exe" = "$bin (deleted)" ]; then
+      echo "${proc#/proc/}"
+    fi
+  done
 }
 
 # Restart every agent that runs the binary this package just replaced.
@@ -31,15 +49,16 @@ proc_env() {
 # at the next login leaves the machine unmonitored for the rest of the day, so
 # the new build starts here, in the session the old one had.
 #
-# The match anchors on the installed path. An AppImage agent and a developer
-# build run from other paths, keep their own single-instance locks, and this
-# package does not own them.
+# The match is this package's own path, so an AppImage agent is left alone. That
+# matters: on Linux the single-instance guard is the plugin's bundle identifier,
+# not a per-path lock, so an AppImage and this package would contend for one
+# name. A developer build is spared for a different reason — `lib.rs` registers
+# the plugin only when the build talks to production.
 restart_running_agents() {
   bin="$1"
-  command -v pgrep >/dev/null 2>&1 || { log "postinst: no pgrep; leaving the running agent alone"; return 0; }
   command -v runuser >/dev/null 2>&1 || { log "postinst: no runuser; leaving the running agent alone"; return 0; }
 
-  pids=$(pgrep -f "^$bin$" 2>/dev/null || true)
+  pids=$(agent_pids "$bin")
   [ -n "$pids" ] || return 0
 
   for pid in $pids; do
@@ -87,7 +106,6 @@ main() {
   restart_running_agents "$AGENT_BIN" || true
 }
 
-# Run the install unless the test asks for the functions alone. dpkg names this
-# script `<package>.postinst` and rpm runs it with no stable $0, so the check
-# cannot key on the name: it defaults to running, and only the test opts out.
-[ "${KLAAYGUARD_POSTINST_LIB:-}" = "1" ] || main "$@"
+# The shipped script carries no way to switch this off. The test sources a copy
+# with this last line removed.
+main "$@"
