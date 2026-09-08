@@ -33,6 +33,11 @@ else { Fail "klaayguard-osqueryi.exe is missing from the installer" }
 # No /R: the installer must leave an agent running without being asked. The
 # macOS postinstall carries the same guarantee today; the Linux postinst gets
 # it in the sibling pull request, which is still open.
+# Two shapes reach no section here. The hook's failure branch needs an elevated
+# caller with no shell window; this runner is a logged-on session with a shell,
+# so RunAsUser succeeds. The passive path (/P) shows the installer window. It
+# would add a fifth install to a job whose bounded waits already fill most of
+# its 30 minutes when it fails.
 # Never wait on an installer without a deadline. A modal dialog nobody can
 # answer looks exactly like a slow runner, so an unbounded wait spends the whole
 # job timeout in silence. A bounded one names the problem and moves on.

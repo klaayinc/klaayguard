@@ -37,9 +37,8 @@
   ;
   ; RunAsUser starts the agent as the logged-in user, never as the elevated
   ; installer, so the credential store stays with the person at the machine. It
-  ; pushes one result: zero for success, one for failure. Read it. It returns
-  ; failure when the caller is elevated and there is no shell window, and an
-  ; unread failure is the silent no-agent install this hook exists to prevent.
+  ; pushes one result: zero for success, one for failure. Read it. An unread
+  ; failure is the silent no-agent install this hook exists to prevent.
   ${If} ${Silent}
   ${OrIf} $PassiveMode = 1
     ClearErrors
@@ -48,31 +47,33 @@
       nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" ""
       Pop $R9
       ${If} $R9 <> 0
-        ; The one shape that sets this flag is the least able to show it: an
-        ; elevated caller with no shell window, which is a management tool
-        ; running as SYSTEM. Such an install has no console for AttachConsole
-        ; and reads no install log, so the exit code is the only channel that
-        ; reaches it. SetErrorLevel marks the install without aborting it — the
-        ; files are in place and the Run key starts the agent at the next logon,
-        ; so failing the whole install would be a lie and would send a
-        ; management tool into a retry loop.
-        ; 1000 is ours, not a Windows Installer code: 0 is success, and NSIS
-        ; uses 1 for a user abort and 2 for a failed install. A tool that reads
-        ; it learns the files landed and the agent did not start, which is
-        ; neither of those.
+        ; RunAsUser fails on more than one path: a failed shell launch when
+        ; the caller is not elevated, and each token step when it is. The one
+        ; a deployment meets is an elevated caller with no shell window, which
+        ; is a management tool running as SYSTEM in session 0. That caller has
+        ; no console for AttachConsole and reads no install log, so the exit
+        ; code is the only channel that reaches it.
         ;
-        ; This does not contradict rejecting an abort above. An abort stops the
-        ; install and leaves the machine without the new files; this finishes
-        ; the install and marks it. Both are non-zero, so a deployment tool
-        ; still needs the mapping — the README's "Installer exit code 1000"
-        ; section tells the admin to add it, since nothing else can.
+        ; SetErrorLevel marks the install and does not abort it. The files are
+        ; in place. An abort would leave the machine without them and would
+        ; send a management tool into a retry loop. The cause does not clear
+        ; on its own, so every retry would fail the same way.
+        ;
+        ; 1000 is ours, not a Windows Installer code. NSIS uses 0 for success,
+        ; 1 for a user abort and 2 for an abort by the script. A tool that
+        ; reads it learns the files landed and the agent did not start. Both
+        ; this and an abort are non-zero, so a deployment tool still needs the
+        ; mapping. The README's "Installer exit code 1000" section gives it.
+        ; It also says what the Run value above means for that reader. The
+        ; value follows the installing account, so only a user-context install
+        ; starts the agent at the next logon.
         SetErrorLevel 1000
-        DetailPrint "KlaayGuard: the agent did not start; it starts at the next logon"
+        DetailPrint "KlaayGuard: the agent did not start (exit code 1000, see the README)"
         Push $0
         System::Call 'kernel32::AttachConsole(i -1)i.r0'
         ${If} $0 <> 0
           System::Call 'kernel32::GetStdHandle(i -11)i.r0'
-          FileWrite $0 "KlaayGuard: the agent did not start; it starts at the next logon$\n"
+          FileWrite $0 "KlaayGuard: the agent did not start (exit code 1000, see the README)$\n"
         ${EndIf}
         Pop $0
       ${EndIf}
