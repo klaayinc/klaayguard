@@ -323,47 +323,61 @@ fi
 
 # Source text would pass even if the case were rewritten to include `upgrade`.
 # Drive `main` with each argument the package managers really pass, against a
-# live agent, and read what survives.
-echo "==> only a real removal may take the removal path"
-survives_main() { # script-lib, arg..., -> "STOPPED" or "SURVIVES"
+# live agent, and read what became of it.
+outcome_of_main() { # script-lib, arg..., -> "RESTARTED", "SURVIVES", "STOPPED" or "COULD-NOT-START"
   local lib="$1"; shift
   runuser -u "$TEST_USER" -- "$installed" "klaayguard://sign-in" &
   sleep 0.5
-  [ -n "$(agent_pids "$installed")" ] || { echo "COULD-NOT-START"; return; }
+  local before after
+  before="$(agent_pids "$installed" | head -1)"
+  [ -n "$before" ] || { echo "COULD-NOT-START"; return; }
   # Point the sourced copy at the stand-in. The assignment lands in this
   # subshell only, and `main` reads AGENT_BIN when it is called.
   ( . "$lib"; AGENT_BIN="$installed"; set +e; main "$@" ) >/dev/null 2>&1
-  if [ -n "$(agent_pids "$installed")" ]; then echo "SURVIVES"; else echo "STOPPED"; fi
+  after="$(agent_pids "$installed" | head -1)"
+  if [ -z "$after" ]; then
+    echo "STOPPED"
+  elif [ "$after" = "$before" ]; then
+    echo "SURVIVES"
+  else
+    echo "RESTARTED"
+  fi
   pkill -f "^$installed" 2>/dev/null || true
   sleep 0.2
 }
 
-for case_row in "remove:STOPPED" "purge:STOPPED" "0:STOPPED" \
-                "upgrade 1.2.3:SURVIVES" "failed-upgrade 1.2.3:SURVIVES" \
-                "abort-upgrade 1.2.3:SURVIVES" "1:SURVIVES" ":SURVIVES"; do
-  args="${case_row%:*}"
-  want="${case_row##*:}"
-  # shellcheck disable=SC2086
-  got=$(survives_main "$workdir/postrm.lib" $args)
-  if [ "$got" != "$want" ]; then
-    echo "FAIL: postrm main '$args' gave $got, expected $want"
-    exit 1
-  fi
-done
+drive_main() { # script-lib, name, "args:WANT"... -> exits 1 on the first mismatch
+  local lib="$1" name="$2"; shift 2
+  local case_row args want got
+  for case_row in "$@"; do
+    args="${case_row%:*}"
+    want="${case_row##*:}"
+    # shellcheck disable=SC2086
+    got=$(outcome_of_main "$lib" $args)
+    if [ "$got" != "$want" ]; then
+      echo "FAIL: $name main '$args' gave $got, expected $want"
+      exit 1
+    fi
+  done
+}
 
-# The install side has the mirror rule: dpkg calls it to undo a failed
-# operation, and there the binary on disk never changed.
+echo "==> only a real removal may take the removal path"
+drive_main "$workdir/postrm.lib" postrm \
+  "remove:STOPPED" "purge:STOPPED" "0:STOPPED" \
+  "upgrade 1.2.3:SURVIVES" "failed-upgrade 1.2.3:SURVIVES" \
+  "abort-upgrade 1.2.3:SURVIVES" "1:SURVIVES" ":SURVIVES"
+
+# The install side has the mirror rule, and it is driven at every point dpkg
+# and rpm reach, not at one. `configure` and rpm's 1 and 2 follow a new binary
+# and must restart. `triggered`, `abort-remove` and `abort-upgrade` undo a
+# failed operation or answer a trigger, and there the binary on disk never
+# changed: a restart would interrupt a healthy agent for nothing.
 echo "==> and only a real configure may restart the agent"
-runuser -u "$TEST_USER" -- "$installed" "klaayguard://sign-in" &
-sleep 0.5
-abort_pid="$(agent_pids "$installed" | head -1)"
-[ -n "$abort_pid" ] || { echo "FAIL: could not start the agent for the abort case"; exit 1; }
-( . "$workdir/postinst.lib"; AGENT_BIN="$installed"; set +e; main abort-upgrade 1.2.3 ) >/dev/null 2>&1
-if [ "$(agent_pids "$installed" | head -1)" != "$abort_pid" ]; then
-  echo "FAIL: postinst restarted a healthy agent on abort-upgrade"
-  exit 1
-fi
-pkill -f "^$installed" 2>/dev/null || true
+drive_main "$workdir/postinst.lib" postinst \
+  "configure:RESTARTED" "configure 1.2.3:RESTARTED" "1:RESTARTED" "2:RESTARTED" ":RESTARTED" \
+  "triggered /usr/share/applications:SURVIVES" \
+  "abort-remove:SURVIVES" "abort-remove in-favour other 1.2.3:SURVIVES" \
+  "abort-upgrade 1.2.3:SURVIVES"
 
 echo "==> the desktop database refresh must survive in both scripts"
 for f in "$POSTINST" "$POSTRM"; do
