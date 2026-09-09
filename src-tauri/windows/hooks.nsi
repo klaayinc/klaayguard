@@ -32,8 +32,8 @@
   ; left to the finish page, which ticks its box by default; starting the agent
   ; here as well would launch it twice. The named mutex absorbs a double start
   ; only for a production build — lib.rs registers tauri_plugin_single_instance
-  ; behind is_production_target — and two agents is PROD-4603, which this repo
-  ; has shipped once already.
+  ; behind is_production_target. Two agents is PROD-4603, which this repo has
+  ; shipped once already.
   ;
   ; RunAsUser starts the agent as the logged-in user, never as the elevated
   ; installer, so the credential store stays with the person at the machine. It

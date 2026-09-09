@@ -252,8 +252,8 @@ agent at each logon.
 - `src-tauri/windows/hooks.nsi` holds the write and the removal.
 
 A silent or passive install also starts the agent at once, so a machine does
-not wait for its next logon. That start needs a shell window, which an install
-running as SYSTEM does not have.
+not wait for its next logon. That start fails for an install running as SYSTEM
+in session 0, because that caller is elevated and has no shell window.
 
 ### Installer exit code 1000
 
