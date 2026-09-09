@@ -1801,6 +1801,7 @@ fn http_client(overall: Option<Duration>) -> reqwest::Client {
 }
 
 /// What `GET /me` says about a token.
+#[derive(Debug, PartialEq)]
 enum Identity {
     /// The API positively rejects it (401/403).
     Rejected,
@@ -1847,12 +1848,30 @@ async fn fetch_identity(base: &str, token: &str) -> Identity {
 /// is one short line, so cut the rest.
 const LABEL_MAX_CHARS: usize = 48;
 
-/// One line of plain text, safe to hand a menu item. Control characters become
-/// spaces, so a newline cannot paint a second line that reads like another menu
-/// item. Runs of space collapse to one.
+/// Format characters that restyle a line without printing anything. A bidi
+/// control reverses the run after it, so a menu that honours one paints
+/// "Emil<RLO>tuo ngiS" as "Emil Sign out". A zero-width space hides a break.
+/// `is_control` misses them: they are Unicode Cf, not Cc. A joiner (U+200D) is
+/// not on this list; it binds emoji sequences, and a name keeps it.
+fn restyles_the_line(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// One line of plain text, safe to hand a menu item. Control and format
+/// characters become spaces, so a newline cannot paint a second line that
+/// reads like another menu item, and a bidi override cannot reverse one. Runs
+/// of space collapse to one.
 fn one_line(value: &str) -> String {
     value
-        .split(|c: char| c.is_control() || c.is_whitespace())
+        .split(|c: char| c.is_control() || c.is_whitespace() || restyles_the_line(c))
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
@@ -1907,6 +1926,33 @@ fn refresh_identity(state: &Arc<AppState>) {
     });
 }
 
+/// Name a session that `/me` could not name at sign-in. The collection loop
+/// calls this once the token has just proved live, so a blip costs the name
+/// until the next cycle, not until a restart. The first cycle runs the moment
+/// a token arrives. A named session asks nothing.
+fn name_unnamed_holder(state: &Arc<AppState>) {
+    if lock_read(&state.user_label).is_none() {
+        refresh_identity(state);
+    }
+}
+
+/// Ask the API about a token that just arrived and, unless the API rejects
+/// it, take it up as this process's session. A `/me` blip names nobody: the
+/// token is adopted anyway, unnamed, so the previous holder's name never sits
+/// above this session. The collection loop's own 401 handling stays the
+/// backstop for a token that later turns out bad. Returns whether the token
+/// was adopted.
+async fn adopt_unless_rejected(state: &Arc<AppState>, tok: &str) -> bool {
+    let label = match fetch_identity(&state.api_base_url, tok).await {
+        Identity::Rejected => return false,
+        Identity::Accepted(label) => label,
+        Identity::Unknown => None,
+    };
+    state.adopt_session(tok.to_string(), label);
+    state.token_acquired.notify_one();
+    true
+}
+
 /// Store a token the loopback exchange just returned, once the API accepts
 /// it. The token reached this process over `127.0.0.1` and was released only
 /// against a verifier that never left it, so the binding is already settled
@@ -1916,23 +1962,13 @@ fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
     let app = app.clone();
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
-        let identity = fetch_identity(&state.api_base_url, &tok).await;
-        if matches!(identity, Identity::Rejected) {
+        if !adopt_unless_rejected(&state, &tok).await {
             log::warn!("sign_in_token_rejected_by_api length={}", tok.len());
             add_breadcrumb("auth", "sign_in_token_rejected", Level::Warning);
             sentry::capture_message("sign_in_token_rejected", Level::Warning);
             let _ = app.emit("auth:status", json!({ "authenticated": false }));
             return;
         }
-        // A `/me` blip names nobody. Adopt the token anyway; the collection
-        // loop's own 401 handling stays the backstop. Adopt it unnamed, so the
-        // previous holder's name never sits above this session.
-        let label = match identity {
-            Identity::Accepted(label) => label,
-            _ => None,
-        };
-        state.adopt_session(tok.clone(), label);
-        state.token_acquired.notify_one();
 
         // The keyring is the primary store. Without a Secret Service daemon
         // (common on Linux) the agent falls back to a user-only file so the
@@ -2777,6 +2813,8 @@ async fn run_cycle(
         );
         return Ok(());
     }
+
+    name_unnamed_holder(state);
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
     let items = parse_config_items(&cfg_json, std::env::consts::OS);
@@ -5163,6 +5201,32 @@ mod identity_label_tests {
         );
     }
 
+    // A bell is a control character but not whitespace. It must go the same
+    // way a newline goes.
+    #[test]
+    fn flattens_a_name_that_carries_a_control_character() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\u{0007}Kampp",
+            }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // A right-to-left override is not a control character, but a menu that
+    // honours it paints "Emil Sign out". A zero-width space hides a break.
+    // Both leave; the name reads as typed.
+    #[test]
+    fn drops_format_characters_that_restyle_the_line() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\u{202E}tuo ngiS",
+                "last_name": "Zero\u{200B}Width"
+            }))),
+            Some("Emil tuo ngiS Zero Width".to_string())
+        );
+    }
+
     // Emoji, joined sequences and right-to-left text are not control
     // characters. They reach the tray whole.
     #[test]
@@ -5181,9 +5245,14 @@ mod session_label_tests {
     use super::*;
 
     fn state() -> Arc<AppState> {
+        state_at("http://127.0.0.1:0")
+    }
+
+    /// A fresh, signed-out state that talks to the API at `api_base_url`.
+    pub(super) fn state_at(api_base_url: &str) -> Arc<AppState> {
         Arc::new(AppState {
             auth_token: RwLock::new(None),
-            api_base_url: "http://127.0.0.1:0".to_string(),
+            api_base_url: api_base_url.to_string(),
             last_attempt_at: RwLock::new(None),
             last_focus_at: RwLock::new(None),
             device_identity: RwLock::new(None),
@@ -5247,6 +5316,159 @@ mod session_label_tests {
         state.name_holder_of(carried.as_deref(), Some("Alice Andersen".into()));
         assert_eq!(
             *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+    }
+}
+
+// What `/me` says decides whether a token becomes the session, and what the
+// tray calls its holder. Each exit is driven against a loopback API, so the
+// call site that carried the hand-down fault is covered, not only the
+// invariant behind it.
+#[cfg(test)]
+mod identity_fetch_tests {
+    use super::session_label_tests::state_at;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const ALICE: &str = r#"{"data":{"type":"me","id":"1","attributes":{
+        "first_name":"Alice","last_name":"Andersen","email":"alice@example.com"}}}"#;
+
+    /// A loopback API that answers its first request with `status` and `body`,
+    /// then closes. Returns the base URL to point the agent at.
+    async fn api_that_replies(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let received = socket.read(&mut request).await.expect("read request");
+            assert!(received > 0, "an empty request");
+            let reply = format!(
+                "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(reply.as_bytes())
+                .await
+                .expect("write reply");
+            socket.shutdown().await.expect("close");
+        });
+        base
+    }
+
+    /// A base URL nothing listens on: the port was bound, read, and released.
+    async fn api_that_is_down() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        format!("http://{}", listener.local_addr().expect("local addr"))
+    }
+
+    #[tokio::test]
+    async fn a_401_rejects_the_token() {
+        let base = api_that_replies(401, "{}").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_403_rejects_the_token() {
+        let base = api_that_replies(403, "{}").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Rejected);
+    }
+
+    // A server error is not a verdict on the token. A blip must never block a
+    // legitimate sign-in.
+    #[tokio::test]
+    async fn a_server_error_is_no_verdict() {
+        let base = api_that_replies(500, "").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Unknown);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_api_is_no_verdict() {
+        let base = api_that_is_down().await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Unknown);
+    }
+
+    // A 2xx whose body the agent cannot read is a blip, not an acceptance that
+    // names nobody.
+    #[tokio::test]
+    async fn an_unreadable_reply_is_no_verdict() {
+        let base = api_that_replies(200, "<html>").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Unknown);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_token_names_its_holder() {
+        let base = api_that_replies(200, ALICE).await;
+        assert_eq!(
+            fetch_identity(&base, "t").await,
+            Identity::Accepted(Some("Alice Andersen".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_token_becomes_the_named_session() {
+        let state = state_at(&api_that_replies(200, ALICE).await);
+        assert!(adopt_unless_rejected(&state, "alice-token").await);
+        assert_eq!(*lock_read(&state.auth_token), Some("alice-token".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+    }
+
+    // The call site that carried the hand-down fault. Bob signs in on Alice's
+    // Mac and `/me` blips: the token is adopted, and it names nobody.
+    #[tokio::test]
+    async fn a_blip_adopts_the_token_unnamed() {
+        let state = state_at(&api_that_replies(500, "").await);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        assert!(adopt_unless_rejected(&state, "bob-token").await);
+        assert_eq!(*lock_read(&state.auth_token), Some("bob-token".into()));
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    // A rejection is about the new token. The session that is live stays.
+    #[tokio::test]
+    async fn a_rejected_token_leaves_the_live_session_alone() {
+        let state = state_at(&api_that_replies(401, "{}").await);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        assert!(!adopt_unless_rejected(&state, "bob-token").await);
+        assert_eq!(*lock_read(&state.auth_token), Some("alice-token".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+    }
+
+    /// The label once the identity refresh, which runs on its own runtime,
+    /// has written it. `None` when five seconds pass and it has not.
+    async fn label_once_written(state: &Arc<AppState>) -> Option<String> {
+        for _ in 0..250 {
+            if let Some(label) = lock_read(&state.user_label).clone() {
+                return Some(label);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    // The heal for a blip at sign-in. The token proved live at the next
+    // collection, so the session `/me` could not name is named there, not at
+    // the next restart.
+    #[tokio::test]
+    async fn a_live_unnamed_session_is_named_at_the_next_cycle() {
+        let state = state_at(&api_that_replies(200, ALICE).await);
+        state.adopt_session("alice-token".into(), None);
+        name_unnamed_holder(&state);
+        assert_eq!(
+            label_once_written(&state).await,
             Some("Alice Andersen".to_string())
         );
     }
