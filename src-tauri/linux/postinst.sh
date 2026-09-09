@@ -8,10 +8,18 @@ set -e
 
 AGENT_BIN=/usr/bin/KlaayGuard
 
-# The session variables the agent needs to reach the tray. The replacement
-# inherits them from the process it replaces, so it lands in the same session
-# whatever the desktop.
-AGENT_SESSION_VARS="DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_CURRENT_DESKTOP LANG"
+# The session variables the agent needs to reach the tray, and the XDG bases
+# that decide which directories it reads and writes. The replacement inherits
+# them from the process it replaces, so it lands in the same session, on the
+# same files, whatever the desktop.
+#
+# XDG_CONFIG_HOME and XDG_DATA_HOME are here because `dirs` reads them:
+# `config_dir()` resolves the autostart entry and the settings file, and
+# `data_local_dir()` resolves the logs, the single-instance lock and the
+# keychain fallback. `env -i` below drops every variable not on this line, so
+# a user who relocates either base would get a replacement that reads and
+# writes where neither the session nor the agent it replaced looks.
+AGENT_SESSION_VARS="DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_CONFIG_HOME XDG_DATA_HOME LANG"
 
 log() { logger -t klaayguard.postinst "$1" 2>/dev/null || true; echo "$1"; }
 

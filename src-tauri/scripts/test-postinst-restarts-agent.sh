@@ -102,6 +102,23 @@ cc -o "$installed" "$workdir/idle.c" || { echo "FAIL: could not build the fake a
 cp "$installed" "$elsewhere"
 chmod -R 755 "$workdir/bin" "$workdir/dev"
 
+# An agent that ignores SIGTERM, for the two force-kill paths. Both scripts
+# wait 5s for a polite stop before they force one, and nothing else in this
+# file reaches that wait.
+printf '#include <signal.h>\n#include <unistd.h>\nint main(void){signal(SIGTERM,SIG_IGN);for(;;)pause();return 0;}\n' > "$workdir/stubborn.c"
+stubborn="$workdir/stubborn/KlaayGuard"
+mkdir -p "$(dirname "$stubborn")"
+cc -o "$stubborn" "$workdir/stubborn.c" || { echo "FAIL: could not build the stubborn fake agent"; exit 1; }
+chmod -R 755 "$workdir/stubborn"
+
+# The XDG bases the agent resolves its own directories from. `dirs` reads
+# XDG_CONFIG_HOME for the autostart entry and the settings file, and
+# XDG_DATA_HOME for the logs, the single-instance lock and the keychain
+# fallback, so a replacement that loses them works on different files.
+xdg_config="$workdir/xdg/config"
+xdg_data="$workdir/xdg/data"
+mkdir -p "$xdg_config" "$xdg_data"
+
 # Source the functions with the install itself removed. The shipped scripts end
 # with the call to main and carry no flag to suppress it, so the strip is what
 # keeps this test from running a real install.
@@ -140,7 +157,9 @@ wait_for_agent() {
 
 # The argument is the point. The desktop entry is `Exec={{exec}} %U`, so a
 # launch carrying a URL has one, and a command-line match would miss it.
-runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "klaayguard://sign-in" &
+runuser -u "$TEST_USER" -- env DISPLAY=":99" \
+  XDG_CONFIG_HOME="$xdg_config" XDG_DATA_HOME="$xdg_data" \
+  "$installed" "klaayguard://sign-in" &
 sleep 0.6
 installed_pid="$(agent_pids "$installed" | head -1)"
 runuser -u "$TEST_USER" -- "$elsewhere" &
@@ -187,6 +206,18 @@ if ! tr '\0' '\n' < "/proc/$new_pid/environ" | grep -qx "DISPLAY=:99"; then
   echo "FAIL: the new agent lost DISPLAY, so it cannot reach the user's session"
   exit 1
 fi
+
+# The start runs `env -i`, so a variable missing from AGENT_SESSION_VARS is
+# gone from the replacement. These two decide which files the agent works on,
+# not whether it starts, so losing them is silent: the agent runs, and writes
+# its autostart entry and its logs where the session never looks.
+echo "==> and the XDG bases it resolves its own directories from"
+for xdg in "XDG_CONFIG_HOME=$xdg_config" "XDG_DATA_HOME=$xdg_data"; do
+  if ! tr '\0' '\n' < "/proc/$new_pid/environ" | grep -qx "$xdg"; then
+    echo "FAIL: the new agent lost ${xdg%%=*}, so it reads and writes a different directory than the agent it replaced"
+    exit 1
+  fi
+done
 
 echo "==> a build at another path must survive"
 if ! alive "$elsewhere_pid"; then
@@ -296,6 +327,130 @@ if [ "$seats_code" -eq 0 ]; then
   exit 1
 fi
 pkill -f "^$installed" 2>/dev/null || true
+sleep 0.3
+
+# A first install has nothing to restart, and that is not a failure. The
+# branch also carries the line that tells an operator which of the two silent
+# cases happened — no agent, or no permission to see one.
+echo "==> a first install must report that there was nothing to restart"
+none_output=$(restart_running_agents "$workdir/bin/KlaayGuard-none" 2>&1)
+none_code=$?
+if [ "$none_code" -ne 0 ]; then
+  echo "FAIL: a first install with no agent running reported failure, which fails the package"
+  echo "      output was: $none_output"
+  exit 1
+fi
+case "$none_output" in
+  *"nothing to restart"*) ;;
+  *)
+    echo "FAIL: nothing in the log says there was no agent to restart"
+    echo "      output was: $none_output"
+    exit 1
+    ;;
+esac
+
+# `runuser` comes from util-linux and a minimal image can lack it. Without it
+# the script must leave the running agent alone: killing an agent it cannot
+# restart is the one outcome worse than an old build still reporting.
+echo "==> without runuser the running agent must be left alone"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" &
+sleep 0.6
+norunuser_pid="$(agent_pids "$installed" | head -1)"
+[ -n "$norunuser_pid" ] || { echo "FAIL: could not start the agent for the missing-runuser case"; exit 1; }
+
+# A subshell, so the emptied PATH cannot outlive this case.
+norunuser_output=$(PATH=""; restart_running_agents "$installed" 2>&1)
+norunuser_code=$?
+if [ "$norunuser_code" -ne 0 ]; then
+  echo "FAIL: a machine without runuser reported failure, which fails the package"
+  echo "      output was: $norunuser_output"
+  exit 1
+fi
+case "$norunuser_output" in
+  *"no runuser"*) ;;
+  *)
+    echo "FAIL: nothing in the log says runuser is missing, so the operator cannot tell why no restart happened"
+    echo "      output was: $norunuser_output"
+    exit 1
+    ;;
+esac
+if ! alive "$norunuser_pid"; then
+  echo "FAIL: the agent was killed on a machine that cannot restart it"
+  exit 1
+fi
+pkill -f "^$installed" 2>/dev/null || true
+sleep 0.3
+
+# Past the polite stop and the force-kill both. The stand-in ignores SIGTERM,
+# so the 5s wait and the `forcing` line are real. Only SIGKILL is faked: a
+# task wedged in uninterruptible sleep outlives one the same way, and the
+# replacement then starts against a process that still holds the plugin's bus
+# name — the case the ERROR exists to name.
+echo "==> an agent that outlives SIGKILL must be named, not passed over"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$stubborn" &
+sleep 0.6
+[ -n "$(agent_pids "$stubborn")" ] || { echo "FAIL: the stubborn fake agent did not start"; exit 1; }
+
+survivor_output=$(
+  . "$workdir/postinst.lib"
+  set +e
+  kill() { case "$1" in -9) return 0 ;; *) builtin kill "$@" ;; esac; }
+  restart_running_agents "$stubborn" 2>&1
+)
+case "$survivor_output" in
+  *"ignored SIGTERM"*) ;;
+  *)
+    echo "FAIL: an agent that ignores SIGTERM was never forced"
+    echo "      output was: $survivor_output"
+    exit 1
+    ;;
+esac
+case "$survivor_output" in
+  *"survived SIGKILL"*) ;;
+  *)
+    echo "FAIL: an agent that outlived SIGKILL was not reported, so the replacement's lost bus name has no explanation"
+    echo "      output was: $survivor_output"
+    exit 1
+    ;;
+esac
+pkill -9 -f "^$stubborn" 2>/dev/null || true
+sleep 0.3
+
+# The removal side of the same case. A force-kill that does not land must not
+# print the success line: the agent is still collecting on a deleted binary,
+# and the machine's owner believes the package is gone.
+echo "==> a removal that cannot kill the agent must say so"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$stubborn" &
+sleep 0.6
+[ -n "$(agent_pids "$stubborn")" ] || { echo "FAIL: the stubborn fake agent did not start for the removal case"; exit 1; }
+
+unkillable_output=$(
+  . "$workdir/postrm.lib"
+  set +e
+  kill() { case "$1" in -9) return 0 ;; *) builtin kill "$@" ;; esac; }
+  stop_running_agents "$stubborn" 2>&1
+)
+unkillable_code=$?
+if [ "$unkillable_code" -eq 0 ]; then
+  echo "FAIL: the agent survived the removal and stop_running_agents reported success"
+  echo "      output was: $unkillable_output"
+  exit 1
+fi
+case "$unkillable_output" in
+  *"ERROR an agent still runs"*) ;;
+  *)
+    echo "FAIL: nothing in the log says an agent still runs the deleted binary"
+    echo "      output was: $unkillable_output"
+    exit 1
+    ;;
+esac
+case "$unkillable_output" in
+  *"stopped the agent this removal deleted"*)
+    echo "FAIL: the removal claimed success while the agent was still running"
+    exit 1
+    ;;
+esac
+pkill -9 -f "^$stubborn" 2>/dev/null || true
 sleep 0.3
 
 # The failure case above leaves nothing at the installed path, so without a
