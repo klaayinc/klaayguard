@@ -5382,6 +5382,25 @@ mod identity_label_tests {
         }
     }
 
+    // The tag block is not one category. `U+E0001` and `U+E0020`-`U+E007F` are
+    // Format; the other 31 code points in `U+E0000`-`U+E007F` are unassigned.
+    // The category rule therefore keeps an unassigned tag where the old list
+    // dropped it, and that is the wanted answer: an unassigned code point
+    // draws a .notdef box, so it paints something. Keeping it also keeps this
+    // rule fixed. Classing unassigned as invisible would change the tray the
+    // day Unicode assigns one.
+    #[test]
+    fn drops_the_tag_characters_and_keeps_the_unassigned() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "\u{E0001}\u{E0020}" }))),
+            None
+        );
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "\u{E0000}" }))),
+            Some("\u{E0000}".to_string())
+        );
+    }
+
     // The cut counts what the tray draws. A name padded with characters that
     // draw nothing must not lose its visible half to them.
     #[test]
