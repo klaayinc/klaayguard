@@ -394,7 +394,15 @@ sleep 0.6
 survivor_output=$(
   . "$workdir/postinst.lib"
   set +e
-  kill() { case "$1" in -9) return 0 ;; *) builtin kill "$@" ;; esac; }
+  # Swallow the force-kill so the stubborn agent really outlives it. Written
+  # over several lines: bash 5.1, which CI runs, rejects a one-line function
+  # body that carries a case inside this command substitution.
+  kill() {
+    if [ "$1" = "-9" ]; then
+      return 0
+    fi
+    builtin kill "$@"
+  }
   restart_running_agents "$stubborn" 2>&1
 )
 case "$survivor_output" in
@@ -427,7 +435,15 @@ sleep 0.6
 unkillable_output=$(
   . "$workdir/postrm.lib"
   set +e
-  kill() { case "$1" in -9) return 0 ;; *) builtin kill "$@" ;; esac; }
+  # Swallow the force-kill so the stubborn agent really outlives it. Written
+  # over several lines: bash 5.1, which CI runs, rejects a one-line function
+  # body that carries a case inside this command substitution.
+  kill() {
+    if [ "$1" = "-9" ]; then
+      return 0
+    fi
+    builtin kill "$@"
+  }
   stop_running_agents "$stubborn" 2>&1
 )
 unkillable_code=$?
