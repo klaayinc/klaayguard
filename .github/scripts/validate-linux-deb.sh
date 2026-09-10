@@ -82,8 +82,24 @@ if test -f control/postinst; then
   grep -q update-desktop-database control/postinst \
     && pass "postinst refreshes the desktop database" \
     || fail "postinst does not run update-desktop-database"
+  # An upgrade writes the new binary and leaves the old process on the old
+  # inode. Nothing else on Linux restarts this agent before the next login, so
+  # a package without this step ships a machine reporting from the old build.
+  grep -q restart_running_agents control/postinst \
+    && pass "postinst restarts the agent it replaces" \
+    || fail "postinst does not restart the running agent; an upgrade keeps the old build alive until logout"
 else
   fail "control archive has no postinst"
+fi
+
+# Removal has the same hole in reverse: nothing supervises this agent, so an
+# uninstall that only deletes files leaves it collecting from a deleted inode.
+if test -f control/postrm; then
+  grep -q stop_running_agents control/postrm \
+    && pass "postrm stops the agent it deletes" \
+    || fail "postrm does not stop the running agent; apt remove leaves it running on a deleted binary"
+else
+  fail "control archive has no postrm"
 fi
 
 # The package must declare its runtime dependencies.
