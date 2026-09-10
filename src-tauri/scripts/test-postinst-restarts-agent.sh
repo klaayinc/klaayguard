@@ -162,8 +162,8 @@ wait_for_agent() {
   return 1
 }
 
-# The argument is the point. The desktop entry is `Exec={{exec}} %U`, so a
-# launch carrying a URL has one, and a command-line match would miss it.
+# The argument is the point: no argument list can hide the file a process runs,
+# and none has to be guessed.
 runuser -u "$TEST_USER" -- env DISPLAY=":99" \
   XDG_CONFIG_HOME="$xdg_config" XDG_DATA_HOME="$xdg_data" \
   "$installed" "klaayguard://sign-in" &
@@ -276,10 +276,22 @@ if alive "$new_pid"; then
   echo "FAIL: the agent on the replaced binary still runs the previous build"
   exit 1
 fi
-if [ -z "$(wait_for_agent "$installed")" ]; then
+# `agent_pids` matches the deleted inode as well, by design — that is how it
+# finds the process to replace. So a bare "an agent runs" check passes for an
+# agent still on the old file, which is the state this whole change exists to
+# end. Read the replacement's own exe.
+restarted_pids="$(wait_for_agent "$installed")"
+if [ -z "$restarted_pids" ]; then
   echo "FAIL: no agent runs the replaced binary; the machine reports nothing until the next login"
   exit 1
 fi
+for restarted_pid in $restarted_pids; do
+  restarted_exe="$(readlink "/proc/$restarted_pid/exe" 2>/dev/null)"
+  if [ "$restarted_exe" != "$installed" ]; then
+    echo "FAIL: agent $restarted_pid runs '$restarted_exe', not the new binary"
+    exit 1
+  fi
+done
 pkill -f "^$installed" 2>/dev/null || true
 sleep 0.3
 

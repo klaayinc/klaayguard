@@ -44,6 +44,12 @@ proc_env() {
 agent_pids() {
   bin="$1"
   for proc in /proc/[0-9]*; do
+    # `readlink exe` resolves in the target's own mount namespace, so an agent
+    # at this same path inside a container or a chroot reads as ours and
+    # matches. Killing it as root, then starting the host binary for whatever
+    # account its uid maps to, is the worst thing this script could do. Take
+    # only processes whose root is ours.
+    [ "$(readlink "$proc/root" 2>/dev/null)" = "/" ] || continue
     exe=$(readlink "$proc/exe" 2>/dev/null) || continue
     if [ "$exe" = "$bin" ] || [ "$exe" = "$bin (deleted)" ]; then
       echo "${proc#/proc/}"
