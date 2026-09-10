@@ -66,6 +66,13 @@ created_user=no
 created_user_b=no
 cleanup() {
   pkill -f "$workdir" 2>/dev/null || true
+  # The stubborn stand-in built below sets SIG_IGN on SIGTERM, so the polite
+  # kill above never reaches it. The two blocks that use it force-kill it on
+  # the happy path, which leaves this trap as the only cleaner for any early
+  # exit in between. Without this line that stand-in outlives the run and
+  # keeps executing a binary in a directory the next line deletes.
+  sleep 0.2
+  pkill -9 -f "$workdir" 2>/dev/null || true
   # Only accounts this run created. A developer whose machine already has one
   # by either name must not lose it, and its home directory, to a test.
   [ "$created_user" = yes ] && userdel -r "$TEST_USER" 2>/dev/null
@@ -112,9 +119,9 @@ cc -o "$stubborn" "$workdir/stubborn.c" || { echo "FAIL: could not build the stu
 chmod -R 755 "$workdir/stubborn"
 
 # The XDG bases the agent resolves its own directories from. `dirs` reads
-# XDG_CONFIG_HOME for the autostart entry and the settings file, and
-# XDG_DATA_HOME for the logs, the single-instance lock and the keychain
-# fallback, so a replacement that loses them works on different files.
+# XDG_CONFIG_HOME for the autostart entry and for the desktop's screen-lock
+# files, and XDG_DATA_HOME for the logs and the credential fallback file, so a
+# replacement that loses them works on different files.
 xdg_config="$workdir/xdg/config"
 xdg_data="$workdir/xdg/data"
 mkdir -p "$xdg_config" "$xdg_data"

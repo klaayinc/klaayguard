@@ -13,12 +13,19 @@ AGENT_BIN=/usr/bin/KlaayGuard
 # them from the process it replaces, so it lands in the same session, on the
 # same files, whatever the desktop.
 #
-# XDG_CONFIG_HOME and XDG_DATA_HOME are here because `dirs` reads them:
-# `config_dir()` resolves the autostart entry and the settings file, and
-# `data_local_dir()` resolves the logs, the single-instance lock and the
-# keychain fallback. `env -i` below drops every variable not on this line, so
-# a user who relocates either base would get a replacement that reads and
-# writes where neither the session nor the agent it replaced looks.
+# XDG_CONFIG_HOME and XDG_DATA_HOME are here because `dirs` reads them.
+# `config_dir()` resolves the autostart entry the agent writes, and the
+# desktop's own screen-lock files it reads: KDE's kscreenlockerrc and
+# Hyprland's hypridle.conf. `data_local_dir()` resolves the logs and the
+# credential file the agent falls back to where no Secret Service daemon runs.
+#
+# There is no single-instance lock file on Linux. `src/lib.rs` builds that
+# module only for macOS and the test target; Linux keeps the plugin's D-Bus
+# name, which this script does not touch.
+#
+# `env -i` below drops every variable not on this line. A replacement that
+# lost XDG_CONFIG_HOME reads a screen-lock config that is not the one this
+# desktop uses, and reports the wrong posture.
 AGENT_SESSION_VARS="DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR XDG_SESSION_TYPE XDG_CURRENT_DESKTOP XDG_CONFIG_HOME XDG_DATA_HOME LANG"
 
 log() { logger -t klaayguard.postinst "$1" 2>/dev/null || true; echo "$1"; }
