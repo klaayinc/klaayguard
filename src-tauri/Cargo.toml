@@ -64,6 +64,7 @@ sha2 = "0.10"
 base64 = "0.22"
 hmac = "0.12"  # App-scoped hash of the machine id for stable Linux device identity
 getrandom = "0.2"  # CSPRNG for the sign-in state nonce (reuses the version already in-tree)
+unicode-properties = { version = "0.1.4", features = ["general-category"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = "0.26"  # For Unix-specific system calls if needed

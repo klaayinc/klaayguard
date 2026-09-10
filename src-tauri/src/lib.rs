@@ -30,6 +30,7 @@ use std::{
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::ShellExt;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 /// Shared application state for background operations. The locks are
 /// `std::sync`: every critical section is one clone, take, or assignment,
@@ -66,6 +67,11 @@ impl AppState {
 
     /// Drop the session. Every path that stops using a token calls this, so the
     /// tray never names a person the agent no longer reports for.
+    ///
+    /// Keep the token first. `name_holder_of` reads the token, finds it still
+    /// live, and writes the label; clearing the token first is what makes that
+    /// read fail. Reverse these two lines and a `/me` reply in flight writes
+    /// the name back over the sign out.
     fn clear_session(&self) {
         *lock_write(&self.auth_token) = None;
         *lock_write(&self.user_label) = None;
@@ -79,8 +85,11 @@ impl AppState {
     /// writes the name back after the sign out cleared it — a tray that names a
     /// person beside a red dot, which nothing clears until the next sign in.
     ///
-    /// Take the token before the label here and in `clear_session`. The reverse
-    /// order in either one deadlocks the pair.
+    /// The guard is a barrier over one ordering: `clear_session` clears
+    /// `auth_token` before `user_label`. Swap those two lines and the bug is
+    /// back, because neither of them holds its guard past its own semicolon —
+    /// the sign out would clear the label first, this line would write it
+    /// again, and the token would go last.
     fn name_holder_of(&self, token: Option<&str>, label: Option<String>) {
         let held_token = lock_read(&self.auth_token);
         if held_token.as_deref() != token {
@@ -1856,33 +1865,40 @@ async fn fetch_identity(base: &str, token: &str) -> Identity {
 /// is one short line, so cut the rest.
 const LABEL_MAX_CHARS: usize = 48;
 
-/// Format characters that paint no glyph and bind nothing to the character
-/// beside them. A bidi control reverses the run after it, so a menu that
-/// honours one paints "Emil<RLO>tuo ngiS" as "Emil Sign out". A zero-width
-/// space hides a break, and a tag character paints nothing at all.
-/// `is_control` misses every one: they are Unicode Cf, not Cc. The joiners in
-/// `binds_without_painting` are not here; they hold an emoji sequence
-/// together, and a name keeps them.
+/// Characters that paint no glyph and bind nothing to the character beside
+/// them. A bidi control reverses the run after it, so a menu that honours one
+/// paints "Emil<RLO>tuo ngiS" as "Emil Sign out". A zero-width space hides a
+/// break, and a tag character paints nothing at all.
+///
+/// `is_control` misses every one: they are Unicode Cf, not Cc. So ask Unicode
+/// for the category instead of listing the code points. A list of ranges
+/// tracks the bug reports it was written from, and five rounds of this one
+/// each added a range and still missed the next: `U+0890`, `U+08E2`,
+/// `U+110BD`, `U+1BCA0`, `U+1D173` and `U+13430` are all Cf, all typeable into
+/// a name field, and none was in the list.
+///
+/// Cf, not `Default_Ignorable_Code_Point`. The two disagree in both
+/// directions. Default-ignorable misses the prepended concatenation marks
+/// above, and it holds the variation selectors, which shape the character
+/// beside them.
+///
+/// Two additions carry what the category cannot:
+///
+/// - Four fillers people actually use for a blank display name. They are Lo,
+///   letters, so no rule about format characters reaches them.
+/// - `U+2800` BRAILLE PATTERN BLANK, So, the empty cell of a braille font.
+///
+/// The joiners in `binds_without_painting` leave again. `U+200D` is Cf, and
+/// cutting a name on it breaks a family emoji into four people.
 fn paints_nothing(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'
-            | '\u{200E}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{206A}'..='\u{206F}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{2800}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{115F}'..='\u{1160}'
-            | '\u{3164}'
-            | '\u{FFA0}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
+    if binds_without_painting(c) {
+        return false;
+    }
+    c.general_category() == GeneralCategory::Format
+        || matches!(
+            c,
+            '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}'
+        )
 }
 
 /// Characters that paint no glyph of their own but shape the one beside them.
@@ -5348,6 +5364,15 @@ mod identity_label_tests {
             "\u{115F}\u{1160}",
             "\u{FFA0}",
             "\u{2800}",
+            // Format characters far from the ones a list is written from. Each
+            // is Cf, each types into a name field, and each drew a blank row
+            // while the rule was a list of ranges.
+            "\u{0890}\u{0891}",
+            "\u{08E2}",
+            "\u{110BD}\u{110CD}",
+            "\u{1BCA0}\u{1BCA3}",
+            "\u{1D173}\u{1D17A}",
+            "\u{13430}\u{1343F}",
         ] {
             assert_eq!(
                 identity_label(&me(json!({ "first_name": name }))),
