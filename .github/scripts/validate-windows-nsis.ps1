@@ -150,7 +150,17 @@ if (-not $installDir) {
 }
 if ($installDir -and (Test-Path "$installDir\KlaayGuard.exe")) {
     Pass "installed at $installDir"
-    $fv = (Get-Item "$installDir\KlaayGuard.exe").VersionInfo.FileVersion
+    # The file appears before its version resource is readable: the installer is
+    # still writing when the path first answers Test-Path, and Get-Item then
+    # returns an empty FileVersion. Read until a value arrives, so an empty one
+    # means the version-sync step really did not run.
+    $fv = ""
+    $deadline = (Get-Date).AddSeconds(30)
+    do {
+        $fv = (Get-Item "$installDir\KlaayGuard.exe").VersionInfo.FileVersion
+        if (-not [string]::IsNullOrWhiteSpace($fv)) { break }
+        Start-Sleep -Seconds 1
+    } until ((Get-Date) -gt $deadline)
     if ($fv -like "$Version*") { Pass "FileVersion $fv" }
     else { Fail "FileVersion is '$fv', expected '$Version'. The version-sync step did not run." }
     if (Test-Path "$installDir\klaayguard-osqueryi.exe") { Pass "sidecar installed beside the app" }
@@ -218,9 +228,22 @@ if (-not $afterUpdate) {
 # Stop the agent first. The uninstaller does it too, but an explicit stop keeps
 # the file checks below about uninstall, not about a timing race. A stop that
 # fails would otherwise resurface as a confusing file-still-there failure.
-foreach ($p in @(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue)) {
-    try { $p.Kill(); $p.WaitForExit(10000) | Out-Null }
-    catch { Fail "could not stop the agent (pid $($p.Id)) before the uninstall: $($_.Exception.Message)" }
+#
+# One pass is not enough. `/R` above leaves both starters in play, so a process
+# can appear after the list is taken, and Windows refuses to delete a running
+# .exe — the survivor resurfaces 90 seconds later as "KlaayGuard.exe survived
+# uninstall", which names the wrong thing. Sweep until nothing is left.
+$stopDeadline = (Get-Date).AddSeconds(60)
+do {
+    $alive = @(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue)
+    foreach ($p in $alive) {
+        try { $p.Kill(); $p.WaitForExit(10000) | Out-Null }
+        catch { Fail "could not stop the agent (pid $($p.Id)) before the uninstall: $($_.Exception.Message)" }
+    }
+    Start-Sleep -Seconds 1
+} until (@(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue).Count -eq 0 -or (Get-Date) -gt $stopDeadline)
+if (@(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue).Count -gt 0) {
+    Fail "an agent still runs after 60s of stopping it; the uninstall checks below cannot mean anything"
 }
 # The NSIS uninstaller copies itself to a temp directory and returns at once,
 # so poll for the cleanup instead of trusting the exit code.
