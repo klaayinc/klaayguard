@@ -180,7 +180,8 @@ elsewhere_pid="$(agent_pids "$elsewhere" | head -1)"
 echo "==> agent_pids must find an agent started with an argument"
 
 echo "==> restart_running_agents must stop the old agent"
-restart_running_agents "$installed"
+restart_output=$(restart_running_agents "$installed" 2>&1)
+echo "$restart_output"
 
 if alive "$installed_pid"; then
   echo "FAIL: the old agent still runs, so the new binary never starts until logout"
@@ -231,6 +232,56 @@ if ! alive "$elsewhere_pid"; then
   echo "FAIL: restart_running_agents killed a build outside the installed path"
   exit 1
 fi
+
+# The polite signal must do the stopping. A kill that never reaches the agent
+# leaves the wait below it to run its full 5s and force-kill a process that
+# would have exited on request. Every upgrade then stalls, a healthy agent dies
+# hard, and the log blames it for a stall the script caused. The log line is
+# the assertion rather than the elapsed time, because a loaded machine can be
+# slow and still be correct.
+echo "==> and the healthy agent must have stopped on the polite signal, not been forced"
+case "$restart_output" in
+  *"ignored SIGTERM"*)
+    echo "FAIL: an agent that honours SIGTERM was force-killed, so the polite kill never reached it"
+    echo "      output was: $restart_output"
+    exit 1
+    ;;
+esac
+
+# The case this whole change exists for. dpkg unpacks the new binary beside the
+# old one and renames it over the target, which leaves the running process on an
+# inode that has no name: /proc/<pid>/exe then reads "<path> (deleted)". A match
+# on the plain path alone misses it, and the upgrade leaves the previous build
+# reporting posture until the next login.
+echo "==> an agent whose binary the install replaced must still be found"
+cc -o "$installed.dpkg-new" "$workdir/idle.c" \
+  || { echo "FAIL: could not build the replacement binary"; exit 1; }
+mv "$installed.dpkg-new" "$installed"
+chmod 755 "$installed"
+if [ "$(readlink "/proc/$new_pid/exe")" != "$installed (deleted)" ]; then
+  echo "FAIL: replacing the binary left /proc/$new_pid/exe reading $(readlink "/proc/$new_pid/exe"); this case proves nothing"
+  exit 1
+fi
+case " $(agent_pids "$installed" | tr '\n' ' ') " in
+  *" $new_pid "*) ;;
+  *)
+    echo "FAIL: agent_pids missed the agent on the replaced binary, so an upgrade leaves the previous build reporting"
+    exit 1
+    ;;
+esac
+
+echo "==> and must be restarted onto the new binary"
+restart_running_agents "$installed"
+if alive "$new_pid"; then
+  echo "FAIL: the agent on the replaced binary still runs the previous build"
+  exit 1
+fi
+if [ -z "$(wait_for_agent "$installed")" ]; then
+  echo "FAIL: no agent runs the replaced binary; the machine reports nothing until the next login"
+  exit 1
+fi
+pkill -f "^$installed" 2>/dev/null || true
+sleep 0.3
 
 # The start runs behind `setsid ... &` with its output discarded, so neither the
 # exit code nor the error reaches this script. A PAM denial would therefore kill
@@ -482,7 +533,17 @@ sleep 0.3
 echo "==> a removal must stop the agent it deletes"
 runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "klaayguard://sign-in" &
 sleep 0.6
-[ -n "$(agent_pids "$installed")" ] || { echo "FAIL: could not start the agent for the removal case"; exit 1; }
+removed_pid="$(agent_pids "$installed" | head -1)"
+[ -n "$removed_pid" ] || { echo "FAIL: could not start the agent for the removal case"; exit 1; }
+
+# A real removal deletes the file and runs this script after, so the process it
+# must stop sits on an inode with no name. The postremove carries its own copy
+# of the deleted-inode match, and this is the only place that drives it.
+rm "$installed"
+if [ "$(readlink "/proc/$removed_pid/exe")" != "$installed (deleted)" ]; then
+  echo "FAIL: deleting the binary left /proc/$removed_pid/exe reading $(readlink "/proc/$removed_pid/exe"); this case proves nothing"
+  exit 1
+fi
 (
   # A fresh shell: the postremove defines its own agent_pids, and sourcing both
   # in one shell would hide which copy the assertions exercise.
@@ -498,6 +559,10 @@ if ! alive "$elsewhere_pid"; then
   echo "FAIL: the removal killed a build outside the removed path"
   exit 1
 fi
+
+# Put the stand-in back. The tables below start an agent from this path.
+cp "$elsewhere" "$installed"
+chmod 755 "$installed"
 
 # Source text would pass even if the case were rewritten to include `upgrade`.
 # Drive `main` with each argument the package managers really pass, against a
