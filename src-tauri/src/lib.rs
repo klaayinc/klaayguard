@@ -1848,20 +1848,38 @@ async fn fetch_identity(base: &str, token: &str) -> Identity {
 /// is one short line, so cut the rest.
 const LABEL_MAX_CHARS: usize = 48;
 
-/// Format characters that restyle a line without printing anything. A bidi
-/// control reverses the run after it, so a menu that honours one paints
-/// "Emil<RLO>tuo ngiS" as "Emil Sign out". A zero-width space hides a break.
-/// `is_control` misses them: they are Unicode Cf, not Cc. A joiner (U+200D) is
-/// not on this list; it binds emoji sequences, and a name keeps it.
-fn restyles_the_line(c: char) -> bool {
+/// Format characters that paint no glyph and bind nothing to the character
+/// beside them. A bidi control reverses the run after it, so a menu that
+/// honours one paints "Emil<RLO>tuo ngiS" as "Emil Sign out". A zero-width
+/// space hides a break, and a tag character paints nothing at all.
+/// `is_control` misses every one: they are Unicode Cf, not Cc. The joiners in
+/// `binds_without_painting` are not here; they hold an emoji sequence
+/// together, and a name keeps them.
+fn paints_nothing(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
             | '\u{200B}'
             | '\u{200E}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
+            | '\u{206A}'..='\u{206F}'
             | '\u{2066}'..='\u{2069}'
             | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// Characters that paint no glyph of their own but shape the one beside them.
+/// A word keeps them, because cutting one apart breaks a family emoji into
+/// four people. A value made only of them still paints nothing, so it names
+/// nobody.
+fn binds_without_painting(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
@@ -1871,7 +1889,7 @@ fn restyles_the_line(c: char) -> bool {
 /// of space collapse to one.
 fn one_line(value: &str) -> String {
     value
-        .split(|c: char| c.is_control() || c.is_whitespace() || restyles_the_line(c))
+        .split(|c: char| c.is_control() || c.is_whitespace() || paints_nothing(c))
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
@@ -1898,7 +1916,7 @@ fn identity_label(me: &Value) -> Option<String> {
             .get(key)
             .and_then(|value| value.as_str())
             .map(one_line)
-            .filter(|value| !value.is_empty())
+            .filter(|value| value.chars().any(|c| !binds_without_painting(c)))
     };
     let name = [field("first_name"), field("last_name")]
         .into_iter()
@@ -5294,6 +5312,38 @@ mod identity_label_tests {
         assert_eq!(
             identity_label(&me(json!({ "first_name": "👨‍👩‍👧‍👦", "last_name": "أحمد" }))),
             Some("👨‍👩‍👧‍👦 أحمد".to_string())
+        );
+    }
+
+    // A name of characters that paint nothing is a blank line with bytes in it.
+    // The menu must drop it the same way it drops an empty string.
+    #[test]
+    fn names_nobody_when_the_name_paints_nothing() {
+        for name in [
+            "\u{E0041}\u{E0042}",
+            "\u{00AD}\u{00AD}",
+            "\u{180E}",
+            "\u{206A}\u{206B}",
+            "\u{FFF9}",
+            "\u{200D}",
+        ] {
+            assert_eq!(
+                identity_label(&me(json!({ "first_name": name }))),
+                None,
+                "{name:?} paints nothing, so it names nobody"
+            );
+        }
+    }
+
+    // The cut counts what the tray draws. A name padded with characters that
+    // draw nothing must not lose its visible half to them.
+    #[test]
+    fn spends_the_label_budget_on_visible_characters() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": format!("Emil{}", "\u{E0041}".repeat(80))
+            }))),
+            Some("Emil".to_string())
         );
     }
 }
