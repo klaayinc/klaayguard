@@ -64,6 +64,7 @@ sha2 = "0.10"
 base64 = "0.22"
 hmac = "0.12"  # App-scoped hash of the machine id for stable Linux device identity
 getrandom = "0.2"  # CSPRNG for the sign-in state nonce (reuses the version already in-tree)
+unicode-properties = { version = "0.1.4", features = ["general-category"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = "0.26"  # For Unix-specific system calls if needed
@@ -85,6 +86,13 @@ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Network
 
 #[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 # Updater disabled
+
+[dev-dependencies]
+# `tauri::test::mock_app` builds an AppHandle with no window server behind it,
+# so the paths that end a session — an invalidated token, a tray sign out —
+# run in a unit test instead of only in a running app. The feature reaches the
+# test profile alone: `cargo build` never enables it.
+tauri = { version = "2", features = ["test"] }
 
 # Enable all Tauri features needed for each platform
 [features]

@@ -49,9 +49,9 @@ running:
   in the operating system credential store: macOS Keychain, Windows
   Credential Manager, or the Linux secret service.
 - **Menu bar icon.** The agent shows a small icon in the menu bar. A green dot
-  means signed in. A red dot means signed out. The menu shows the time until
-  the next report and a link to the Klaay Employee Hub. There is no other user
-  interface and no window.
+  means signed in. A red dot means signed out. The menu names the signed-in
+  person, and shows the time until the next report and a link to the Klaay
+  Employee Hub. There is no other user interface and no window.
 - **Sign-in reminders.** If the agent is signed out, it opens the login page
   and shows one system notification. It repeats this at most once per minute.
 - **Automatic updates.** Every 6 hours, the agent asks Klaay for a new

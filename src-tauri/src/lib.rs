@@ -30,6 +30,7 @@ use std::{
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::ShellExt;
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 /// Shared application state for background operations. The locks are
 /// `std::sync`: every critical section is one clone, take, or assignment,
@@ -43,6 +44,9 @@ pub struct AppState {
     pub last_focus_at: RwLock<Option<Instant>>, // debounce for the sign-in nudge
     /// The device identity, resolved once per process (persisted by keychain).
     pub device_identity: RwLock<Option<String>>,
+    /// The signed-in person's name, or their email when the account carries no
+    /// name. `None` until the API names them, and again after a sign out.
+    pub user_label: RwLock<Option<String>>,
     /// Woken when a token is (re)acquired, so a collection runs at once.
     pub token_acquired: tokio::sync::Notify,
     /// Linux: whether the tray icon built, and whether a StatusNotifier host
@@ -50,6 +54,49 @@ pub struct AppState {
     /// them to decide whether it must open the fallback window instead.
     pub tray_built: std::sync::atomic::AtomicBool,
     pub tray_watcher_present: std::sync::atomic::AtomicBool,
+}
+
+impl AppState {
+    /// Take up a session: the token, and the name of whoever holds it. The two
+    /// always move together. A token the API could not name carries no name, so
+    /// the last holder never sits above this one.
+    fn adopt_session(&self, token: String, label: Option<String>) {
+        *lock_write(&self.auth_token) = Some(token);
+        *lock_write(&self.user_label) = label;
+    }
+
+    /// Drop the session. Every path that stops using a token calls this, so the
+    /// tray never names a person the agent no longer reports for.
+    ///
+    /// Keep the token first. `name_holder_of` reads the token, finds it still
+    /// live, and writes the label; clearing the token first is what makes that
+    /// read fail. Reverse these two lines and a `/me` reply in flight writes
+    /// the name back over the sign out.
+    fn clear_session(&self) {
+        *lock_write(&self.auth_token) = None;
+        *lock_write(&self.user_label) = None;
+    }
+
+    /// Name the holder of `token`, but only while that token is still the live
+    /// one. A `/me` reply that lands after a sign out describes a session that
+    /// has ended, and must not name it.
+    /// Hold the token guard across the label write. Dropping it first leaves a
+    /// gap in which `clear_session` runs to completion, and this line then
+    /// writes the name back after the sign out cleared it — a tray that names a
+    /// person beside a red dot, which nothing clears until the next sign in.
+    ///
+    /// The guard is a barrier over one ordering: `clear_session` clears
+    /// `auth_token` before `user_label`. Swap those two lines and the bug is
+    /// back, because neither of them holds its guard past its own semicolon —
+    /// the sign out would clear the label first, this line would write it
+    /// again, and the token would go last.
+    fn name_holder_of(&self, token: Option<&str>, label: Option<String>) {
+        let held_token = lock_read(&self.auth_token);
+        if held_token.as_deref() != token {
+            return;
+        }
+        *lock_write(&self.user_label) = label;
+    }
 }
 
 /// Read an AppState lock. A poisoned lock cannot hold a half-updated value
@@ -1770,24 +1817,187 @@ fn http_client(overall: Option<Duration>) -> reqwest::Client {
     builder.build().expect("reqwest client")
 }
 
-/// Returns true only when the API positively rejects the token (401/403). Network
-/// errors, timeouts, or any other status return false ("not definitely invalid") so a
-/// transient blip never blocks a legitimate sign-in — the collection loop's own 401
-/// handling stays the backstop for a token that later turns out bad.
-async fn token_definitely_invalid(base: &str, token: &str) -> bool {
+/// What `GET /me` says about a token.
+#[derive(Debug, PartialEq)]
+enum Identity {
+    /// The API positively rejects it (401/403).
+    Rejected,
+    /// The API accepts it. The label names the holder, when the reply carries
+    /// a name or an email to name them by.
+    Accepted(Option<String>),
+    /// Nothing conclusive: a network error, a timeout, any other status. The
+    /// callers read this as "not definitely invalid". A transient blip must
+    /// never block a legitimate sign-in. The collection loop's own 401 handling
+    /// stays the backstop for a token that later turns out bad.
+    Unknown,
+}
+
+/// Ask the API who holds this token. One request answers both questions the
+/// agent has: whether the token still works, and whose name to put in the tray.
+async fn fetch_identity(base: &str, token: &str) -> Identity {
     let client = http_client(Some(Duration::from_secs(10)));
-    match client
+    let response = match client
         .get(format!("{}/me", base))
         .bearer_auth(token)
         .send()
         .await
     {
-        Ok(resp) => matches!(
-            resp.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ),
-        Err(_) => false,
+        Ok(response) => response,
+        Err(_) => return Identity::Unknown,
+    };
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Identity::Rejected;
     }
+    if !response.status().is_success() {
+        return Identity::Unknown;
+    }
+    match response.json::<Value>().await {
+        Ok(body) => Identity::Accepted(identity_label(&body)),
+        Err(_) => Identity::Unknown,
+    }
+}
+
+/// How many characters of a name the tray shows. Nobody validates the length of
+/// a name: the person types it, and the API stores what they type. A menu item
+/// is one short line, so cut the rest.
+const LABEL_MAX_CHARS: usize = 48;
+
+/// Characters that paint no glyph and bind nothing to the character beside
+/// them. A bidi control reverses the run after it, so a menu that honours one
+/// paints "Emil<RLO>tuo ngiS" as "Emil Sign out". A zero-width space hides a
+/// break, and a tag character paints nothing at all.
+///
+/// `is_control` misses every one: they are Unicode Cf, not Cc. So ask Unicode
+/// for the category instead of listing the code points. A list of ranges
+/// tracks the bug reports it was written from, and five rounds of this one
+/// each added a range and still missed the next: `U+0890`, `U+08E2`,
+/// `U+110BD`, `U+1BCA0`, `U+1D173` and `U+13430` are all Cf, all typeable into
+/// a name field, and none was in the list.
+///
+/// Cf, not `Default_Ignorable_Code_Point`. The two disagree in both
+/// directions. Default-ignorable misses the prepended concatenation marks
+/// above, and it holds the variation selectors, which shape the character
+/// beside them.
+///
+/// Two additions carry what the category cannot:
+///
+/// - Four fillers people actually use for a blank display name. They are Lo,
+///   letters, so no rule about format characters reaches them.
+/// - `U+2800` BRAILLE PATTERN BLANK, So, the empty cell of a braille font.
+///
+/// The joiners in `binds_without_painting` leave again. `U+200D` is Cf, and
+/// cutting a name on it breaks a family emoji into four people.
+fn paints_nothing(c: char) -> bool {
+    if binds_without_painting(c) {
+        return false;
+    }
+    c.general_category() == GeneralCategory::Format
+        || matches!(
+            c,
+            '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' | '\u{2800}'
+        )
+}
+
+/// Characters that paint no glyph of their own but shape the one beside them.
+/// A word keeps them, because cutting one apart breaks a family emoji into
+/// four people. A value made only of them still paints nothing, so it names
+/// nobody.
+fn binds_without_painting(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// One line of plain text, safe to hand a menu item. Control and format
+/// characters become spaces, so a newline cannot paint a second line that
+/// reads like another menu item, and a bidi override cannot reverse one. Runs
+/// of space collapse to one.
+fn one_line(value: &str) -> String {
+    value
+        .split(|c: char| c.is_control() || c.is_whitespace() || paints_nothing(c))
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Cut a label to `LABEL_MAX_CHARS`, always on a character boundary, and mark
+/// the cut. `chars` counts code points, so a name of emoji never splits one.
+fn cap_label(label: String) -> String {
+    if label.chars().count() <= LABEL_MAX_CHARS {
+        return label;
+    }
+    let kept: String = label.chars().take(LABEL_MAX_CHARS - 1).collect();
+    format!("{kept}…")
+}
+
+/// The line the tray shows for the signed-in person, read from a `/me` reply:
+/// their name, or their email when the account carries no name. `None` when the
+/// reply carries neither, so the menu drops the line instead of showing a blank
+/// one.
+fn identity_label(me: &Value) -> Option<String> {
+    let attributes = me.pointer("/data/attributes")?;
+    let field = |key: &str| {
+        attributes
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(one_line)
+            .filter(|value| value.chars().any(|c| !binds_without_painting(c)))
+    };
+    let name = [field("first_name"), field("last_name")]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !name.is_empty() {
+        return Some(cap_label(name));
+    }
+    field("email").map(cap_label)
+}
+
+/// Name the holder of the token this process already has. The sign-in path
+/// learns the name from the check it already makes; a start with a stored token
+/// makes no such check, so it asks here.
+fn refresh_identity(state: &Arc<AppState>) {
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(token) = lock_read(&state.auth_token).clone() else {
+            return;
+        };
+        if let Identity::Accepted(label) = fetch_identity(&state.api_base_url, &token).await {
+            state.name_holder_of(Some(&token), label);
+        }
+    });
+}
+
+/// Name a session that `/me` could not name at sign-in. The collection loop
+/// calls this once the token has just proved live, so a blip costs the name
+/// until the next cycle, not until a restart. The first cycle runs the moment
+/// a token arrives. A named session asks nothing.
+fn name_unnamed_holder(state: &Arc<AppState>) {
+    if lock_read(&state.user_label).is_none() {
+        refresh_identity(state);
+    }
+}
+
+/// Ask the API about a token that just arrived and, unless the API rejects
+/// it, take it up as this process's session. A `/me` blip names nobody: the
+/// token is adopted anyway, unnamed, so the previous holder's name never sits
+/// above this session. The collection loop's own 401 handling stays the
+/// backstop for a token that later turns out bad. Returns whether the token
+/// was adopted.
+async fn adopt_unless_rejected(state: &Arc<AppState>, tok: &str) -> bool {
+    let label = match fetch_identity(&state.api_base_url, tok).await {
+        Identity::Rejected => return false,
+        Identity::Accepted(label) => label,
+        Identity::Unknown => None,
+    };
+    state.adopt_session(tok.to_string(), label);
+    state.token_acquired.notify_one();
+    true
 }
 
 /// Store a token the loopback exchange just returned, once the API accepts
@@ -1795,19 +2005,17 @@ async fn token_definitely_invalid(base: &str, token: &str) -> bool {
 /// against a verifier that never left it, so the binding is already settled
 /// by the time this runs; the API check stays because a token this agent
 /// cannot use is worth catching here rather than at the next collection.
-fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
+fn adopt_token<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>, tok: String) {
     let app = app.clone();
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
-        if token_definitely_invalid(&state.api_base_url, &tok).await {
+        if !adopt_unless_rejected(&state, &tok).await {
             log::warn!("sign_in_token_rejected_by_api length={}", tok.len());
             add_breadcrumb("auth", "sign_in_token_rejected", Level::Warning);
             sentry::capture_message("sign_in_token_rejected", Level::Warning);
             let _ = app.emit("auth:status", json!({ "authenticated": false }));
             return;
         }
-        *lock_write(&state.auth_token) = Some(tok.clone());
-        state.token_acquired.notify_one();
 
         // The keyring is the primary store. Without a Secret Service daemon
         // (common on Linux) the agent falls back to a user-only file so the
@@ -1847,8 +2055,8 @@ fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
 
 /// Executes a batch of SQL statements against osquery and returns results keyed by logical id
 /// The vector contains pairs of (logical_id, sql_to_execute).
-async fn execute_sql_batch(
-    app: tauri::AppHandle,
+async fn execute_sql_batch<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     queries: Vec<(String, String)>,
 ) -> Result<HashMap<String, Value>, String> {
     let mut all_results: HashMap<String, Value> = HashMap::new();
@@ -1921,12 +2129,14 @@ async fn execute_sql_batch(
     Ok(all_results)
 }
 
-fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) {
+fn invalidate_auth<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     // Stop using the token, but DON'T delete it from the keychain: a keychain write
     // pops a second OS prompt on unsigned builds, and the stale token is harmless
     // (the next sign-in overwrites it, or shadows it through the file store, which
     // `keychain::load_token` reads first). Just clear it in memory and prompt re-login.
-    *lock_write(&state.auth_token) = None;
+    // The name goes with it: the dot turns red, so the tray must stop naming
+    // anybody.
+    state.clear_session();
     log::warn!("Authentication invalidated; notifying user to re-sign-in");
     notify_signin_needed(app, state);
     let _ = app.emit("auth:invalidated", ());
@@ -1958,7 +2168,7 @@ fn collection_interval_seconds() -> u64 {
 /// notification. The debounce keeps repeated 401s from spamming browser tabs. A
 /// no-op once a token is present: a cold start by deep link signs the user in
 /// while this is being decided.
-fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
+fn notify_signin_needed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     if lock_read(&state.auth_token).is_some() {
         return;
     }
@@ -1993,7 +2203,11 @@ fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
 }
 
 /// Emit a collection error to UI listeners, the log, and Sentry (error level).
-fn emit_error(app: &tauri::AppHandle, event: &str, payload: serde_json::Value) {
+fn emit_error<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    event: &str,
+    payload: serde_json::Value,
+) {
     let _ = app.emit(event, payload.clone());
     let serialized = payload.to_string();
     log::error!("error_event:{}, payload:{}", event, serialized);
@@ -2278,7 +2492,7 @@ fn fallback_window_needed(tray_built: bool, watcher_present: bool, signed_in: bo
 /// Open the sign-in fallback window, once. A second call while the window
 /// lives is a no-op, so startup and a later sign-out cannot stack windows.
 #[cfg(target_os = "linux")]
-fn open_fallback_window(app: &tauri::AppHandle) {
+fn open_fallback_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if app.get_webview_window("fallback").is_some() {
         return;
     }
@@ -2464,8 +2678,8 @@ fn ensure_autostart_entry() -> Result<(), String> {
 /// in the keychain; every later run returns the stored value, cached in memory
 /// after the first successful read. `system_info` is the osquery rows this
 /// cycle already collected, so the serial query is not run a second time.
-async fn get_device_identity_internal(
-    app: &tauri::AppHandle,
+async fn get_device_identity_internal<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &Arc<AppState>,
     system_info: Option<&Value>,
 ) -> Result<String, String> {
@@ -2594,8 +2808,8 @@ async fn send_with_retry(
     }
 }
 
-async fn run_cycle(
-    app: &tauri::AppHandle,
+async fn run_cycle<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &Arc<AppState>,
     client: &reqwest::Client,
 ) -> Result<(), String> {
@@ -2650,6 +2864,8 @@ async fn run_cycle(
         );
         return Ok(());
     }
+
+    name_unnamed_holder(state);
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
     let items = parse_config_items(&cfg_json, std::env::consts::OS);
@@ -3328,7 +3544,10 @@ fn notify_sign_in_link(url: &str, on_clipboard: bool) {
 /// on Linux open a new browser window (a focusing compositor raises it); the
 /// sign-in flow adds the clipboard copy and notification itself (see
 /// `open_sign_in`). Off Linux, use the opener plugin unchanged.
-fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+fn open_external_url<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         if open_url_in_browser(url).is_ok() {
@@ -3342,7 +3561,7 @@ fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
 }
 
 /// Open a Klaay Frontend path in the default browser.
-fn open_frontend(app: &tauri::AppHandle, path: &str) {
+fn open_frontend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, path: &str) {
     let url = format!("{}{}", get_frontend_url(), path);
     log::info!("opening url={}", url);
     if let Err(e) = open_external_url(app, &url) {
@@ -3361,7 +3580,7 @@ fn open_frontend(app: &tauri::AppHandle, path: &str) {
 /// released only against a verifier this process never sends anywhere. So
 /// the token binds to this machine, and there is no nonce for anyone to get
 /// wrong.
-fn open_sign_in(app: &tauri::AppHandle) {
+fn open_sign_in<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let state = app.state::<Arc<AppState>>().inner().clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -3425,6 +3644,11 @@ fn open_sign_in(app: &tauri::AppHandle) {
 /// Handles + assets for keeping the tray in sync with auth state.
 struct TrayMenu {
     item: tauri::menu::MenuItem<tauri::Wry>,
+    /// The line naming the signed-in person, added at the top of the menu only
+    /// once the API has named them.
+    user: tauri::menu::MenuItem<tauri::Wry>,
+    /// Whether `user` is in the menu right now.
+    user_shown: std::sync::atomic::AtomicBool,
     /// The "Sign out" item, added to the menu only while signed in.
     sign_out: tauri::menu::MenuItem<tauri::Wry>,
     /// The tray menu itself, so "Sign out" can be added and removed at runtime.
@@ -3469,7 +3693,7 @@ fn fmt_countdown(secs: i64) -> String {
 
 /// Refresh the single tray item: a clickable "Sign in" when signed out, or a greyed
 /// countdown to the next fetch when signed in. Menu mutation runs on the main thread.
-fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
+fn refresh_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     let (text, enabled) = if lock_read(&state.auth_token).is_some() {
         let interval = collection_interval_seconds() as i64;
         let remaining = match *lock_read(&state.last_attempt_at) {
@@ -3481,11 +3705,29 @@ fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
         ("Sign in".to_string(), true)
     };
     let signed_in = !enabled;
+    let user_label = lock_read(&state.user_label).clone();
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(tray) = handle.try_state::<TrayMenu>() {
             let _ = tray.item.set_text(&text);
             let _ = tray.item.set_enabled(enabled);
+            // The name line sits above every other item, and joins the menu
+            // only once the API has named the person. Its text is set before
+            // it joins, so the line never shows up blank.
+            let show_user = user_label.is_some();
+            if let Some(label) = &user_label {
+                let _ = tray.user.set_text(label);
+            }
+            let was_shown = tray
+                .user_shown
+                .swap(show_user, std::sync::atomic::Ordering::Relaxed);
+            if was_shown != show_user {
+                let _ = if show_user {
+                    tray.menu.prepend(&tray.user)
+                } else {
+                    tray.menu.remove(&tray.user)
+                };
+            }
             // On an auth-state flip, swap the status dot and add or remove the
             // "Sign out" item. "Sign out" shows only while signed in, appended
             // last so it sits at the very bottom of the menu.
@@ -3520,9 +3762,21 @@ const SIGN_OUT_LABEL: &str = "Sign out";
 /// item. An explicit sign out deletes the stored token, unlike an invalidated
 /// one, so the next start does not reuse it; if the store refuses, the next
 /// start WILL sign back in, so that is reported, not shrugged off.
-fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
-    *lock_write(&state.auth_token) = None;
-    match keychain::delete_token() {
+fn sign_out<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
+    sign_out_with(app, state, keychain::delete_token);
+}
+
+/// The whole of a sign out, with the credential store's delete passed in. Only
+/// the store is an argument: a test drives every other step, and must not
+/// delete the entry the agent installed on the same machine signs in with.
+fn sign_out_with<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &Arc<AppState>,
+    delete_stored_token: fn() -> Result<(), String>,
+) {
+    // Nobody is signed in, so the menu names nobody. refresh_tray drops the line.
+    state.clear_session();
+    match delete_stored_token() {
         Ok(()) => log::info!("user signed out from the tray"),
         Err(e) => {
             log::error!("sign out incomplete: {}", e);
@@ -4483,6 +4737,7 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
     };
     if authed {
         log::info!("KlaayGuard started - authenticated, collecting in background");
+        refresh_identity(&state);
     } else {
         log::info!("KlaayGuard started - sign-in required");
     }
@@ -4659,6 +4914,7 @@ pub fn run() {
         last_attempt_at: RwLock::new(None),
         last_focus_at: RwLock::new(None),
         device_identity: RwLock::new(None),
+        user_label: RwLock::new(None),
         token_acquired: tokio::sync::Notify::new(),
         // Assume a usable tray until setup proves otherwise, so a nudge that
         // somehow runs first does not open a window on a healthy desktop.
@@ -4742,10 +4998,18 @@ pub fn run() {
             // Tray menu first, in a neutral state, so the icon is up before any
             // credential-store, D-Bus, or network work; the tray clock flips it
             // to the real state within a second. A live auth/countdown item, an
-            // Employee Hub link, and a version line. "Sign out" is appended
-            // below the version only while signed in (see refresh_tray), so it
-            // sits at the very bottom, away from the other clickable items. No
-            // quit.
+            // Employee Hub link, and a version line. The name line is prepended
+            // above them once the API names the person, and "Sign out" is
+            // appended below the version only while signed in (see
+            // refresh_tray), so it sits at the very bottom, away from the other
+            // clickable items. No quit.
+            let user_i = tauri::menu::MenuItem::with_id(
+                app,
+                "user",
+                "",
+                false,
+                None::<&str>,
+            )?;
             let item = tauri::menu::MenuItem::with_id(
                 app,
                 "auth_action",
@@ -4808,6 +5072,8 @@ pub fn run() {
                     .build(app)?;
                 app.manage(TrayMenu {
                     item: item.clone(),
+                    user: user_i.clone(),
+                    user_shown: std::sync::atomic::AtomicBool::new(false),
                     sign_out: sign_out_i.clone(),
                     menu: menu.clone(),
                     tray,
@@ -4896,6 +5162,575 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod identity_label_tests {
+    use super::*;
+
+    fn me(attributes: Value) -> Value {
+        json!({ "data": { "type": "me", "id": "1", "attributes": attributes } })
+    }
+
+    #[test]
+    fn names_the_person_by_first_and_last_name() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil",
+                "last_name": "Kampp",
+                "email": "rdk@klaay.com"
+            }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // A directory that carries only one of the two names still names the
+    // person. The email is the fallback, not the second choice.
+    #[test]
+    fn one_name_is_a_name() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil",
+                "last_name": null,
+                "email": "rdk@klaay.com"
+            }))),
+            Some("Emil".to_string())
+        );
+    }
+
+    // The API serves the account-scoped directory name and falls back to the
+    // self-managed column, so blank and padded values both reach this code.
+    #[test]
+    fn falls_back_to_the_email_when_no_name_is_given() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "  ",
+                "last_name": "",
+                "email": "rdk@klaay.com"
+            }))),
+            Some("rdk@klaay.com".to_string())
+        );
+    }
+
+    #[test]
+    fn trims_the_names_it_shows() {
+        assert_eq!(
+            identity_label(&me(
+                json!({ "first_name": " Emil ", "last_name": " Kampp " })
+            )),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // Nothing to show beats a blank line in the menu.
+    #[test]
+    fn names_nobody_when_the_reply_carries_neither() {
+        assert_eq!(identity_label(&me(json!({}))), None);
+        assert_eq!(identity_label(&json!({})), None);
+    }
+
+    // Nobody validates the length of a name: the person types it, and the API
+    // stores what they type. A menu item cannot show a paragraph.
+    #[test]
+    fn caps_a_name_that_would_swamp_the_menu() {
+        let label = identity_label(&me(json!({ "first_name": "a".repeat(801) })))
+            .expect("a name that long still names somebody");
+        assert!(
+            label.chars().count() <= LABEL_MAX_CHARS,
+            "kept {} characters",
+            label.chars().count()
+        );
+        assert!(label.ends_with('…'));
+    }
+
+    // Cut on a character boundary, never inside one. A name of 801 emoji must
+    // not panic and must not split a code point.
+    #[test]
+    fn caps_a_long_name_without_splitting_a_character() {
+        let label =
+            identity_label(&me(json!({ "first_name": "😀".repeat(801) }))).expect("emoji name");
+        assert!(label.chars().count() <= LABEL_MAX_CHARS);
+        assert!(label.starts_with('😀'));
+    }
+
+    // A newline inside a name paints a second line in the tray that reads like
+    // another menu item. Flatten it.
+    #[test]
+    fn flattens_a_name_that_carries_a_newline() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\nSign out",
+                "last_name": "Kampp"
+            }))),
+            Some("Emil Sign out Kampp".to_string())
+        );
+    }
+
+    // A bell is a control character but not whitespace. It must go the same
+    // way a newline goes.
+    #[test]
+    fn flattens_a_name_that_carries_a_control_character() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\u{0007}Kampp",
+            }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // A right-to-left override is not a control character, but a menu that
+    // honours it paints "Emil Sign out". A zero-width space hides a break.
+    // Both leave; the name reads as typed.
+    #[test]
+    fn drops_format_characters_that_restyle_the_line() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\u{202E}tuo ngiS",
+                "last_name": "Zero\u{200B}Width"
+            }))),
+            Some("Emil tuo ngiS Zero Width".to_string())
+        );
+    }
+
+    // The Arabic letter mark sets the direction of the run that follows it,
+    // and prints nothing. A name that carries one still reads as typed.
+    #[test]
+    fn drops_the_arabic_letter_mark() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "Emil\u{061C}Kampp" }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // The left-to-right and right-to-left marks do the same for a single run.
+    #[test]
+    fn drops_the_direction_marks() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\u{200E}Kampp",
+                "last_name": "Right\u{200F}Left"
+            }))),
+            Some("Emil Kampp Right Left".to_string())
+        );
+    }
+
+    // An isolate wraps a run and re-orders it against its neighbours. The pair
+    // prints nothing, so a name keeps only what the person typed.
+    #[test]
+    fn drops_the_bidi_isolates() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "Emil\u{2066}X\u{2069}Kampp" }))),
+            Some("Emil X Kampp".to_string())
+        );
+    }
+
+    // A byte order mark inside a name is a zero-width no-break space. It hides
+    // a break the same way a zero-width space does.
+    #[test]
+    fn drops_a_byte_order_mark() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "Emil\u{FEFF}Kampp" }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // Emoji, joined sequences and right-to-left text are not control
+    // characters. They reach the tray whole.
+    #[test]
+    fn passes_emoji_and_right_to_left_text_through() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "👨‍👩‍👧‍👦", "last_name": "أحمد" }))),
+            Some("👨‍👩‍👧‍👦 أحمد".to_string())
+        );
+    }
+
+    // A name of characters that paint nothing is a blank line with bytes in it.
+    // The menu must drop it the same way it drops an empty string.
+    #[test]
+    fn names_nobody_when_the_name_paints_nothing() {
+        for name in [
+            "\u{E0041}\u{E0042}",
+            "\u{00AD}\u{00AD}",
+            "\u{180E}",
+            "\u{206A}\u{206B}",
+            "\u{FFF9}",
+            "\u{200D}",
+            // No format-character rule reaches these. The word joiner and the
+            // invisible operators are Cf like the ones above; HANGUL FILLER is
+            // a letter, and it is what people actually use for a blank display
+            // name; BRAILLE PATTERN BLANK is a symbol that paints nothing.
+            "\u{2060}\u{2064}",
+            "\u{3164}",
+            "\u{115F}\u{1160}",
+            "\u{FFA0}",
+            "\u{2800}",
+            // Format characters far from the ones a list is written from. Each
+            // is Cf, each types into a name field, and each drew a blank row
+            // while the rule was a list of ranges.
+            "\u{0890}\u{0891}",
+            "\u{08E2}",
+            "\u{110BD}\u{110CD}",
+            "\u{1BCA0}\u{1BCA3}",
+            "\u{1D173}\u{1D17A}",
+            "\u{13430}\u{1343F}",
+        ] {
+            assert_eq!(
+                identity_label(&me(json!({ "first_name": name }))),
+                None,
+                "{name:?} paints nothing, so it names nobody"
+            );
+        }
+    }
+
+    // The cut counts what the tray draws. A name padded with characters that
+    // draw nothing must not lose its visible half to them.
+    #[test]
+    fn spends_the_label_budget_on_visible_characters() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": format!("Emil{}", "\u{E0041}".repeat(80))
+            }))),
+            Some("Emil".to_string())
+        );
+    }
+}
+
+// The name and the token move together. A name that outlives the session that
+// earned it names the wrong person, and the tray has no way to know.
+#[cfg(test)]
+mod session_label_tests {
+    use super::*;
+
+    fn state() -> Arc<AppState> {
+        state_at("http://127.0.0.1:0")
+    }
+
+    /// A fresh, signed-out state that talks to the API at `api_base_url`.
+    pub(super) fn state_at(api_base_url: &str) -> Arc<AppState> {
+        Arc::new(AppState {
+            auth_token: RwLock::new(None),
+            api_base_url: api_base_url.to_string(),
+            last_attempt_at: RwLock::new(None),
+            last_focus_at: RwLock::new(None),
+            device_identity: RwLock::new(None),
+            user_label: RwLock::new(None),
+            token_acquired: tokio::sync::Notify::new(),
+            tray_built: std::sync::atomic::AtomicBool::new(true),
+            tray_watcher_present: std::sync::atomic::AtomicBool::new(true),
+        })
+    }
+
+    #[test]
+    fn adopting_a_session_names_its_holder() {
+        let state = state();
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+        assert_eq!(*lock_read(&state.auth_token), Some("alice-token".into()));
+    }
+
+    // A 401 from the collection loop drops the token. The dot turns red, so the
+    // name must go too.
+    #[test]
+    fn clearing_a_session_drops_the_name_with_the_token() {
+        let state = state();
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        state.clear_session();
+        assert_eq!(*lock_read(&state.user_label), None);
+        assert_eq!(*lock_read(&state.auth_token), None);
+    }
+
+    // The hand-down case. Bob signs in on Alice's Mac and `/me` fails, so the
+    // API names nobody. The tray must not keep naming Alice.
+    #[test]
+    fn an_unnamed_session_never_inherits_the_last_name() {
+        let state = state();
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        state.adopt_session("bob-token".into(), None);
+        assert_eq!(*lock_read(&state.user_label), None);
+        assert_eq!(*lock_read(&state.auth_token), Some("bob-token".into()));
+    }
+
+    // A sign out during the `/me` round trip wins. The reply that lands after
+    // it describes a session that no longer exists.
+    #[test]
+    fn a_late_reply_never_names_a_session_that_ended() {
+        let state = state();
+        state.adopt_session("alice-token".into(), None);
+        let carried = lock_read(&state.auth_token).clone();
+        state.clear_session();
+        state.name_holder_of(carried.as_deref(), Some("Alice Andersen".into()));
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    #[test]
+    fn a_reply_for_the_live_session_names_it() {
+        let state = state();
+        state.adopt_session("alice-token".into(), None);
+        let carried = lock_read(&state.auth_token).clone();
+        state.name_holder_of(carried.as_deref(), Some("Alice Andersen".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+    }
+}
+
+// What `/me` says decides whether a token becomes the session, and what the
+// tray calls its holder. Each exit is driven against a loopback API, so the
+// call site that carried the hand-down fault is covered, not only the
+// invariant behind it.
+#[cfg(test)]
+mod identity_fetch_tests {
+    use super::session_label_tests::state_at;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    pub(super) const ALICE: &str = r#"{"data":{"type":"me","id":"1","attributes":{
+        "first_name":"Alice","last_name":"Andersen","email":"alice@example.com"}}}"#;
+
+    /// A loopback API that answers its first request with `status` and `body`,
+    /// then closes. Returns the base URL to point the agent at.
+    async fn api_that_replies(status: u16, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0u8; 4096];
+            let received = socket.read(&mut request).await.expect("read request");
+            assert!(received > 0, "an empty request");
+            let reply = format!(
+                "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(reply.as_bytes())
+                .await
+                .expect("write reply");
+            socket.shutdown().await.expect("close");
+        });
+        base
+    }
+
+    /// A base URL nothing listens on: the port was bound, read, and released.
+    async fn api_that_is_down() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        format!("http://{}", listener.local_addr().expect("local addr"))
+    }
+
+    #[tokio::test]
+    async fn a_401_rejects_the_token() {
+        let base = api_that_replies(401, "{}").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Rejected);
+    }
+
+    #[tokio::test]
+    async fn a_403_rejects_the_token() {
+        let base = api_that_replies(403, "{}").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Rejected);
+    }
+
+    // A server error is not a verdict on the token. A blip must never block a
+    // legitimate sign-in.
+    #[tokio::test]
+    async fn a_server_error_is_no_verdict() {
+        let base = api_that_replies(500, "").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Unknown);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_api_is_no_verdict() {
+        let base = api_that_is_down().await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Unknown);
+    }
+
+    // A 2xx whose body the agent cannot read is a blip, not an acceptance that
+    // names nobody.
+    #[tokio::test]
+    async fn an_unreadable_reply_is_no_verdict() {
+        let base = api_that_replies(200, "<html>").await;
+        assert_eq!(fetch_identity(&base, "t").await, Identity::Unknown);
+    }
+
+    #[tokio::test]
+    async fn an_accepted_token_names_its_holder() {
+        let base = api_that_replies(200, ALICE).await;
+        assert_eq!(
+            fetch_identity(&base, "t").await,
+            Identity::Accepted(Some("Alice Andersen".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_accepted_token_becomes_the_named_session() {
+        let state = state_at(&api_that_replies(200, ALICE).await);
+        assert!(adopt_unless_rejected(&state, "alice-token").await);
+        assert_eq!(*lock_read(&state.auth_token), Some("alice-token".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+    }
+
+    // The call site that carried the hand-down fault. Bob signs in on Alice's
+    // Mac and `/me` blips: the token is adopted, and it names nobody.
+    #[tokio::test]
+    async fn a_blip_adopts_the_token_unnamed() {
+        let state = state_at(&api_that_replies(500, "").await);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        assert!(adopt_unless_rejected(&state, "bob-token").await);
+        assert_eq!(*lock_read(&state.auth_token), Some("bob-token".into()));
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    // A rejection is about the new token. The session that is live stays.
+    #[tokio::test]
+    async fn a_rejected_token_leaves_the_live_session_alone() {
+        let state = state_at(&api_that_replies(401, "{}").await);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        assert!(!adopt_unless_rejected(&state, "bob-token").await);
+        assert_eq!(*lock_read(&state.auth_token), Some("alice-token".into()));
+        assert_eq!(
+            *lock_read(&state.user_label),
+            Some("Alice Andersen".to_string())
+        );
+    }
+
+    /// The label once the identity refresh, which runs on its own runtime,
+    /// has written it. `None` when five seconds pass and it has not.
+    pub(super) async fn label_once_written(state: &Arc<AppState>) -> Option<String> {
+        for _ in 0..250 {
+            if let Some(label) = lock_read(&state.user_label).clone() {
+                return Some(label);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    // The heal for a blip at sign-in. The token proved live at the next
+    // collection, so the session `/me` could not name is named there, not at
+    // the next restart.
+    #[tokio::test]
+    async fn a_live_unnamed_session_is_named_at_the_next_cycle() {
+        let state = state_at(&api_that_replies(200, ALICE).await);
+        state.adopt_session("alice-token".into(), None);
+        name_unnamed_holder(&state);
+        assert_eq!(
+            label_once_written(&state).await,
+            Some("Alice Andersen".to_string())
+        );
+    }
+}
+
+// Three one-line calls end or heal a session: an invalidated token, a tray
+// sign out, and the name a live token earns back at the next collection. Each
+// runs here through the real function, on an app handle that `tauri::test`
+// builds without a window server.
+#[cfg(test)]
+mod session_end_tests {
+    use super::identity_fetch_tests::{label_once_written, ALICE};
+    use super::session_label_tests::state_at;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A base URL for a state that makes no request of its own.
+    const NO_API: &str = "http://127.0.0.1:0";
+
+    // A 401 from the collection loop stops the agent using the token. The dot
+    // turns red, so the tray must stop naming anybody.
+    #[test]
+    fn an_invalidated_token_takes_the_name_with_it() {
+        let app = tauri::test::mock_app();
+        let state = state_at(NO_API);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        // The sign-in nudge is debounced. A nudge one moment old keeps this
+        // test from opening a browser.
+        *lock_write(&state.last_focus_at) = Some(Instant::now());
+
+        invalidate_auth(app.handle(), &state);
+
+        assert_eq!(*lock_read(&state.auth_token), None);
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    // A tray sign out ends the session the person asked to end. The credential
+    // store's delete is the one step a test stands in for: deleting the real
+    // entry would sign this machine's installed agent out.
+    #[test]
+    fn a_sign_out_takes_the_name_with_the_token() {
+        let app = tauri::test::mock_app();
+        let state = state_at(NO_API);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+
+        sign_out_with(app.handle(), &state, || Ok(()));
+
+        assert_eq!(*lock_read(&state.auth_token), None);
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    /// A loopback API that answers every request by path until the test ends:
+    /// an empty collection config, and a `/me` that names Alice.
+    async fn api_that_answers_by_path() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let received = socket.read(&mut request).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&request[..received]).into_owned();
+                    let body = if head.contains("GET /me ") {
+                        ALICE
+                    } else {
+                        "{}"
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 200 Reply\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    // The heal for a `/me` blip at sign-in. The config reply proves the token
+    // live, so the cycle names the session the sign-in could not name, instead
+    // of leaving the tray unnamed until the next restart.
+    #[tokio::test]
+    async fn a_cycle_names_the_session_the_sign_in_could_not() {
+        let app = tauri::test::mock_app();
+        let state = state_at(&api_that_answers_by_path().await);
+        state.adopt_session("alice-token".into(), None);
+
+        run_cycle(
+            app.handle(),
+            &state,
+            &http_client(Some(Duration::from_secs(10))),
+        )
+        .await
+        .expect("a cycle against the loopback API");
+
+        assert_eq!(
+            label_once_written(&state).await,
+            Some("Alice Andersen".to_string())
+        );
+    }
 }
 
 #[cfg(test)]
