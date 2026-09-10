@@ -97,6 +97,10 @@ if ! id "$TEST_USER_B" >/dev/null 2>&1; then
   created_user_b=yes
 fi
 REAL_RUNUSER="$(command -v runuser)"
+# The postinstall starts the replacement with systemd-run where systemd runs and with
+# runuser everywhere else. A fake for one path only leaves the other untested, and the
+# blocks below all mean "the start failed", not "runuser failed".
+REAL_SYSTEMD_RUN="$(command -v systemd-run || true)"
 chmod 755 "$workdir"
 
 # A real ELF binary, not a shell script: the rule under test reads
@@ -303,6 +307,8 @@ echo "==> a restart that fails must be reported, not logged as done"
 mkdir -p "$workdir/fakebin"
 printf '#!/bin/sh\nexit 1\n' > "$workdir/fakebin/runuser"
 chmod +x "$workdir/fakebin/runuser"
+printf '#!/bin/sh\nexit 1\n' > "$workdir/fakebin/systemd-run"
+chmod +x "$workdir/fakebin/systemd-run"
 runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "klaayguard://sign-in" &
 sleep 0.6
 doomed_pid="$(agent_pids "$installed" | head -1)"
@@ -342,6 +348,13 @@ cat > "$workdir/fakebin/runuser" <<FAKE
 exec "$REAL_RUNUSER" "\$@"
 FAKE
 chmod +x "$workdir/fakebin/runuser"
+cat > "$workdir/fakebin/systemd-run" <<FAKE
+#!/bin/sh
+# Same denial on the systemd path, where the user arrives as --uid=.
+for a in "\$@"; do [ "\$a" = "--uid=$TEST_USER_B" ] && exit 1; done
+exec "$REAL_SYSTEMD_RUN" "\$@"
+FAKE
+chmod +x "$workdir/fakebin/systemd-run"
 
 runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" &
 runuser -u "$TEST_USER_B" -- env DISPLAY=":98" "$installed" &
@@ -382,6 +395,16 @@ echo "\$n" > "$workdir/runuser.count"
 exec "$REAL_RUNUSER" "\$@"
 FAKE
 chmod +x "$workdir/fakebin/runuser"
+cat > "$workdir/fakebin/systemd-run" <<FAKE
+#!/bin/sh
+# Same one-then-fail on the systemd path, sharing the counter.
+n=\$(cat "$workdir/runuser.count" 2>/dev/null || echo 0)
+n=\$((n + 1))
+echo "\$n" > "$workdir/runuser.count"
+[ "\$n" -ge 2 ] && exit 1
+exec "$REAL_SYSTEMD_RUN" "\$@"
+FAKE
+chmod +x "$workdir/fakebin/systemd-run"
 
 runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" &
 runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" seat-two &
