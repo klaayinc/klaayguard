@@ -112,6 +112,13 @@ jobs:
         working-directory: src-tauri
         run: bash scripts/test-install-agent-seam.sh
 
+      # Proves the .pkg postinstall stops the agent it replaces. Without that
+      # step the old process keeps running, `open -a` reactivates it, and the
+      # Mac reports from the old build until the user logs out.
+      - name: postinstall stops the old agent
+        working-directory: src-tauri
+        run: bash scripts/test-postinstall-stops-agent.sh
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -243,6 +250,9 @@ jobs:
   bundle-windows:
     name: Bundle check (Windows NSIS)
     runs-on: windows-latest
+    # The check drives a real installer. A dialog nobody can answer would
+    # otherwise hold the runner for the six-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

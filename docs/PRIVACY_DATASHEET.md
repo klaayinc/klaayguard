@@ -1,7 +1,7 @@
 # KlaayGuard Privacy Datasheet
 
 **Product:** KlaayGuard desktop agent
-**Version of this document:** 2026-08-28
+**Version of this document:** 2026-09-04
 **Audience:** Customer security and privacy reviewers (incl. BYOD deployments)
 
 ## 1. Overview
@@ -77,14 +77,14 @@ The agent runs as the logged-in user, not as root/Administrator, and therefore c
 
 - The agent keeps **no local database**. Collected rows go directly from osquery to the Klaay API and are not buffered on disk.
 - The only data stored locally are:
-  - the authentication token, in the operating system's secure credential store;
+  - the authentication token, in the operating system's secure credential store. On a Linux desktop that runs no secret service, the agent stores the token in a file readable only by the user, and tells the user so;
   - the agent's own log files, in the user's log directory.
 
 ## 6. Network Transmission
 
 - All transmission is over **HTTPS** to `https://api.klaay.com`.
-- Authentication is via short-lived JWT bearer tokens; the agent's auth token is stored in the operating system's secure credential store (macOS Keychain, Windows Credential Manager, or libsecret on Linux).
-- Sign-in is performed once at first launch in the user's default browser at `https://app.klaay.com`; the browser returns a token to the agent through the `klaayguard://` URL scheme.
+- Authentication uses expiring JWT bearer tokens; the agent's token is valid for three months and is stored in the operating system's secure credential store (macOS Keychain, Windows Credential Manager, or the Linux secret service).
+- Sign-in happens once, at first start, in the user's default browser at `https://app.klaay.com`. The browser hands the agent a one-time code on a local loopback address (`127.0.0.1`); the agent exchanges that code, plus a secret that never leaves the agent process, for its token. The token never travels through a URL, and no other program on the machine can spend the code (RFC 8252, RFC 7636).
 - The agent uploads collected rows in batches every **15 minutes**. There is no real-time streaming and no peer-to-peer or third-party data flow.
 - Optional crash and error telemetry is sent to Sentry only if a Sentry DSN is configured by Klaay; this stream contains application stack traces and version metadata, not collected osquery data.
 
@@ -105,7 +105,7 @@ Customers preferring stricter isolation may install KlaayGuard inside a dedicate
 
 The Klaay server defines the query set. The agent enforces one hard limit that the server cannot cross: it runs a query only if it is a single read-only statement. You can read this gate in the agent source at [`src-tauri/src/lib.rs`](../src-tauri/src/lib.rs) (`is_read_only_query`). The gate accepts one plain `SELECT` or one `WITH … ` common table expression, and refuses stacked statements and every non-query verb.
 
-The query set in §2 is the current production set. Klaay customers under NDA may request a code-level walkthrough or attestation. Because the agent is open source, anyone can verify the safety gate directly.
+The query set in §2 is the current production set. Klaay customers under NDA may request a code-level walkthrough or attestation.
 
 ## 10. Contact
 

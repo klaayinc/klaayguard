@@ -251,6 +251,29 @@ agent at each logon.
 - The uninstaller removes the value.
 - `src-tauri/windows/hooks.nsi` holds the write and the removal.
 
+A silent or passive install also starts the agent at once, so a machine does
+not wait for its next logon. That start fails for an install running as SYSTEM
+in session 0, because that caller is elevated and has no shell window.
+
+### Installer exit code 1000
+
+The installer exits `1000` when the files landed but the agent did not start.
+What happens next depends on the account that ran the installer. The package
+is per-user, so the files and the `Run` value land in that account's profile.
+
+- A user-context install starts the agent at that person's next logon.
+- A device-context install runs as SYSTEM. The files and the `Run` value sit
+  in the SYSTEM profile, and no agent ever runs for the person. Device context
+  is not supported. Deploy in user context.
+
+Map `1000` in your deployment tool, because the tool decides pass or fail from
+this number and does not know it. In Microsoft Intune, set the install
+behavior to **User** and add `1000` to the app's return-code table as
+**Success**. Do not add it as **Retry**: the cause does not clear on its own,
+so every retry returns `1000` again. Windows Installer codes do not apply
+here. This is an NSIS package: `0` is success, `1` is a user abort and `2` is
+an abort by the script.
+
 ## Automatic updates
 
 The agent checks `GET /klaayguard/updates/latest` at startup and then every
