@@ -1958,7 +1958,7 @@ async fn adopt_unless_rejected(state: &Arc<AppState>, tok: &str) -> bool {
 /// against a verifier that never left it, so the binding is already settled
 /// by the time this runs; the API check stays because a token this agent
 /// cannot use is worth catching here rather than at the next collection.
-fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
+fn adopt_token<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>, tok: String) {
     let app = app.clone();
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
@@ -2008,8 +2008,8 @@ fn adopt_token(app: &tauri::AppHandle, state: &Arc<AppState>, tok: String) {
 
 /// Executes a batch of SQL statements against osquery and returns results keyed by logical id
 /// The vector contains pairs of (logical_id, sql_to_execute).
-async fn execute_sql_batch(
-    app: tauri::AppHandle,
+async fn execute_sql_batch<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     queries: Vec<(String, String)>,
 ) -> Result<HashMap<String, Value>, String> {
     let mut all_results: HashMap<String, Value> = HashMap::new();
@@ -2082,7 +2082,7 @@ async fn execute_sql_batch(
     Ok(all_results)
 }
 
-fn invalidate_auth(app: &tauri::AppHandle, state: &Arc<AppState>) {
+fn invalidate_auth<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     // Stop using the token, but DON'T delete it from the keychain: a keychain write
     // pops a second OS prompt on unsigned builds, and the stale token is harmless
     // (the next sign-in overwrites it, or shadows it through the file store, which
@@ -2121,7 +2121,7 @@ fn collection_interval_seconds() -> u64 {
 /// notification. The debounce keeps repeated 401s from spamming browser tabs. A
 /// no-op once a token is present: a cold start by deep link signs the user in
 /// while this is being decided.
-fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
+fn notify_signin_needed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     if lock_read(&state.auth_token).is_some() {
         return;
     }
@@ -2156,7 +2156,11 @@ fn notify_signin_needed(app: &tauri::AppHandle, state: &Arc<AppState>) {
 }
 
 /// Emit a collection error to UI listeners, the log, and Sentry (error level).
-fn emit_error(app: &tauri::AppHandle, event: &str, payload: serde_json::Value) {
+fn emit_error<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    event: &str,
+    payload: serde_json::Value,
+) {
     let _ = app.emit(event, payload.clone());
     let serialized = payload.to_string();
     log::error!("error_event:{}, payload:{}", event, serialized);
@@ -2441,7 +2445,7 @@ fn fallback_window_needed(tray_built: bool, watcher_present: bool, signed_in: bo
 /// Open the sign-in fallback window, once. A second call while the window
 /// lives is a no-op, so startup and a later sign-out cannot stack windows.
 #[cfg(target_os = "linux")]
-fn open_fallback_window(app: &tauri::AppHandle) {
+fn open_fallback_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if app.get_webview_window("fallback").is_some() {
         return;
     }
@@ -2627,8 +2631,8 @@ fn ensure_autostart_entry() -> Result<(), String> {
 /// in the keychain; every later run returns the stored value, cached in memory
 /// after the first successful read. `system_info` is the osquery rows this
 /// cycle already collected, so the serial query is not run a second time.
-async fn get_device_identity_internal(
-    app: &tauri::AppHandle,
+async fn get_device_identity_internal<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &Arc<AppState>,
     system_info: Option<&Value>,
 ) -> Result<String, String> {
@@ -2757,8 +2761,8 @@ async fn send_with_retry(
     }
 }
 
-async fn run_cycle(
-    app: &tauri::AppHandle,
+async fn run_cycle<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &Arc<AppState>,
     client: &reqwest::Client,
 ) -> Result<(), String> {
@@ -3493,7 +3497,10 @@ fn notify_sign_in_link(url: &str, on_clipboard: bool) {
 /// on Linux open a new browser window (a focusing compositor raises it); the
 /// sign-in flow adds the clipboard copy and notification itself (see
 /// `open_sign_in`). Off Linux, use the opener plugin unchanged.
-fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
+fn open_external_url<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         if open_url_in_browser(url).is_ok() {
@@ -3507,7 +3514,7 @@ fn open_external_url(app: &tauri::AppHandle, url: &str) -> Result<(), String> {
 }
 
 /// Open a Klaay Frontend path in the default browser.
-fn open_frontend(app: &tauri::AppHandle, path: &str) {
+fn open_frontend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, path: &str) {
     let url = format!("{}{}", get_frontend_url(), path);
     log::info!("opening url={}", url);
     if let Err(e) = open_external_url(app, &url) {
@@ -3526,7 +3533,7 @@ fn open_frontend(app: &tauri::AppHandle, path: &str) {
 /// released only against a verifier this process never sends anywhere. So
 /// the token binds to this machine, and there is no nonce for anyone to get
 /// wrong.
-fn open_sign_in(app: &tauri::AppHandle) {
+fn open_sign_in<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let state = app.state::<Arc<AppState>>().inner().clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -3639,7 +3646,7 @@ fn fmt_countdown(secs: i64) -> String {
 
 /// Refresh the single tray item: a clickable "Sign in" when signed out, or a greyed
 /// countdown to the next fetch when signed in. Menu mutation runs on the main thread.
-fn refresh_tray(app: &tauri::AppHandle, state: &Arc<AppState>) {
+fn refresh_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     let (text, enabled) = if lock_read(&state.auth_token).is_some() {
         let interval = collection_interval_seconds() as i64;
         let remaining = match *lock_read(&state.last_attempt_at) {
@@ -3708,10 +3715,21 @@ const SIGN_OUT_LABEL: &str = "Sign out";
 /// item. An explicit sign out deletes the stored token, unlike an invalidated
 /// one, so the next start does not reuse it; if the store refuses, the next
 /// start WILL sign back in, so that is reported, not shrugged off.
-fn sign_out(app: &tauri::AppHandle, state: &Arc<AppState>) {
+fn sign_out<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
+    sign_out_with(app, state, keychain::delete_token);
+}
+
+/// The whole of a sign out, with the credential store's delete passed in. Only
+/// the store is an argument: a test drives every other step, and must not
+/// delete the entry the agent installed on the same machine signs in with.
+fn sign_out_with<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &Arc<AppState>,
+    delete_stored_token: fn() -> Result<(), String>,
+) {
     // Nobody is signed in, so the menu names nobody. refresh_tray drops the line.
     state.clear_session();
-    match keychain::delete_token() {
+    match delete_stored_token() {
         Ok(()) => log::info!("user signed out from the tray"),
         Err(e) => {
             log::error!("sign out incomplete: {}", e);
@@ -5227,6 +5245,48 @@ mod identity_label_tests {
         );
     }
 
+    // The Arabic letter mark sets the direction of the run that follows it,
+    // and prints nothing. A name that carries one still reads as typed.
+    #[test]
+    fn drops_the_arabic_letter_mark() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "Emil\u{061C}Kampp" }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
+    // The left-to-right and right-to-left marks do the same for a single run.
+    #[test]
+    fn drops_the_direction_marks() {
+        assert_eq!(
+            identity_label(&me(json!({
+                "first_name": "Emil\u{200E}Kampp",
+                "last_name": "Right\u{200F}Left"
+            }))),
+            Some("Emil Kampp Right Left".to_string())
+        );
+    }
+
+    // An isolate wraps a run and re-orders it against its neighbours. The pair
+    // prints nothing, so a name keeps only what the person typed.
+    #[test]
+    fn drops_the_bidi_isolates() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "Emil\u{2066}X\u{2069}Kampp" }))),
+            Some("Emil X Kampp".to_string())
+        );
+    }
+
+    // A byte order mark inside a name is a zero-width no-break space. It hides
+    // a break the same way a zero-width space does.
+    #[test]
+    fn drops_a_byte_order_mark() {
+        assert_eq!(
+            identity_label(&me(json!({ "first_name": "Emil\u{FEFF}Kampp" }))),
+            Some("Emil Kampp".to_string())
+        );
+    }
+
     // Emoji, joined sequences and right-to-left text are not control
     // characters. They reach the tray whole.
     #[test]
@@ -5332,7 +5392,7 @@ mod identity_fetch_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    const ALICE: &str = r#"{"data":{"type":"me","id":"1","attributes":{
+    pub(super) const ALICE: &str = r#"{"data":{"type":"me","id":"1","attributes":{
         "first_name":"Alice","last_name":"Andersen","email":"alice@example.com"}}}"#;
 
     /// A loopback API that answers its first request with `status` and `body`,
@@ -5449,7 +5509,7 @@ mod identity_fetch_tests {
 
     /// The label once the identity refresh, which runs on its own runtime,
     /// has written it. `None` when five seconds pass and it has not.
-    async fn label_once_written(state: &Arc<AppState>) -> Option<String> {
+    pub(super) async fn label_once_written(state: &Arc<AppState>) -> Option<String> {
         for _ in 0..250 {
             if let Some(label) = lock_read(&state.user_label).clone() {
                 return Some(label);
@@ -5467,6 +5527,108 @@ mod identity_fetch_tests {
         let state = state_at(&api_that_replies(200, ALICE).await);
         state.adopt_session("alice-token".into(), None);
         name_unnamed_holder(&state);
+        assert_eq!(
+            label_once_written(&state).await,
+            Some("Alice Andersen".to_string())
+        );
+    }
+}
+
+// Three one-line calls end or heal a session: an invalidated token, a tray
+// sign out, and the name a live token earns back at the next collection. Each
+// runs here through the real function, on an app handle that `tauri::test`
+// builds without a window server.
+#[cfg(test)]
+mod session_end_tests {
+    use super::identity_fetch_tests::{label_once_written, ALICE};
+    use super::session_label_tests::state_at;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A base URL for a state that makes no request of its own.
+    const NO_API: &str = "http://127.0.0.1:0";
+
+    // A 401 from the collection loop stops the agent using the token. The dot
+    // turns red, so the tray must stop naming anybody.
+    #[test]
+    fn an_invalidated_token_takes_the_name_with_it() {
+        let app = tauri::test::mock_app();
+        let state = state_at(NO_API);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+        // The sign-in nudge is debounced. A nudge one moment old keeps this
+        // test from opening a browser.
+        *lock_write(&state.last_focus_at) = Some(Instant::now());
+
+        invalidate_auth(app.handle(), &state);
+
+        assert_eq!(*lock_read(&state.auth_token), None);
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    // A tray sign out ends the session the person asked to end. The credential
+    // store's delete is the one step a test stands in for: deleting the real
+    // entry would sign this machine's installed agent out.
+    #[test]
+    fn a_sign_out_takes_the_name_with_the_token() {
+        let app = tauri::test::mock_app();
+        let state = state_at(NO_API);
+        state.adopt_session("alice-token".into(), Some("Alice Andersen".into()));
+
+        sign_out_with(app.handle(), &state, || Ok(()));
+
+        assert_eq!(*lock_read(&state.auth_token), None);
+        assert_eq!(*lock_read(&state.user_label), None);
+    }
+
+    /// A loopback API that answers every request by path until the test ends:
+    /// an empty collection config, and a `/me` that names Alice.
+    async fn api_that_answers_by_path() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let received = socket.read(&mut request).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&request[..received]).into_owned();
+                    let body = if head.contains("GET /me ") {
+                        ALICE
+                    } else {
+                        "{}"
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 200 Reply\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        base
+    }
+
+    // The heal for a `/me` blip at sign-in. The config reply proves the token
+    // live, so the cycle names the session the sign-in could not name, instead
+    // of leaving the tray unnamed until the next restart.
+    #[tokio::test]
+    async fn a_cycle_names_the_session_the_sign_in_could_not() {
+        let app = tauri::test::mock_app();
+        let state = state_at(&api_that_answers_by_path().await);
+        state.adopt_session("alice-token".into(), None);
+
+        run_cycle(
+            app.handle(),
+            &state,
+            &http_client(Some(Duration::from_secs(10))),
+        )
+        .await
+        .expect("a cycle against the loopback API");
+
         assert_eq!(
             label_once_written(&state).await,
             Some("Alice Andersen".to_string())
