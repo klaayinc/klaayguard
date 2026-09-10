@@ -422,6 +422,47 @@ fi
 pkill -f "^$installed" 2>/dev/null || true
 sleep 0.3
 
+# The block above stubs the starter to fail on its second call, so the second
+# start never reaches the real one. This one lets both through: two seats, both
+# replacements real. On the systemd path each start needs its own unit name, and
+# a name built from the postinstall's own pid is the same on both iterations —
+# the second start then fails with "unit already exists" and that user loses a
+# seat until the next login. Nothing else in this file reaches that.
+echo "==> two seats must both come back, with the real starter on each"
+rm -f "$workdir/fakebin/runuser" "$workdir/fakebin/systemd-run"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" &
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" seat-two &
+sleep 0.8
+before_seats="$(agent_pids "$installed" | tr '\n' ' ')"
+[ "$(agent_pids "$installed" | wc -l)" -eq 2 ] \
+  || { echo "FAIL: expected two agents for one user, got [$before_seats]"; exit 1; }
+
+both_output=$(restart_running_agents "$installed" 2>&1)
+both_code=$?
+after_seats="$(wait_for_agent "$installed")"
+after_count=$(echo "$after_seats" | wc -w)
+if [ "$both_code" -ne 0 ]; then
+  echo "FAIL: both seats had a real starter and the restart still reported failure"
+  echo "      output was: $both_output"
+  exit 1
+fi
+if [ "$after_count" -ne 2 ]; then
+  echo "FAIL: expected two replacements for the two seats, got $after_count [$after_seats]"
+  echo "      output was: $both_output"
+  exit 1
+fi
+for seat_pid in $after_seats; do
+  case " $before_seats " in
+    *" $seat_pid "*)
+      echo "FAIL: agent $seat_pid is one of the originals; that seat was never replaced"
+      exit 1
+      ;;
+  esac
+done
+systemctl stop 'klaayguard-agent-*' 2>/dev/null || true
+pkill -f "^$installed" 2>/dev/null || true
+sleep 0.3
+
 # A first install has nothing to restart, and that is not a failure. The
 # branch also carries the line that tells an operator which of the two silent
 # cases happened — no agent, or no permission to see one.

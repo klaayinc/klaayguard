@@ -182,8 +182,15 @@ restart_running_agents() {
         set -- "$@" "--setenv=$pair"
         remaining=$((remaining - 1))
       done
+      # Name the unit after the pid being replaced, not this script's own. `$$`
+      # is the same on every pass of the loop, so a user holding two seats built
+      # one name twice and the second start died on "unit already exists" — the
+      # fallback has no namespace to collide in, so that would be a regression
+      # this branch introduced. `systemd-escape` because an AD or SSSD fleet
+      # carries names like `alice@corp.com`, where `@` reads as a template
+      # instance and `\` is not a legal unit name at all.
       systemd-run --collect --quiet \
-        --unit="klaayguard-agent-$user-$$" \
+        --unit="klaayguard-agent-$(systemd-escape "$user")-$pid" \
         --uid="$user" \
         --setenv="HOME=$home" --setenv="USER=$user" --setenv="LOGNAME=$user" \
         --setenv="PATH=/usr/local/bin:/usr/bin:/bin" \
