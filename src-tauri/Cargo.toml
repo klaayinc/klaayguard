@@ -64,7 +64,12 @@ sha2 = "0.10"
 base64 = "0.22"
 hmac = "0.12"  # App-scoped hash of the machine id for stable Linux device identity
 getrandom = "0.2"  # CSPRNG for the sign-in state nonce (reuses the version already in-tree)
-unicode-properties = { version = "0.1.4", features = ["general-category"] }
+# `default-features = false`, because the default set also carries `emoji`.
+# Only `paints_nothing` uses this crate, and it asks for one general category.
+# The emoji tables compiled into the agent binary and nothing called them.
+unicode-properties = { version = "0.1.4", default-features = false, features = [
+  "general-category",
+] }
 
 [target.'cfg(unix)'.dependencies]
 nix = "0.26"  # For Unix-specific system calls if needed
