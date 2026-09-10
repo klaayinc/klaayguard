@@ -74,8 +74,16 @@ impl AppState {
     /// Name the holder of `token`, but only while that token is still the live
     /// one. A `/me` reply that lands after a sign out describes a session that
     /// has ended, and must not name it.
+    /// Hold the token guard across the label write. Dropping it first leaves a
+    /// gap in which `clear_session` runs to completion, and this line then
+    /// writes the name back after the sign out cleared it — a tray that names a
+    /// person beside a red dot, which nothing clears until the next sign in.
+    ///
+    /// Take the token before the label here and in `clear_session`. The reverse
+    /// order in either one deadlocks the pair.
     fn name_holder_of(&self, token: Option<&str>, label: Option<String>) {
-        if lock_read(&self.auth_token).as_deref() != token {
+        let held_token = lock_read(&self.auth_token);
+        if held_token.as_deref() != token {
             return;
         }
         *lock_write(&self.user_label) = label;
@@ -1864,10 +1872,15 @@ fn paints_nothing(c: char) -> bool {
             | '\u{200B}'
             | '\u{200E}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
             | '\u{206A}'..='\u{206F}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{2800}'
             | '\u{FEFF}'
             | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{3164}'
+            | '\u{FFA0}'
             | '\u{E0000}'..='\u{E007F}'
     )
 }
@@ -5326,6 +5339,15 @@ mod identity_label_tests {
             "\u{206A}\u{206B}",
             "\u{FFF9}",
             "\u{200D}",
+            // No format-character rule reaches these. The word joiner and the
+            // invisible operators are Cf like the ones above; HANGUL FILLER is
+            // a letter, and it is what people actually use for a blank display
+            // name; BRAILLE PATTERN BLANK is a symbol that paints nothing.
+            "\u{2060}\u{2064}",
+            "\u{3164}",
+            "\u{115F}\u{1160}",
+            "\u{FFA0}",
+            "\u{2800}",
         ] {
             assert_eq!(
                 identity_label(&me(json!({ "first_name": name }))),
