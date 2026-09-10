@@ -150,17 +150,7 @@ if (-not $installDir) {
 }
 if ($installDir -and (Test-Path "$installDir\KlaayGuard.exe")) {
     Pass "installed at $installDir"
-    # The file appears before its version resource is readable: the installer is
-    # still writing when the path first answers Test-Path, and Get-Item then
-    # returns an empty FileVersion. Read until a value arrives, so an empty one
-    # means the version-sync step really did not run.
-    $fv = ""
-    $deadline = (Get-Date).AddSeconds(30)
-    do {
-        $fv = (Get-Item "$installDir\KlaayGuard.exe").VersionInfo.FileVersion
-        if (-not [string]::IsNullOrWhiteSpace($fv)) { break }
-        Start-Sleep -Seconds 1
-    } until ((Get-Date) -gt $deadline)
+    $fv = (Get-Item "$installDir\KlaayGuard.exe").VersionInfo.FileVersion
     if ($fv -like "$Version*") { Pass "FileVersion $fv" }
     else { Fail "FileVersion is '$fv', expected '$Version'. The version-sync step did not run." }
     if (Test-Path "$installDir\klaayguard-osqueryi.exe") { Pass "sidecar installed beside the app" }

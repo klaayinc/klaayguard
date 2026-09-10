@@ -276,8 +276,15 @@ jobs:
         with:
           tool: tauri-cli@2.11.4
 
+      # Point the build at a dead port. The agent's update loop takes its first
+      # tick the moment it starts, and against the production API it finds the
+      # current release and installs it — so every assertion below would read a
+      # different binary than the one this job built. With no reachable API the
+      # check fails harmlessly and the installed 0.1.12 stays 0.1.12.
       - name: Build NSIS installer
         working-directory: src-tauri
+        env:
+          VITE_API_BASE_URL: http://127.0.0.1:9
         run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
       - name: Validate installer
