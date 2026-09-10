@@ -37,12 +37,10 @@ proc_env() {
 
 # Every process running this binary, whatever its arguments.
 #
-# `/proc/<pid>/exe` names the file the process runs, so an argument cannot hide
-# it. A command-line match can: the desktop entry is `Exec={{exec}} %U`, so a
-# launch carrying a URL has an argument, and an anchored pattern misses it.
-#
-# The link reads "<path> (deleted)" once the package replaces the file, which is
-# exactly the process this script exists to replace.
+# `/proc/<pid>/exe` names the file the process runs, so no argument list can hide
+# it and none has to be guessed. The link reads "<path> (deleted)" once the
+# package replaces the file, which is exactly the process this script exists to
+# replace.
 agent_pids() {
   bin="$1"
   for proc in /proc/[0-9]*; do
