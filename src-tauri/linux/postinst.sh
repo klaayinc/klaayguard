@@ -161,13 +161,39 @@ restart_running_agents() {
       waited=$((waited + 1))
     done
 
-    # setsid detaches the new agent from this script. Without it the child keeps
-    # dpkg's stdout open and apt waits for a process that never exits.
+    # `setsid` leaves the terminal and the process group, not the control group.
+    # Started that way the replacement stays in whatever cgroup dpkg ran in, so
+    # an upgrade driven from a unit — MDM, unattended-upgrades — kills the agent
+    # again the moment that unit stops, after this script has already reported
+    # success. Measured: inside `systemd-run --wait`, a setsid child dies with
+    # the unit; the same child under `systemd-run --collect` outlives it.
+    #
+    # So put the agent in its own transient unit where systemd runs, and keep
+    # setsid for machines without it. setsid is still needed there: without it
+    # the child holds dpkg's stdout and apt waits for a process that never exits.
     log "postinst: restarting the agent for $user"
-    setsid runuser -u "$user" -- env -i \
-      HOME="$home" USER="$user" LOGNAME="$user" \
-      PATH=/usr/local/bin:/usr/bin:/bin \
-      "$@" "$bin" >/dev/null 2>&1 &
+    if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+      # `$@` holds VAR=value pairs; systemd-run wants one --setenv= per pair.
+      # Rotate the list in place — the two branches are exclusive, so the
+      # fallback below never sees the rewritten form.
+      remaining=$#
+      while [ "$remaining" -gt 0 ]; do
+        pair="$1"; shift
+        set -- "$@" "--setenv=$pair"
+        remaining=$((remaining - 1))
+      done
+      systemd-run --collect --quiet \
+        --unit="klaayguard-agent-$user-$$" \
+        --uid="$user" \
+        --setenv="HOME=$home" --setenv="USER=$user" --setenv="LOGNAME=$user" \
+        --setenv="PATH=/usr/local/bin:/usr/bin:/bin" \
+        "$@" -- "$bin" >/dev/null 2>&1
+    else
+      setsid runuser -u "$user" -- env -i \
+        HOME="$home" USER="$user" LOGNAME="$user" \
+        PATH=/usr/local/bin:/usr/bin:/bin \
+        "$@" "$bin" >/dev/null 2>&1 &
+    fi
     restarted="$restarted $user:$pid"
   done
 
