@@ -70,6 +70,28 @@ function Wait-ForAgent([int]$Seconds = 60) {
     return $null
 }
 
+# Wait until one agent runs and keeps running, then return it. `/R` puts both
+# starters in play — the NSIS hook and the template's .onInstSuccess — so two
+# processes exist for a moment and the single-instance lock makes the loser
+# concede once its retries run out. Reading the first moment any process exists
+# samples that overlap and calls it a defect, which is why the count below is
+# taken from the set that holds rather than the set that appears. When nothing
+# settles the last set comes back, so a run where two agents really do survive
+# still fails on the count.
+function Wait-ForSettledAgent([int]$Seconds = 60) {
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    $previous = @()
+    do {
+        Start-Sleep -Seconds 1
+        $current = @(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue)
+        if ($current.Count -eq 1 -and $previous.Count -eq 1 -and $previous[0].Id -eq $current[0].Id) {
+            return $current
+        }
+        $previous = $current
+    } until ((Get-Date) -gt $deadline)
+    return $previous
+}
+
 # --- 2a. The install leaves an agent running ---------------------------------
 # A security agent that waits for the next logon leaves the machine unmonitored
 # until then. The installer stops the old process before it writes the files,
@@ -181,7 +203,7 @@ if ($agent) {
 $beforeUpdate = Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue
 $proc = Invoke-Installer $Installer @("/S", "/UPDATE", "/R")
 if ($proc -and $proc.ExitCode -ne 0) { Fail "the self-update command line exited $($proc.ExitCode)" }
-$afterUpdate = Wait-ForAgent
+$afterUpdate = Wait-ForSettledAgent
 if (-not $afterUpdate) {
     Fail "no agent runs after '/S /UPDATE /R'; the self-update path leaves the machine unmonitored"
 } elseif (@($afterUpdate).Count -ne 1) {
