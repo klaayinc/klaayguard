@@ -244,9 +244,9 @@ jobs:
         run: sudo bash scripts/test-postinst-restarts-agent.sh
 
   # Build the Windows NSIS installer the way release does, then install it
-  # silently on the runner and assert on the result: the Run key, the
-  # klaayguard:// handler, the sidecar, and a clean uninstall. Every one of
-  # those is invisible to cargo build.
+  # silently on the runner and assert on the result: the Run key, the sidecar,
+  # a clean uninstall, and that no klaayguard:// handler is registered. Every
+  # one of those is invisible to cargo build.
   bundle-windows:
     name: Bundle check (Windows NSIS)
     runs-on: windows-latest

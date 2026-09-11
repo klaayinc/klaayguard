@@ -167,10 +167,11 @@ wait_for_agent() {
 }
 
 # The argument is the point: no argument list can hide the file a process runs,
-# and none has to be guessed.
+# and none has to be guessed. The fake ignores its arguments, so any word
+# serves; the decoy proves agent_pids matches on the binary, not on argv.
 runuser -u "$TEST_USER" -- env DISPLAY=":99" \
   XDG_CONFIG_HOME="$xdg_config" XDG_DATA_HOME="$xdg_data" \
-  "$installed" "klaayguard://sign-in" &
+  "$installed" "decoy-argument" &
 sleep 0.6
 installed_pid="$(agent_pids "$installed" | head -1)"
 runuser -u "$TEST_USER" -- "$elsewhere" &
@@ -309,7 +310,7 @@ printf '#!/bin/sh\nexit 1\n' > "$workdir/fakebin/runuser"
 chmod +x "$workdir/fakebin/runuser"
 printf '#!/bin/sh\nexit 1\n' > "$workdir/fakebin/systemd-run"
 chmod +x "$workdir/fakebin/systemd-run"
-runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "klaayguard://sign-in" &
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "decoy-argument" &
 sleep 0.6
 doomed_pid="$(agent_pids "$installed" | head -1)"
 [ -n "$doomed_pid" ] || { echo "FAIL: could not start the agent for the failure case"; exit 1; }
@@ -607,7 +608,7 @@ sleep 0.3
 # fresh agent here `stop_running_agents` would run on an empty list and the
 # block would pass without doing anything.
 echo "==> a removal must stop the agent it deletes"
-runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "klaayguard://sign-in" &
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$installed" "decoy-argument" &
 sleep 0.6
 removed_pid="$(agent_pids "$installed" | head -1)"
 [ -n "$removed_pid" ] || { echo "FAIL: could not start the agent for the removal case"; exit 1; }
@@ -645,7 +646,7 @@ chmod 755 "$installed"
 # live agent, and read what became of it.
 outcome_of_main() { # script-lib, arg..., -> "RESTARTED", "SURVIVES", "STOPPED" or "COULD-NOT-START"
   local lib="$1"; shift
-  runuser -u "$TEST_USER" -- "$installed" "klaayguard://sign-in" &
+  runuser -u "$TEST_USER" -- "$installed" "decoy-argument" &
   sleep 0.5
   local before after
   before="$(agent_pids "$installed" | head -1)"

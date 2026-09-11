@@ -1,5 +1,11 @@
 # cargo-about configuration. Generates THIRD-PARTY-LICENSES.md.
-# Run: cargo about generate about.hbs -o ../THIRD-PARTY-LICENSES.md
+# Install: cargo install cargo-about --version 0.9.2 --locked --features cli
+#          The cli feature carries the binary; without it nothing installs.
+# Run:     cargo about generate about.hbs -o ../THIRD-PARTY-LICENSES.md
+#
+# Pin the version. cargo-about gathers license texts differently between
+# releases, so an unpinned run rewrites hundreds of lines of a file that ships
+# inside the installer.
 #
 # Keep this list in step with the `allow` list in deny.toml. cargo-about accepts
 # a dependency license here; cargo-deny enforces the same set in CI.
@@ -19,3 +25,55 @@ accepted = [
     "OpenSSL",
     "CDLA-Permissive-2.0",
 ]
+
+# Three crates carry a license header inside source files. Without these
+# entries cargo-about copies each such file in full - C headers and Rust
+# sources land in the license notice. Name the real license files instead.
+#
+# Give every file its own license. Without one the tool prints the file under
+# each license in the crate expression, so an ISC text lands under an Apache
+# heading and an Apache text under an ISC one.
+#
+# Update a checksum when the crate version changes; cargo-about refuses a
+# stale one rather than serving the wrong text.
+
+[ring.clarify]
+license = "Apache-2.0 AND ISC"
+
+# Names the split rather than granting anything: ring's own new code is ISC,
+# and the inherited BoringSSL code keeps its own terms.
+[[ring.clarify.files]]
+path = "LICENSE"
+license = "ISC"
+checksum = "b3d734001a94efff3579978d953391aa7115f877657d25eb54037a43875d078a"
+
+[[ring.clarify.files]]
+path = "LICENSE-BoringSSL"
+license = "Apache-2.0"
+checksum = "005fc765ddc5115da796cca915baa9557abae13ff35e0a47c47affc56f6c414d"
+
+[[ring.clarify.files]]
+path = "LICENSE-other-bits"
+license = "ISC"
+checksum = "f025ccfb7dfb6bdfedc75ca0f67acc69e6fb4998143d834f7c2f38a29989680f"
+
+[schemars_derive.clarify]
+license = "MIT"
+
+[[schemars_derive.clarify.files]]
+path = "LICENSE"
+license = "MIT"
+checksum = "1954992a2b32e8a2af24a4c11b726902e344c1934b947a77f04d404908f8db30"
+
+[libdbus-sys.clarify]
+license = "Apache-2.0 OR MIT"
+
+[[libdbus-sys.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "453745410e3be8cf25d56872ea2aec975a78e6c9f217443d0bf908a5bce7c8ff"
+
+[[libdbus-sys.clarify.files]]
+path = "LICENSE-MIT"
+license = "MIT"
+checksum = "de3911c2d98c8bd2d701ee721347053d9b55995a11f9a8c955e44d3ca1b376bf"
