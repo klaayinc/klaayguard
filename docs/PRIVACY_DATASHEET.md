@@ -94,10 +94,11 @@ Klaay signs and notarizes the macOS installers. Klaay does not sign the Linux pa
 
 ## 8. BYOD Considerations
 
-KlaayGuard is suitable for personal-device deployment because the data scope is restricted to security posture, not user activity. Two items worth highlighting to end users on personal devices:
+KlaayGuard is suitable for personal-device deployment because the data scope is restricted to security posture, not user activity. Three items worth highlighting to end users on personal devices:
 
 - The `users` query enumerates **all local user accounts** on the device (usernames, UIDs, home directory paths). It does not access those accounts' files or activity. On a single-user personal device this is typically a non-issue; on a shared family device, other account names will appear in the inventory.
 - The agent runs only while the user it is installed under is logged in. It has no visibility into other user profiles on the same machine.
+- A person can work in more than one Klaay workspace. The agent then reports the device to **every workspace where they are a current employee**, so each of those workspaces sees the device inventory and posture in section 2. Workspaces where the person holds only the auditor role receive nothing.
 
 Customers preferring stricter isolation may install KlaayGuard inside a dedicated work-purpose macOS user profile rather than the user's primary profile. This is supported but is generally not necessary given the limited data scope.
 
