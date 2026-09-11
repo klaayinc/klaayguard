@@ -2002,7 +2002,7 @@ async fn adopt_unless_rejected(state: &Arc<AppState>, tok: &str) -> bool {
 
 /// Store a token the loopback exchange just returned, once the API accepts
 /// it. The token reached this process over `127.0.0.1` and was released only
-/// against a verifier that never left it, so the binding is already settled
+/// against a verifier the browser never saw, so the binding is already settled
 /// by the time this runs; the API check stays because a token this agent
 /// cannot use is worth catching here rather than at the next collection.
 fn adopt_token<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>, tok: String) {
@@ -3576,7 +3576,7 @@ fn open_frontend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, path: &str) {
 /// why Google, Microsoft, and password all work here without this process
 /// knowing about any of them. What comes back arrives on `127.0.0.1`, not on
 /// a `klaayguard://` URL any local program could have claimed, and it is
-/// released only against a verifier this process never sends anywhere. So
+/// released only against a verifier the browser never sees. So
 /// the token binds to this machine, and there is no nonce for anyone to get
 /// wrong.
 fn open_sign_in<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {

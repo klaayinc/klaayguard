@@ -29,8 +29,8 @@ sequenceDiagram
     %% Sign-in (first launch or after 401/403)
     Agent->>API: POST /cli_auth_requests (kind=loopback, code_challenge, redirect_port)
     API-->>Agent: request_id
-    Agent->>Browser: Open {frontend}/login?app=klaayguard&request=<request_id>
-    Browser-->>Agent: GET 127.0.0.1:<port>/?code=<one-time code>
+    Agent->>Browser: Open {frontend}/login?app=klaayguard&request=REQUEST_ID
+    Browser-->>Agent: GET 127.0.0.1:PORT/?code=ONE_TIME_CODE
     Agent->>API: POST /cli_auth_requests/claim (code, code_verifier)
     API-->>Agent: token
     Agent->>API: GET /me (validate token)
