@@ -167,8 +167,8 @@ wait_for_agent() {
 }
 
 # The argument is the point: no argument list can hide the file a process runs,
-# and none has to be guessed. The agent reads only --forget-credentials, so any
-# other word serves, and a decoy proves agent_pids matches on the binary.
+# and none has to be guessed. The fake ignores its arguments, so any word
+# serves; the decoy proves agent_pids matches on the binary, not on argv.
 runuser -u "$TEST_USER" -- env DISPLAY=":99" \
   XDG_CONFIG_HOME="$xdg_config" XDG_DATA_HOME="$xdg_data" \
   "$installed" "decoy-argument" &
