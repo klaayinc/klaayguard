@@ -3756,10 +3756,11 @@ fn refresh_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppSta
 const SIGN_OUT_LABEL: &str = "Sign out";
 
 /// Clear the session at the user's request: drop the in-memory token, delete it
-/// from the OS credential store, and refresh the tray. refresh_tray then turns the dot red and removes the "Sign out"
-/// item. An explicit sign out deletes the stored token, unlike an invalidated
-/// one, so the next start does not reuse it; if the store refuses, the next
-/// start WILL sign back in, so that is reported, not shrugged off.
+/// from the OS credential store, and refresh the tray. refresh_tray then turns
+/// the dot red and removes the "Sign out" item. An explicit sign out deletes
+/// the stored token, unlike an invalidated one, so the next start does not
+/// reuse it; if the store refuses, the next start WILL sign back in, so that is
+/// reported, not shrugged off.
 fn sign_out<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     sign_out_with(app, state, keychain::delete_token);
 }
