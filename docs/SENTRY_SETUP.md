@@ -12,7 +12,7 @@ in `src-tauri/src/main.rs`.
 The agent sends:
 
 - panics and errors, with stack traces;
-- lifecycle messages (collection start, deep-link token saved, update steps)
+- lifecycle messages (collection start, `sign_in_token_saved`, update steps)
   that make remote debugging possible without log access.
 
 It never sends collected osquery data.

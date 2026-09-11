@@ -45,9 +45,11 @@ These functions exist only to keep the agent itself signed in, current, and
 running:
 
 - **Sign-in.** The agent opens the Klaay login page in your browser. After
-  login, the browser returns a token to the agent. The agent stores the token
-  in the operating system credential store: macOS Keychain, Windows
-  Credential Manager, or the Linux secret service.
+  login, the browser sends a one-time code to a port the agent listens on, at
+  `127.0.0.1`. The agent exchanges that code for a token, with a secret that
+  never leaves the agent. The agent stores the token in the operating system
+  credential store: macOS Keychain, Windows Credential Manager, or the Linux
+  secret service.
 - **Menu bar icon.** The agent shows a small icon in the menu bar. A green dot
   means signed in. A red dot means signed out. The menu names the signed-in
   person, and shows the time until the next report and a link to the Klaay

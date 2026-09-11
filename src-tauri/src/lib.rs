@@ -3569,7 +3569,6 @@ fn open_frontend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, path: &str) {
     }
 }
 
-/// How long a minted sign-in nonce stays valid for reuse. The app itself opens
 /// Open the Klaay sign-in page in the browser and wait on a loopback port
 /// for the answer.
 ///

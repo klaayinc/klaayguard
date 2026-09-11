@@ -1,7 +1,7 @@
 # KlaayGuard Privacy Datasheet
 
 **Product:** KlaayGuard desktop agent
-**Version of this document:** 2026-09-04
+**Version of this document:** 2026-09-11
 **Audience:** Customer security and privacy reviewers (incl. BYOD deployments)
 
 ## 1. Overview
@@ -98,7 +98,7 @@ KlaayGuard is suitable for personal-device deployment because the data scope is 
 
 - The `users` query enumerates **all local user accounts** on the device (usernames, UIDs, home directory paths). It does not access those accounts' files or activity. On a single-user personal device this is typically a non-issue; on a shared family device, other account names will appear in the inventory.
 - The agent runs only while the user it is installed under is logged in. It has no visibility into other user profiles on the same machine.
-- A person can work in more than one Klaay workspace. The agent then reports the device to **every workspace where they are a current employee**, so each of those workspaces sees the device inventory and posture in section 2. Workspaces where the person holds only the auditor role receive nothing.
+- A person can work in more than one Klaay workspace. The device reports to the workspace the person picks when they sign the agent in. Klaay can also turn on reporting to every workspace, which is off by default. Klaay then also records the device in each workspace where the person is a current employee. It leaves out a workspace where the person only audits. A sign-in that asks for no workspace keeps reporting this way until it expires. Each workspace that receives the device sees the inventory and posture in §2.
 
 Customers preferring stricter isolation may install KlaayGuard inside a dedicated work-purpose macOS user profile rather than the user's primary profile. This is supported but is generally not necessary given the limited data scope.
 
