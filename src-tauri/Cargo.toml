@@ -63,7 +63,7 @@ sha2 = "0.10"
 # base64url for the PKCE verifier and its challenge (sign_in.rs).
 base64 = "0.22"
 hmac = "0.12"  # App-scoped hash of the machine id for stable Linux device identity
-getrandom = "0.2"  # CSPRNG for the sign-in state nonce (reuses the version already in-tree)
+getrandom = "0.2"  # CSPRNG for the PKCE verifier and the device identity (reuses the version already in-tree)
 # `default-features = false`, because the default set also carries `emoji`.
 # Only `paints_nothing` uses this crate, and it asks for one general category.
 # The emoji tables compiled into the agent binary and nothing called them.

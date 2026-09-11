@@ -16,7 +16,7 @@
 //!   address, so the token binds to the machine that asked for it. No
 //!   `state` nonce to check, and no confused deputy to worry about.
 //! - A local program that does read the code still cannot spend it. The
-//!   verifier never leaves this process (RFC 7636).
+//!   browser never sees the verifier (RFC 7636).
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -34,7 +34,7 @@ pub struct Pending {
     /// The id the browser carries. Not a secret: it selects a row and
     /// nothing else.
     pub request_id: String,
-    /// The secret that claims the token. Never leaves this process.
+    /// The secret that claims the token. The browser never sees it.
     pub verifier: String,
     pub listener: TcpListener,
 }

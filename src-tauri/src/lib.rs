@@ -2002,7 +2002,7 @@ async fn adopt_unless_rejected(state: &Arc<AppState>, tok: &str) -> bool {
 
 /// Store a token the loopback exchange just returned, once the API accepts
 /// it. The token reached this process over `127.0.0.1` and was released only
-/// against a verifier that never left it, so the binding is already settled
+/// against a verifier the browser never saw, so the binding is already settled
 /// by the time this runs; the API check stays because a token this agent
 /// cannot use is worth catching here rather than at the next collection.
 fn adopt_token<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>, tok: String) {
@@ -2166,8 +2166,8 @@ fn collection_interval_seconds() -> u64 {
 
 /// Debounced sign-in nudge: opens the login page in the browser and posts a native
 /// notification. The debounce keeps repeated 401s from spamming browser tabs. A
-/// no-op once a token is present: a cold start by deep link signs the user in
-/// while this is being decided.
+/// no-op once a token is present: a cold start signs the user in from the
+/// stored token while this is being decided.
 fn notify_signin_needed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     if lock_read(&state.auth_token).is_some() {
         return;
@@ -3569,7 +3569,6 @@ fn open_frontend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, path: &str) {
     }
 }
 
-/// How long a minted sign-in nonce stays valid for reuse. The app itself opens
 /// Open the Klaay sign-in page in the browser and wait on a loopback port
 /// for the answer.
 ///
@@ -3577,7 +3576,7 @@ fn open_frontend<R: tauri::Runtime>(app: &tauri::AppHandle<R>, path: &str) {
 /// why Google, Microsoft, and password all work here without this process
 /// knowing about any of them. What comes back arrives on `127.0.0.1`, not on
 /// a `klaayguard://` URL any local program could have claimed, and it is
-/// released only against a verifier this process never sends anywhere. So
+/// released only against a verifier the browser never sees. So
 /// the token binds to this machine, and there is no nonce for anyone to get
 /// wrong.
 fn open_sign_in<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
@@ -3757,11 +3756,11 @@ fn refresh_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppSta
 const SIGN_OUT_LABEL: &str = "Sign out";
 
 /// Clear the session at the user's request: drop the in-memory token, delete it
-/// from the OS credential store, forget any pending sign-in nonce, and refresh
-/// the tray. refresh_tray then turns the dot red and removes the "Sign out"
-/// item. An explicit sign out deletes the stored token, unlike an invalidated
-/// one, so the next start does not reuse it; if the store refuses, the next
-/// start WILL sign back in, so that is reported, not shrugged off.
+/// from the OS credential store, and refresh the tray. refresh_tray then turns
+/// the dot red and removes the "Sign out" item. An explicit sign out deletes
+/// the stored token, unlike an invalidated one, so the next start does not
+/// reuse it; if the store refuses, the next start WILL sign back in, so that is
+/// reported, not shrugged off.
 fn sign_out<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppState>) {
     sign_out_with(app, state, keychain::delete_token);
 }
@@ -4693,10 +4692,9 @@ fn spawn_update_loop(app: tauri::AppHandle, api_base: String) {
     });
 }
 
-/// Startup work that may block: the deep-link handler and autostart entries,
-/// then the stored token, then the launch URL or the sign-in nudge. Runs off
-/// the main thread so the tray is already visible while a locked keyring waits
-/// on its prompt.
+/// Startup work that may block: the autostart entries, then the stored token,
+/// then the sign-in nudge. Runs off the main thread so the tray is already
+/// visible while a locked keyring waits on its prompt.
 fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
     // Start at login, like the macOS LaunchAgent. An agent that only runs
     // when a human remembers to launch it leaves gaps the fleet dashboard

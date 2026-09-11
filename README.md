@@ -27,8 +27,12 @@ sequenceDiagram
     participant Osquery as osquery (bundled sidecar)
 
     %% Sign-in (first launch or after 401/403)
-    Agent->>Browser: Open {frontend}/login?app=klaayguard&state=<nonce>
-    Browser-->>Agent: klaayguard://…?token=<jwt>&state=<nonce>
+    Agent->>API: POST /cli_auth_requests (kind=loopback, code_challenge, redirect_port)
+    API-->>Agent: request_id
+    Agent->>Browser: Open {frontend}/login?app=klaayguard&request=REQUEST_ID
+    Browser-->>Agent: GET 127.0.0.1:PORT/?code=ONE_TIME_CODE
+    Agent->>API: POST /cli_auth_requests/claim (code, code_verifier)
+    API-->>Agent: token
     Agent->>API: GET /me (validate token)
     API-->>Agent: 200 OK
     Agent->>Agent: Store token in OS credential store
@@ -190,7 +194,9 @@ All variables are optional.
 
 | Call | Purpose | Auth |
 |---|---|---|
-| `GET /me` | Validate a token from a deep link | Bearer |
+| `POST /cli_auth_requests` | Register the loopback sign-in | none |
+| `POST /cli_auth_requests/claim` | Exchange the one-time code for a token | none |
+| `GET /me` | Validate the token and name the signed-in person | Bearer |
 | `GET /klaayguard/config` | Fetch the query set | Bearer |
 | `POST /klaayguard/data` | Send collected rows | Bearer |
 | `GET /klaayguard/updates/latest` | Update manifest | none |

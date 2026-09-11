@@ -3,9 +3,8 @@
 ; and customRemove macros in this file were never invoked, so nothing they wrote
 ; ever reached the registry.
 ;
-; The klaayguard:// protocol needs no hook. The Tauri template registers every
-; scheme from the deep-link plugin config under $SHCTX\Software\Classes, and
-; removes them again at uninstall.
+; The klaayguard:// protocol went with the loopback sign-in, and no plugin
+; registers a scheme any more, so no hook adds or removes one.
 ;
 ; NSIS does not escape with a backslash. Write registry paths with single
 ; backslashes; a doubled one is a literal doubled backslash in the key name.
