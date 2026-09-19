@@ -119,6 +119,13 @@ jobs:
         working-directory: src-tauri
         run: bash scripts/test-postinstall-stops-agent.sh
 
+      # Proves the .pkg pins its payload to /Applications. Left unwired, this
+      # test existed while the installer shipped a relocatable bundle, so a Mac
+      # holding another com.klaay.app copy took the app instead.
+      - name: pkg structure
+        working-directory: src-tauri
+        run: bash scripts/test-pkg-structure.sh
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

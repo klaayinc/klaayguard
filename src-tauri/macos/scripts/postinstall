@@ -6,12 +6,18 @@
 # is running immediately after install instead of waiting for the user to
 # remember to launch it.
 #
-# This MUST always exit 0: a non-zero postinstall fails the whole installation.
-# Every failure path is best-effort because the app also self-installs the agent
-# on first launch (RunAtLoad in the plist covers next login as well).
+# Every agent-registration path below exits 0, because the app also self-installs
+# the agent on first launch (RunAtLoad in the plist covers next login as well),
+# and a non-zero postinstall fails the whole installation. A missing app is the
+# one exception: nothing can self-heal from it, so that path fails the install
+# rather than report a success the machine cannot back up.
 set -u
 
-APP="/Applications/KlaayGuard.app"
+# $3 is the destination volume — "/" for the usual install, a mountpoint when the
+# user picks another disk. The component plist pins the payload to /Applications,
+# so the app sits under that volume and never anywhere else.
+TARGET_VOLUME="${3:-/}"
+APP="${TARGET_VOLUME%/}/Applications/KlaayGuard.app"
 BIN="$APP/Contents/MacOS/KlaayGuard"
 
 log() { /usr/bin/logger -t com.klaay.klaayguard.postinstall "$1"; echo "$1"; }
@@ -144,8 +150,8 @@ ensure_agent_running() {
 
 main() {
   if [ ! -x "$BIN" ]; then
-    log "postinstall: binary not found at $BIN; skipping agent setup"
-    exit 0
+    log "postinstall: ERROR no KlaayGuard binary at $BIN; the install left no app and no agent"
+    exit 1
   fi
 
   # The human at the GUI, not the installer's root context.
