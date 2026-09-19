@@ -254,21 +254,28 @@ fi
 
 # The name guard turns this file into a library when it is not called
 # `postinstall`. If the positive arm ever stopped matching, the installer would
-# do nothing at all and still exit 0.
+# do nothing at all and still report a success.
 echo "==> the name guard must run main when the file is named postinstall"
 if [ -x /Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard ]; then
   echo "note: KlaayGuard is installed on this Mac; skipping rather than running a real install"
 else
   cp "$POSTINSTALL" "$workdir/postinstall"
   guard_out=$(bash "$workdir/postinstall" 2>&1)
+  guard_status=$?
   case "$guard_out" in
-    *"binary not found"*) ;;
+    *"no KlaayGuard binary at"*) ;;
     *)
-      echo "FAIL: the name guard did not run main; the installer would do nothing and exit 0"
+      echo "FAIL: the name guard did not run main; the installer would do nothing and report a success"
       echo "      output was: $guard_out"
       exit 1
       ;;
   esac
+  # An install that placed no app must fail the installation rather than end
+  # green with no app and no agent.
+  if [ "$guard_status" -eq 0 ]; then
+    echo "FAIL: postinstall exited 0 with no app installed; the installer would report a success"
+    exit 1
+  fi
 fi
 
 echo "PASS: the installer stops the agent it replaces, spares other builds, and reports when none comes back"

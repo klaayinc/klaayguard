@@ -30,12 +30,23 @@ root="$workdir/root"
 mkdir -p "$root/Applications"
 cp -R "$APP_PATH" "$root/Applications/"
 
+# pkgbuild marks a bundle payload relocatable by default. Installer then asks
+# LaunchServices for any bundle carrying com.klaay.app and writes the app over
+# that one instead — a mounted DMG, a copy in the Trash, or a developer build —
+# leaving /Applications empty while the installer still reports success. Take
+# the analysed plist so the other keys keep pkgbuild's own defaults, and turn
+# that one off.
+component_plist="$workdir/component.plist"
+pkgbuild --analyze --root "$root" "$component_plist"
+/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$component_plist"
+
 component_pkg="$workdir/component.pkg"
 pkgbuild \
   --root "$root" \
   --identifier "$IDENTIFIER" \
   --version "$VERSION" \
   --install-location "/" \
+  --component-plist "$component_plist" \
   --scripts "$SCRIPTS_DIR" \
   "$component_pkg"
 
