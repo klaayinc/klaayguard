@@ -14,11 +14,34 @@ cd "$(dirname "$0")/.."
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
-# Minimal stand-in app bundle.
+# Minimal stand-in app bundle. It carries an Info.plist with the shipped bundle
+# id, because that is what makes it a bundle to pkgbuild: `--analyze` lists the
+# payload's bundles, and the relocation this test guards is keyed on the
+# identifier. A bare .app directory would analyse to nothing.
 fake_app="$workdir/KlaayGuard.app"
 mkdir -p "$fake_app/Contents/MacOS"
 printf '#!/bin/bash\nexit 0\n' > "$fake_app/Contents/MacOS/KlaayGuard"
 chmod +x "$fake_app/Contents/MacOS/KlaayGuard"
+cat > "$fake_app/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.klaay.app</string>
+    <key>CFBundleName</key>
+    <string>KlaayGuard</string>
+    <key>CFBundleExecutable</key>
+    <string>KlaayGuard</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+</dict>
+</plist>
+PLIST
 
 out_pkg="$workdir/KlaayGuard-test.pkg"
 echo "==> Building test pkg"
