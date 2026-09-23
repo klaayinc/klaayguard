@@ -1782,12 +1782,15 @@ fn power_lock_verdict(power: &PowerLockValues) -> LockVerdict {
 
     // Every applicable value must be readable before ANY source is judged:
     // one power source saying "never" says nothing about the other.
-    if sources.iter().any(|(lock, standby, hibernate, display_off)| {
-        lock.is_none()
-            || candidates(*standby, *hibernate, *display_off)
-                .iter()
-                .any(Option::is_none)
-    }) {
+    if sources
+        .iter()
+        .any(|(lock, standby, hibernate, display_off)| {
+            lock.is_none()
+                || candidates(*standby, *hibernate, *display_off)
+                    .iter()
+                    .any(Option::is_none)
+        })
+    {
         return unreadable();
     }
 
