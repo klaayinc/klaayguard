@@ -1768,7 +1768,12 @@ fn power_lock_verdict(power: &PowerLockValues) -> LockVerdict {
     // resuming from it demands the password.
     let candidates = |standby, hibernate, display_off| {
         let mut triggers = Vec::new();
-        if standby_ok {
+        // Modern Standby replaces S1-S3 rather than removing the idea of
+        // sleeping: "sleep after" still enters low-power idle there, so the
+        // standby timeout counts on those hosts too. Measured on a customer
+        // machine reporting S1-S3 unavailable "because S0 low power idle is
+        // supported", with a sleep timeout set and honoured.
+        if standby_ok || s0ix {
             triggers.push(standby);
         }
         if hibernate_ok {
@@ -7120,6 +7125,63 @@ zroot/ROOT/default / zfs rw 0 0
             ..s0ix
         };
         assert_eq!(power_lock_verdict(&no_s0ix).locks, Some(false));
+    }
+
+    #[test]
+    fn windows_screenlock_matches_the_reported_customer_machine() {
+        // Element Standard's machine (PROD-5063), from what they sent us:
+        // sign-in required "Every Time" (greyed out, so policy-managed);
+        // plugged in 15 min screen off / 30 min sleep; on battery 3 min /
+        // 5 min; and `powercfg /a` reporting S0 Low Power Idle available with
+        // S1-S3 unavailable *because* S0ix is supported.
+        //
+        // This is the shape the old code could not answer: no S1-S3, so the
+        // standby timeout looked irrelevant, and no secure screen saver, so
+        // that path says nothing. Under Modern Standby both the sleep and the
+        // display-off timeouts really do lock the host.
+        let inputs = WindowsScreenLockInputs {
+            power: PowerLockValues {
+                console_lock_ac: Some(true),
+                console_lock_dc: Some(true),
+                standby_available: Some(false),
+                hibernate_available: Some(true),
+                modern_standby: Some(true),
+                standby_ac_secs: Some(1800),
+                standby_dc_secs: Some(300),
+                // Not reported by the customer; "never" is the conservative
+                // reading and does not change the verdict.
+                hibernate_ac_secs: Some(0),
+                hibernate_dc_secs: Some(0),
+                display_off_ac_secs: Some(900),
+                display_off_dc_secs: Some(180),
+                has_battery: Some(true),
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        // Soonest trigger per source is display-off (900 mains, 180 battery);
+        // the worst case across the two is what the host can sit unlocked for.
+        assert_eq!(row[0]["delay_seconds"], 900);
+        assert_eq!(row[0]["source"], "power_policy");
+    }
+
+    #[test]
+    fn power_lock_counts_the_sleep_timeout_under_modern_standby() {
+        // S1-S3 gone because S0ix replaced them, and the display is set never
+        // to turn off: the sleep timeout is then the only thing that locks,
+        // and ignoring it would report a locking host as unlocked.
+        let inputs = PowerLockValues {
+            standby_available: Some(false),
+            hibernate_available: Some(false),
+            modern_standby: Some(true),
+            display_off_ac_secs: Some(0),
+            display_off_dc_secs: Some(0),
+            ..sleeps(true, 900, 300)
+        };
+        let v = power_lock_verdict(&inputs);
+        assert_eq!(v.locks, Some(true));
+        assert_eq!(v.delay_seconds, Some(900));
     }
 
     #[test]
