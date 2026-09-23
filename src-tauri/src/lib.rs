@@ -1567,8 +1567,16 @@ struct ScreenSaverValues {
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Default, Clone, PartialEq)]
 struct SleepLockValues {
-    /// CONSOLELOCK: "require a password on wakeup" for the active scheme.
-    console_lock: Option<bool>,
+    /// CONSOLELOCK: "require a password on wakeup". Group Policy exposes this
+    /// as two settings, "(plugged in)" and "(on battery)", and the power
+    /// framework stores an index per power source, so both are read and both
+    /// must require the password.
+    console_lock_ac: Option<bool>,
+    console_lock_dc: Option<bool>,
+    /// Whether the host has any sleep state to enter at all. A VM or a desktop
+    /// with S1-S4 unavailable still stores a sleep timeout that never fires,
+    /// so without this the path would report a lock that cannot happen.
+    can_sleep: Option<bool>,
     /// STANDBYIDLE on mains and on battery, in seconds. 0 means "never".
     /// Both are read and both must lock: a machine that sleeps on battery and
     /// never on mains sits unlocked whenever it is plugged in. Measured on a
@@ -1680,10 +1688,12 @@ struct LockVerdict {
 #[cfg(any(target_os = "windows", test))]
 fn sleep_lock_verdict(sleep: &SleepLockValues) -> LockVerdict {
     let detail = format!(
-        "ConsoleLock={} StandbyIdleAC={} StandbyIdleDC={} Battery={} DisplayOffAC={} DisplayOffDC={}",
-        fmt_opt(sleep.console_lock),
+        "ConsoleLockAC={} ConsoleLockDC={} StandbyIdleAC={} StandbyIdleDC={} CanSleep={} Battery={} DisplayOffAC={} DisplayOffDC={}",
+        fmt_opt(sleep.console_lock_ac),
+        fmt_opt(sleep.console_lock_dc),
         fmt_opt(sleep.standby_ac_secs),
         fmt_opt(sleep.standby_dc_secs),
+        fmt_opt(sleep.can_sleep),
         fmt_opt(sleep.has_battery),
         fmt_opt(sleep.display_off_ac_secs),
         fmt_opt(sleep.display_off_dc_secs),
@@ -1702,27 +1712,38 @@ fn sleep_lock_verdict(sleep: &SleepLockValues) -> LockVerdict {
         source: "none",
         detail: detail.clone(),
     };
-    match sleep.console_lock {
+    match sleep.can_sleep {
         None => return unreadable(),
-        // Windows wakes straight to the desktop, so sleeping never locks.
+        // No sleep state to enter, so the timeout below never fires.
         Some(false) => return verdict(Some(false), None),
         Some(true) => {}
     }
-    // On a desktop the battery-side timeout is returned but never applies.
-    let mut applies = vec![sleep.standby_ac_secs];
+    // On a desktop the battery-side values are returned but never apply.
+    let mut applies = vec![(sleep.console_lock_ac, sleep.standby_ac_secs)];
     match sleep.has_battery {
         None => return unreadable(),
-        Some(true) => applies.push(sleep.standby_dc_secs),
+        Some(true) => applies.push((sleep.console_lock_dc, sleep.standby_dc_secs)),
         Some(false) => {}
     }
-    if applies.iter().any(|t| t.is_none()) {
+    // Every applicable value must be readable before any verdict: one power
+    // source saying "never sleeps" says nothing about the other.
+    if applies
+        .iter()
+        .any(|(lock, standby)| lock.is_none() || standby.is_none())
+    {
         return unreadable();
     }
-    let timeouts: Vec<u64> = applies.into_iter().flatten().collect();
-    if timeouts.contains(&0) {
-        return verdict(Some(false), Some(0));
+    let mut delays = Vec::new();
+    for (lock, standby) in applies {
+        match (lock, standby) {
+            // Windows wakes straight to the desktop on this power source.
+            (Some(false), _) => return verdict(Some(false), None),
+            (_, Some(0)) => return verdict(Some(false), Some(0)),
+            (_, Some(secs)) => delays.push(secs),
+            _ => return unreadable(),
+        }
     }
-    verdict(Some(true), timeouts.into_iter().max())
+    verdict(Some(true), delays.into_iter().max())
 }
 
 /// The screensaver path: it must be active, must ask for a password, must
@@ -1766,11 +1787,16 @@ fn screensaver_lock_verdict(inputs: &WindowsScreenLockInputs) -> LockVerdict {
         detail,
     };
     if source == "none" {
+        // Not "unreadable": the agent runs as the signed-in person and this
+        // key is theirs to read, so no values means the screen saver is not
+        // configured, and an unconfigured screen saver locks nothing. Calling
+        // it unknown would mean a host with no lock at all could never be
+        // reported as having none.
         return LockVerdict {
-            locks: None,
+            locks: Some(false),
             delay_seconds: None,
             source: "none",
-            detail: "no screen saver values found".to_string(),
+            detail: "no screen saver values set, so no screen saver locks this host".to_string(),
         };
     }
     if active.value == Some(false) || secure.value == Some(false) {
@@ -1835,23 +1861,11 @@ fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
     // A mechanism the agent could not read might be the one that locks, so it
     // outranks a definite "no" from the others: the row never reports a lock
     // missing on the strength of a value nobody could see.
-    if mechanisms.iter().any(|m| m.locks.is_none()) {
-        if saver.source == "none" && sleep.source == "none" {
-            return screenlock_row(
-                "windows",
-                "unknown",
-                None,
-                "none",
-                "no screen-lock policy, screen saver, or power values found",
-            );
-        }
-        return screenlock_row(
-            "windows",
-            "unknown",
-            saver.delay_seconds,
-            saver.source,
-            &detail,
-        );
+    // The source names the mechanism that could not be read, and no delay is
+    // reported: any figure here would belong to a mechanism that does not
+    // lock, which is not what "unknown" means.
+    if let Some(m) = mechanisms.iter().find(|m| m.locks.is_none()) {
+        return screenlock_row("windows", "unknown", None, m.source, &detail);
     }
     // Every mechanism was readable and none of them locks.
     let m = mechanisms
@@ -1959,8 +1973,11 @@ const SUB_VIDEO: &str = "7516b95f-f776-4464-8c53-06167f40cc99";
 const SETTING_VIDEO_IDLE: &str = "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e";
 
 /// Whether the host has a system battery. BATTERY_FLAG_NO_SYSTEM_BATTERY
-/// (128) is the one bit that answers it; a failed call stays None so the
-/// verdict degrades to unknown rather than judging a laptop as a desktop.
+/// (128) is the one bit that answers it. 255 is the documented "unknown
+/// status" value, and it has that bit set, so it must be read as unknown
+/// rather than as a desktop — otherwise a laptop whose battery cannot be
+/// read has its battery-side settings dropped and can report a lock it does
+/// not have. A failed call stays None for the same reason.
 #[cfg(target_os = "windows")]
 fn has_battery() -> Option<bool> {
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
@@ -1969,7 +1986,24 @@ fn has_battery() -> Option<bool> {
     if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
         return None;
     }
-    Some(status.BatteryFlag & 128 == 0)
+    match status.BatteryFlag {
+        255 => None,
+        flag => Some(flag & 128 == 0),
+    }
+}
+
+/// Whether the host has any sleep state available. A VM, and many desktops,
+/// still store a sleep timeout while `powercfg /a` reports no S1-S4 state, so
+/// the timeout alone would claim a lock that can never happen.
+#[cfg(target_os = "windows")]
+fn can_sleep() -> Option<bool> {
+    use windows_sys::Win32::System::Power::{GetPwrCapabilities, SYSTEM_POWER_CAPABILITIES};
+    let mut caps: SYSTEM_POWER_CAPABILITIES = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is to a live, fully initialised local.
+    if unsafe { GetPwrCapabilities(&mut caps) } == 0 {
+        return None;
+    }
+    Some(caps.SystemS1 != 0 || caps.SystemS2 != 0 || caps.SystemS3 != 0 || caps.SystemS4 != 0)
 }
 
 #[cfg(target_os = "windows")]
@@ -2028,10 +2062,11 @@ fn read_sleep_lock_values() -> SleepLockValues {
     };
     let standby = |ac| power_value(&scheme, SUB_SLEEP, SETTING_STANDBY_IDLE, ac).map(u64::from);
     let display_off = |ac| power_value(&scheme, SUB_VIDEO, SETTING_VIDEO_IDLE, ac).map(u64::from);
+    let console_lock = |ac| power_value(&scheme, SUB_NONE, SETTING_CONSOLE_LOCK, ac).map(|v| v != 0);
     SleepLockValues {
-        // Lock-on-wake is a per-scheme setting, not per-power-source; both
-        // sides carry the same value, so the mains one answers.
-        console_lock: power_value(&scheme, SUB_NONE, SETTING_CONSOLE_LOCK, true).map(|v| v != 0),
+        console_lock_ac: console_lock(true),
+        console_lock_dc: console_lock(false),
+        can_sleep: can_sleep(),
         standby_ac_secs: standby(true),
         standby_dc_secs: standby(false),
         has_battery: has_battery(),
@@ -6871,7 +6906,9 @@ zroot/ROOT/default / zfs rw 0 0
     /// only and never change a verdict, so they stay unset here.
     fn sleeps(console_lock: bool, ac: u64, dc: u64) -> SleepLockValues {
         SleepLockValues {
-            console_lock: Some(console_lock),
+            console_lock_ac: Some(console_lock),
+            console_lock_dc: Some(console_lock),
+            can_sleep: Some(true),
             standby_ac_secs: Some(ac),
             standby_dc_secs: Some(dc),
             has_battery: Some(true),
@@ -6920,6 +6957,48 @@ zroot/ROOT/default / zfs rw 0 0
     }
 
     #[test]
+    fn sleep_lock_says_no_when_only_one_power_source_asks_for_the_password() {
+        // "Require a password on wakeup" is stored per power source, and
+        // Group Policy exposes it as two settings. A laptop that asks when
+        // plugged in but not on battery wakes straight to the desktop every
+        // time it is unplugged.
+        let inputs = SleepLockValues {
+            console_lock_dc: Some(false),
+            ..sleeps(true, 600, 600)
+        };
+        assert_eq!(sleep_lock_verdict(&inputs).locks, Some(false));
+    }
+
+    #[test]
+    fn sleep_lock_says_no_when_the_host_has_no_sleep_state() {
+        // A VM stores a sleep timeout it can never act on. Reading the
+        // timeout alone would claim a lock that cannot happen.
+        let inputs = SleepLockValues {
+            can_sleep: Some(false),
+            ..sleeps(true, 600, 600)
+        };
+        assert_eq!(sleep_lock_verdict(&inputs).locks, Some(false));
+        // Unreadable capability is unknown, not a desktop that never sleeps.
+        let inputs = SleepLockValues {
+            can_sleep: None,
+            ..sleeps(true, 600, 600)
+        };
+        assert_eq!(sleep_lock_verdict(&inputs).locks, None);
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_nothing_is_configured_anywhere() {
+        // No screen saver values at all is "not configured", which locks
+        // nothing -- not "unreadable". Treating it as unknown would mean a
+        // host with no screen lock by any mechanism could never be reported.
+        let inputs = WindowsScreenLockInputs {
+            sleep: sleeps(false, 600, 600),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+    }
+
+    #[test]
     fn sleep_lock_ignores_the_battery_side_on_a_desktop() {
         // A desktop returns a battery-side timeout that never applies.
         let inputs = SleepLockValues {
@@ -6952,6 +7031,13 @@ zroot/ROOT/default / zfs rw 0 0
             ..sleeps(true, 0, 0)
         };
         assert_eq!(sleep_lock_verdict(&inputs).locks, None);
+        // A battery that cannot be read must not be taken for a desktop: the
+        // battery-side values would be dropped and a lock claimed without them.
+        let inputs = SleepLockValues {
+            has_battery: None,
+            ..sleeps(true, 900, 0)
+        };
+        assert_eq!(sleep_lock_verdict(&inputs).locks, None);
         // Nothing read at all names no source, so the row can report "none".
         let v = sleep_lock_verdict(&SleepLockValues::default());
         assert_eq!(v.locks, None);
@@ -6979,7 +7065,7 @@ zroot/ROOT/default / zfs rw 0 0
         // Both mechanisms stay visible in the evidence.
         let detail = row[0]["detail"].as_str().unwrap();
         assert!(detail.contains("ScreenSaverIsSecure=unset"));
-        assert!(detail.contains("ConsoleLock=true"));
+        assert!(detail.contains("ConsoleLockAC=true"));
     }
 
     #[test]
