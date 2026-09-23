@@ -1570,11 +1570,20 @@ struct SleepLockValues {
     /// CONSOLELOCK: "require a password on wakeup" for the active scheme.
     console_lock: Option<bool>,
     /// STANDBYIDLE on mains and on battery, in seconds. 0 means "never".
-    /// Both are read: a laptop is on battery as often as not, and a scheme
-    /// that sleeps on one and never on the other locks on one and not the
-    /// other.
+    /// Both are read and both must lock: a machine that sleeps on battery and
+    /// never on mains sits unlocked whenever it is plugged in. Measured on a
+    /// Windows 11 laptop, the two differ in practice.
     standby_ac_secs: Option<u64>,
     standby_dc_secs: Option<u64>,
+    /// Whether the host has a battery at all. On a desktop the battery-side
+    /// values are returned but never apply, so only the mains side is judged.
+    has_battery: Option<bool>,
+    /// Evidence only. The display-off timeouts say when the screen goes dark,
+    /// which is not the same as locking: Windows locks on wake from sleep,
+    /// not on an idle display. They are reported so the whole idle picture is
+    /// visible behind the verdict, and they never decide it.
+    display_off_ac_secs: Option<u64>,
+    display_off_dc_secs: Option<u64>,
 }
 
 /// Every screen-lock source on a Windows host, as raw text. The IO wrapper
@@ -1662,18 +1671,22 @@ struct LockVerdict {
 /// demands a password on wake, so lock engages only when the password is
 /// required AND the machine actually sleeps.
 ///
-/// The delay is the sooner of the mains and battery timeouts: whichever
-/// applies, the screen is locked by then. A timeout of 0 means "never sleeps"
-/// and is no candidate; when every readable timeout is 0 the machine never
-/// sleeps on its own and this path is a definite "no". One unreadable timeout
-/// leaves it unknown rather than inventing a "no" from the other.
+/// Every power source that applies must lock, and the delay is the LONGEST of
+/// them: the machine is on one source or the other, so the honest answer to
+/// "how long can this sit unlocked" is the worst case. A timeout of 0 means
+/// "never sleeps", so a machine that sleeps on battery and never on mains is
+/// a definite "no" — it sits unlocked whenever it is plugged in. An
+/// unreadable value leaves the path unknown rather than inventing an answer.
 #[cfg(any(target_os = "windows", test))]
 fn sleep_lock_verdict(sleep: &SleepLockValues) -> LockVerdict {
     let detail = format!(
-        "ConsoleLock={} StandbyIdleAC={} StandbyIdleDC={}",
+        "ConsoleLock={} StandbyIdleAC={} StandbyIdleDC={} Battery={} DisplayOffAC={} DisplayOffDC={}",
         fmt_opt(sleep.console_lock),
         fmt_opt(sleep.standby_ac_secs),
         fmt_opt(sleep.standby_dc_secs),
+        fmt_opt(sleep.has_battery),
+        fmt_opt(sleep.display_off_ac_secs),
+        fmt_opt(sleep.display_off_dc_secs),
     );
     let verdict = |locks, delay_seconds| LockVerdict {
         locks,
@@ -1695,16 +1708,21 @@ fn sleep_lock_verdict(sleep: &SleepLockValues) -> LockVerdict {
         Some(false) => return verdict(Some(false), None),
         Some(true) => {}
     }
-    let (ac, dc) = (sleep.standby_ac_secs, sleep.standby_dc_secs);
-    if let Some(secs) = [ac, dc].into_iter().flatten().filter(|s| *s > 0).min() {
-        return verdict(Some(true), Some(secs));
+    // On a desktop the battery-side timeout is returned but never applies.
+    let mut applies = vec![sleep.standby_ac_secs];
+    match sleep.has_battery {
+        None => return unreadable(),
+        Some(true) => applies.push(sleep.standby_dc_secs),
+        Some(false) => {}
     }
-    if ac.is_some() && dc.is_some() {
+    if applies.iter().any(|t| t.is_none()) {
+        return unreadable();
+    }
+    let timeouts: Vec<u64> = applies.into_iter().flatten().collect();
+    if timeouts.iter().any(|t| *t == 0) {
         return verdict(Some(false), Some(0));
     }
-    // "Require a password" is on but no timeout could be read: the machine may
-    // or may not ever sleep, so this path cannot answer.
-    unreadable()
+    verdict(Some(true), timeouts.into_iter().max())
 }
 
 /// The screensaver path: it must be active, must ask for a password, must
@@ -1934,6 +1952,24 @@ const SETTING_CONSOLE_LOCK: &str = "0e796bdb-100d-47d6-a2d5-f7d2daa51f51";
 const SUB_SLEEP: &str = "238c9fa8-0aad-41ed-83f4-97be242c8f20";
 #[cfg(target_os = "windows")]
 const SETTING_STANDBY_IDLE: &str = "29f6c1db-86da-48c5-9fdb-f2b67b1f44da";
+#[cfg(target_os = "windows")]
+const SUB_VIDEO: &str = "7516b95f-f776-4464-8c53-06167f40cc99";
+#[cfg(target_os = "windows")]
+const SETTING_VIDEO_IDLE: &str = "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e";
+
+/// Whether the host has a system battery. BATTERY_FLAG_NO_SYSTEM_BATTERY
+/// (128) is the one bit that answers it; a failed call stays None so the
+/// verdict degrades to unknown rather than judging a laptop as a desktop.
+#[cfg(target_os = "windows")]
+fn has_battery() -> Option<bool> {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is to a live, fully initialised local.
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return None;
+    }
+    Some(status.BatteryFlag & 128 == 0)
+}
 
 #[cfg(target_os = "windows")]
 fn guid_from(text: &str) -> Option<windows_sys::core::GUID> {
@@ -1988,12 +2024,16 @@ fn read_sleep_lock_values() -> SleepLockValues {
         return SleepLockValues::default();
     };
     let standby = |ac| power_value(&scheme, SUB_SLEEP, SETTING_STANDBY_IDLE, ac).map(u64::from);
+    let display_off = |ac| power_value(&scheme, SUB_VIDEO, SETTING_VIDEO_IDLE, ac).map(u64::from);
     SleepLockValues {
         // Lock-on-wake is a per-scheme setting, not per-power-source; both
         // sides carry the same value, so the mains one answers.
         console_lock: power_value(&scheme, SUB_NONE, SETTING_CONSOLE_LOCK, true).map(|v| v != 0),
         standby_ac_secs: standby(true),
         standby_dc_secs: standby(false),
+        has_battery: has_battery(),
+        display_off_ac_secs: display_off(true),
+        display_off_dc_secs: display_off(false),
     }
 }
 
@@ -6824,11 +6864,16 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(row[0]["source"], "none");
     }
 
+    /// A laptop, so both power sources apply. Display-off values are evidence
+    /// only and never change a verdict, so they stay unset here.
     fn sleeps(console_lock: bool, ac: u64, dc: u64) -> SleepLockValues {
         SleepLockValues {
             console_lock: Some(console_lock),
             standby_ac_secs: Some(ac),
             standby_dc_secs: Some(dc),
+            has_battery: Some(true),
+            display_off_ac_secs: None,
+            display_off_dc_secs: None,
         }
     }
 
@@ -6852,15 +6897,35 @@ zroot/ROOT/default / zfs rw 0 0
     }
 
     #[test]
-    fn sleep_lock_reports_the_sooner_of_the_two_timeouts() {
-        // The machine locks at whichever timeout applies, so the sooner one
-        // is the honest time to a locked screen.
+    fn sleep_lock_reports_the_worst_of_the_two_timeouts() {
+        // The machine is on one power source or the other, so "how long can
+        // this sit unlocked" is answered by the longer of the two.
         let v = sleep_lock_verdict(&sleeps(true, 900, 600));
         assert_eq!(v.locks, Some(true));
-        assert_eq!(v.delay_seconds, Some(600));
+        assert_eq!(v.delay_seconds, Some(900));
         assert_eq!(v.source, "sleep_policy");
-        // A "never" on one side is not a candidate, but does not hide the other.
-        assert_eq!(sleep_lock_verdict(&sleeps(true, 0, 600)).delay_seconds, Some(600));
+    }
+
+    #[test]
+    fn sleep_lock_says_no_when_only_one_power_source_sleeps() {
+        // Measured on a Windows 11 laptop: mains and battery really do differ.
+        // A machine that never sleeps on mains sits unlocked whenever it is
+        // plugged in, so this is a "no", not a lock after 600s.
+        let v = sleep_lock_verdict(&sleeps(true, 0, 600));
+        assert_eq!(v.locks, Some(false));
+        assert_eq!(v.delay_seconds, Some(0));
+    }
+
+    #[test]
+    fn sleep_lock_ignores_the_battery_side_on_a_desktop() {
+        // A desktop returns a battery-side timeout that never applies.
+        let inputs = SleepLockValues {
+            has_battery: Some(false),
+            ..sleeps(true, 600, 0)
+        };
+        let v = sleep_lock_verdict(&inputs);
+        assert_eq!(v.locks, Some(true));
+        assert_eq!(v.delay_seconds, Some(600));
     }
 
     #[test]
@@ -6880,9 +6945,8 @@ zroot/ROOT/default / zfs rw 0 0
     fn sleep_lock_stays_unknown_when_a_timeout_is_unreadable() {
         // One readable zero says nothing about the other side.
         let inputs = SleepLockValues {
-            console_lock: Some(true),
-            standby_ac_secs: Some(0),
             standby_dc_secs: None,
+            ..sleeps(true, 0, 0)
         };
         assert_eq!(sleep_lock_verdict(&inputs).locks, None);
         // Nothing read at all names no source, so the row can report "none".
@@ -6907,7 +6971,7 @@ zroot/ROOT/default / zfs rw 0 0
         };
         let row = windows_screenlock_row(&inputs);
         assert_eq!(row[0]["enabled"], "yes");
-        assert_eq!(row[0]["delay_seconds"], 900);
+        assert_eq!(row[0]["delay_seconds"], 1800);
         assert_eq!(row[0]["source"], "sleep_policy");
         // Both mechanisms stay visible in the evidence.
         let detail = row[0]["detail"].as_str().unwrap();
@@ -6958,7 +7022,8 @@ zroot/ROOT/default / zfs rw 0 0
         // Measured on a Windows 11 laptop (PROD-5063): the power API reports
         // CONSOLELOCK=1 on both power sources even though `powercfg /q` hides
         // the setting and the registry holds no value for it, while sleep is
-        // switched off entirely. The secure screensaver is what locks it.
+        // switched off entirely and the display turns off only on battery.
+        // The secure screensaver is what actually locks this machine.
         let inputs = WindowsScreenLockInputs {
             user_preference: ScreenSaverValues {
                 active: Some("1".into()),
@@ -6966,7 +7031,11 @@ zroot/ROOT/default / zfs rw 0 0
                 timeout_seconds: Some("300".into()),
                 exe: Some(r"C:\Windows\System32\scrnsave.scr".into()),
             },
-            sleep: sleeps(true, 0, 0),
+            sleep: SleepLockValues {
+                display_off_ac_secs: Some(0),
+                display_off_dc_secs: Some(180),
+                ..sleeps(true, 0, 0)
+            },
             ..Default::default()
         };
         let row = windows_screenlock_row(&inputs);
