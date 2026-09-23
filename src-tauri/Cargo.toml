@@ -86,7 +86,10 @@ zbus = "5"
 winreg = "0.55"
 # Password and lockout policy through NetUserModalsGet, which any user may
 # call; `net accounts` wraps the same call but prints localized labels.
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_NetworkManagement_NetManagement"] }
+# Win32_System_Power reads the screen lock Windows 11 users actually set
+# (Settings -> Accounts -> Sign-in options): the power API resolves a scheme's
+# defaults, which a raw registry walk does not.
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_NetworkManagement_NetManagement", "Win32_System_Power"] }
 
 
 #[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
