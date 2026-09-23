@@ -1560,6 +1560,46 @@ struct ScreenSaverValues {
     exe: Option<String>,             // SCRNSAVE.EXE         the saver; absent = "(None)"
 }
 
+/// The power-configuration values behind the lock Windows 11 users actually
+/// set: Settings -> Accounts -> Sign-in options writes none of the screensaver
+/// values, so the screensaver keys alone cannot see it. These arrive already
+/// parsed, because the power API hands back numbers rather than REG_SZ text.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default, Clone, PartialEq)]
+struct PowerLockValues {
+    /// CONSOLELOCK: "require a password on wakeup". Group Policy exposes this
+    /// as two settings, "(plugged in)" and "(on battery)", and the power
+    /// framework stores an index per power source, so both are read and both
+    /// must require the password. It gates every resume path below.
+    console_lock_ac: Option<bool>,
+    console_lock_dc: Option<bool>,
+    /// Which power states the firmware actually offers. A timeout is stored
+    /// and returned whether or not its state exists, so each path is judged
+    /// only when its state is available. Measured on a Windows 11 laptop with
+    /// Device Guard on: no standby at all, hibernate only.
+    standby_available: Option<bool>,
+    hibernate_available: Option<bool>,
+    /// Modern Standby (S0 low power idle). On these hosts the display turning
+    /// off IS entry into low-power idle, so the display-off timeout is a real
+    /// lock trigger. On every other host a dark screen locks nothing.
+    modern_standby: Option<bool>,
+    /// The idle timeout that triggers each state, per power source, in
+    /// seconds. 0 means "never". Both sources are read and both must lock: a
+    /// machine that sleeps on battery and never on mains sits unlocked the
+    /// whole time it is plugged in.
+    standby_ac_secs: Option<u64>,
+    standby_dc_secs: Option<u64>,
+    hibernate_ac_secs: Option<u64>,
+    hibernate_dc_secs: Option<u64>,
+    /// Display-off. A lock trigger only under Modern Standby; reported either
+    /// way, because it is the rest of the idle picture behind the verdict.
+    display_off_ac_secs: Option<u64>,
+    display_off_dc_secs: Option<u64>,
+    /// Whether the host has a battery at all. On a desktop the battery-side
+    /// values are returned but never apply, so only the mains side is judged.
+    has_battery: Option<bool>,
+}
+
 /// Every screen-lock source on a Windows host, as raw text. The IO wrapper
 /// fills it; every decision below is pure and unit-tested on any host. The
 /// screen-saver policies are user-scope only (ControlPanelDisplay.admx), so
@@ -1575,6 +1615,9 @@ struct WindowsScreenLockInputs {
     user_policy: ScreenSaverValues,
     /// HKCU\Control Panel\Desktop
     user_preference: ScreenSaverValues,
+    /// The active power scheme: lock-on-wake, the idle timeouts, and which
+    /// low-power states the firmware actually offers.
+    power: PowerLockValues,
 }
 
 /// Parse a REG_SZ boolean ("1" or "0"). Anything else is unknown, never a
@@ -1626,28 +1669,166 @@ fn first_set<'a, T>(
     }
 }
 
-/// Windows screenlock row. Decision order:
-/// 1. A machine inactivity limit above zero locks the console whatever the
-///    screensaver says, so it answers "yes" outright.
-/// 2. Otherwise the screensaver must be active, must ask for a password,
-///    must have a non-zero timeout, and a saver must be selected: Windows
-///    runs no saver, and so never locks, when SCRNSAVE.EXE is unset, whatever
-///    the other three say. Any definite failure is "no"; a missing value is
-///    "unknown". A definite "no" beats "unknown", so a saver that never asks
-///    for a password is reported even when its timeout is unset.
+/// One mechanism's answer: Some(true) locks, Some(false) does not, None could
+/// not be read. The delay is the time to a locked screen when it locks, and
+/// whatever the mechanism could still say about timing when it does not.
 #[cfg(any(target_os = "windows", test))]
-fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
-    if let Some(secs) = parse_reg_sz_u64(inputs.inactivity_timeout_secs.as_deref()) {
-        if secs > 0 {
-            return screenlock_row(
-                "windows",
-                "yes",
-                Some(secs),
-                "machine_inactivity_policy",
-                &format!("InactivityTimeoutSecs={}", secs),
-            );
+struct LockVerdict {
+    locks: Option<bool>,
+    delay_seconds: Option<u64>,
+    source: &'static str,
+    detail: String,
+}
+
+/// The power path: Windows 11 puts the lock people actually set under
+/// Settings -> Accounts -> Sign-in options, which writes none of the
+/// screensaver values. The host enters a low-power state after an idle
+/// timeout and demands a password on resume, so a lock needs BOTH the
+/// password requirement AND a state it can actually enter.
+///
+/// Which states exist is firmware-dependent, and a timeout is stored whether
+/// or not its state exists — measured on a Windows 11 laptop with Device
+/// Guard on, every standby state was unavailable and only hibernate remained,
+/// with the hibernate timeout set. Judging the standby timeout alone would
+/// have called that host unlocked. So each trigger counts only when its state
+/// is available: standby idle for S1-S3, hibernate idle for S4, and, under
+/// Modern Standby, the display-off timeout, because there the screen going
+/// dark IS entry into low-power idle.
+///
+/// Within a power source the SOONEST firing trigger is when it locks. Across
+/// sources the delay is the LONGEST: the host is on one or the other, so the
+/// honest answer to "how long can this sit unlocked" is the worst case. An
+/// unreadable value leaves the path unknown rather than inventing an answer.
+#[cfg(any(target_os = "windows", test))]
+fn power_lock_verdict(power: &PowerLockValues) -> LockVerdict {
+    let detail = format!(
+        "ConsoleLockAC={} ConsoleLockDC={} StandbyIdleAC={} StandbyIdleDC={} HibernateIdleAC={} HibernateIdleDC={} DisplayOffAC={} DisplayOffDC={} Standby={} Hibernate={} ModernStandby={} Battery={}",
+        fmt_opt(power.console_lock_ac),
+        fmt_opt(power.console_lock_dc),
+        fmt_opt(power.standby_ac_secs),
+        fmt_opt(power.standby_dc_secs),
+        fmt_opt(power.hibernate_ac_secs),
+        fmt_opt(power.hibernate_dc_secs),
+        fmt_opt(power.display_off_ac_secs),
+        fmt_opt(power.display_off_dc_secs),
+        fmt_opt(power.standby_available),
+        fmt_opt(power.hibernate_available),
+        fmt_opt(power.modern_standby),
+        fmt_opt(power.has_battery),
+    );
+    let verdict = |locks, delay_seconds| LockVerdict {
+        locks,
+        delay_seconds,
+        source: "power_policy",
+        detail: detail.clone(),
+    };
+    // Nothing read at all: this path names no source, so a host where neither
+    // mechanism is readable can still report "none".
+    let unreadable = || LockVerdict {
+        locks: None,
+        delay_seconds: None,
+        source: "none",
+        detail: detail.clone(),
+    };
+    let (Some(standby_ok), Some(hibernate_ok), Some(s0ix)) = (
+        power.standby_available,
+        power.hibernate_available,
+        power.modern_standby,
+    ) else {
+        return unreadable();
+    };
+    // No power state to enter at all: every timeout below is stored but never
+    // fires, so nothing here locks the host.
+    if !standby_ok && !hibernate_ok && !s0ix {
+        return verdict(Some(false), None);
+    }
+
+    // Each power source is judged on its own values. On a desktop the
+    // battery-side ones are returned but never apply.
+    let mut sources = vec![(
+        power.console_lock_ac,
+        power.standby_ac_secs,
+        power.hibernate_ac_secs,
+        power.display_off_ac_secs,
+    )];
+    match power.has_battery {
+        None => return unreadable(),
+        Some(true) => sources.push((
+            power.console_lock_dc,
+            power.standby_dc_secs,
+            power.hibernate_dc_secs,
+            power.display_off_dc_secs,
+        )),
+        Some(false) => {}
+    }
+
+    // Only the triggers whose power state exists are candidates: a timeout
+    // for a state the firmware does not offer never fires. Under Modern
+    // Standby the display turning off IS entry into low-power idle, so
+    // resuming from it demands the password.
+    let candidates = |standby, hibernate, display_off| {
+        let mut triggers = Vec::new();
+        // Modern Standby replaces S1-S3 rather than removing the idea of
+        // sleeping: "sleep after" still enters low-power idle there, so the
+        // standby timeout counts on those hosts too. Measured on a customer
+        // machine reporting S1-S3 unavailable "because S0 low power idle is
+        // supported", with a sleep timeout set and honoured.
+        if standby_ok || s0ix {
+            triggers.push(standby);
+        }
+        if hibernate_ok {
+            triggers.push(hibernate);
+        }
+        if s0ix {
+            triggers.push(display_off);
+        }
+        triggers
+    };
+
+    // Every applicable value must be readable before ANY source is judged:
+    // one power source saying "never" says nothing about the other.
+    if sources
+        .iter()
+        .any(|(lock, standby, hibernate, display_off)| {
+            lock.is_none()
+                || candidates(*standby, *hibernate, *display_off)
+                    .iter()
+                    .any(Option::is_none)
+        })
+    {
+        return unreadable();
+    }
+
+    let mut worst = Vec::new();
+    for (lock, standby, hibernate, display_off) in sources {
+        // Windows wakes straight to the desktop on this power source.
+        if lock == Some(false) {
+            return verdict(Some(false), None);
+        }
+        // The soonest trigger that actually fires is when this source locks;
+        // a 0 means that one never fires and is no candidate.
+        match candidates(standby, hibernate, display_off)
+            .into_iter()
+            .flatten()
+            .filter(|t| *t > 0)
+            .min()
+        {
+            Some(secs) => worst.push(secs),
+            // Every available state is set to "never" on this power source.
+            None => return verdict(Some(false), Some(0)),
         }
     }
+    // The host is on one source or the other, so the worst case answers "how
+    // long can this sit unlocked".
+    verdict(Some(true), worst.into_iter().max())
+}
+
+/// The screensaver path: it must be active, must ask for a password, must
+/// have a non-zero timeout, and a saver must be selected — Windows runs no
+/// saver, and so never locks, when SCRNSAVE.EXE is unset, whatever the other
+/// three say. Any definite failure is "no"; a missing value is unknown.
+#[cfg(any(target_os = "windows", test))]
+fn screensaver_lock_verdict(inputs: &WindowsScreenLockInputs) -> LockVerdict {
     let ranked = [
         ("user_policy", &inputs.user_policy),
         ("user", &inputs.user_preference),
@@ -1676,39 +1857,145 @@ fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
             _ => 2,
         })
         .unwrap_or("none");
+    let verdict = |locks, delay_seconds, detail: String| LockVerdict {
+        locks,
+        delay_seconds,
+        source,
+        detail,
+    };
     if source == "none" {
-        return screenlock_row(
-            "windows",
-            "unknown",
-            None,
-            "none",
-            "no screen-lock policy and no screen saver values found",
-        );
+        // Not "unreadable": the agent runs as the signed-in person and this
+        // key is theirs to read, so no values means the screen saver is not
+        // configured, and an unconfigured screen saver locks nothing. Calling
+        // it unknown would mean a host with no lock at all could never be
+        // reported as having none.
+        return LockVerdict {
+            locks: Some(false),
+            delay_seconds: None,
+            source: "none",
+            detail: "no screen saver values set, so no screen saver locks this host".to_string(),
+        };
     }
     if active.value == Some(false) || secure.value == Some(false) {
-        return screenlock_row("windows", "no", timeout.value, source, &detail);
+        return verdict(Some(false), timeout.value, detail);
     }
     if timeout.value == Some(0) {
         // Mirrors the GNOME idle-delay=0 rule: a lock that never triggers is
         // not a lock.
-        return screenlock_row("windows", "no", Some(0), source, &detail);
+        return verdict(Some(false), Some(0), detail);
     }
     match (active.value, secure.value, timeout.value) {
-        (Some(true), Some(true), Some(t)) if exe.value.is_none() => screenlock_row(
-            "windows",
-            "no",
+        (Some(true), Some(true), Some(t)) if exe.value.is_none() => verdict(
+            Some(false),
             Some(t),
-            source,
-            &format!(
+            format!(
                 "{} (no screen saver selected, so none runs and nothing locks)",
                 detail
             ),
         ),
-        (Some(true), Some(true), Some(t)) => {
-            screenlock_row("windows", "yes", Some(t), source, &detail)
-        }
-        _ => screenlock_row("windows", "unknown", timeout.value, source, &detail),
+        (Some(true), Some(true), Some(t)) => verdict(Some(true), Some(t), detail),
+        _ => verdict(None, timeout.value, detail),
     }
+}
+
+/// Windows screenlock row. Decision order:
+/// 1. A machine inactivity limit above zero locks the console whatever every
+///    other mechanism says, so it answers "yes" outright.
+/// 2. Otherwise the screensaver and the power path each answer, and the row
+///    combines them: a machine locks if ANY mechanism locks it, reported at
+///    the soonest delay, because that is when the screen is actually locked.
+///    Failing that, an unreadable mechanism outranks a definite "no" — it
+///    might be the one that locks — so "no" is reported only when every
+///    mechanism was readable and none of them locks. The agent never reports
+///    a lock missing on the strength of a value it could not see.
+#[cfg(any(target_os = "windows", test))]
+fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
+    if let Some(secs) = parse_reg_sz_u64(inputs.inactivity_timeout_secs.as_deref()) {
+        if secs > 0 {
+            return screenlock_row(
+                "windows",
+                "yes",
+                Some(secs),
+                "machine_inactivity_policy",
+                &format!("InactivityTimeoutSecs={}", secs),
+            );
+        }
+    }
+    let saver = screensaver_lock_verdict(inputs);
+    let power = power_lock_verdict(&inputs.power);
+    let detail = format!("{} | {}", saver.detail, power.detail);
+    let mechanisms = [&saver, &power];
+
+    // The soonest lock wins: two mechanisms that both lock leave the screen
+    // locked at the earlier of the two.
+    let locking = mechanisms
+        .iter()
+        .filter(|m| m.locks == Some(true))
+        .min_by_key(|m| m.delay_seconds.unwrap_or(u64::MAX));
+    if let Some(m) = locking {
+        return screenlock_row("windows", "yes", m.delay_seconds, m.source, &detail);
+    }
+    // A mechanism the agent could not read might be the one that locks, so it
+    // outranks a definite "no" from the others: the row never reports a lock
+    // missing on the strength of a value nobody could see.
+    // The source names the mechanism that could not be read, and no delay is
+    // reported: any figure here would belong to a mechanism that does not
+    // lock, which is not what "unknown" means.
+    if let Some(m) = mechanisms.iter().find(|m| m.locks.is_none()) {
+        return screenlock_row("windows", "unknown", None, m.source, &detail);
+    }
+    // Every mechanism was readable and none of them locks.
+    let m = mechanisms
+        .iter()
+        .find(|m| m.locks == Some(false))
+        .copied()
+        .unwrap_or(&saver);
+    screenlock_row("windows", "no", m.delay_seconds, m.source, &detail)
+}
+
+/// A GUID split into the parts the Win32 GUID struct wants. Kept free of any
+/// windows-sys type so the parser is unit-tested on any host.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct GuidParts {
+    d1: u32,
+    d2: u16,
+    d3: u16,
+    d4: [u8; 8],
+}
+
+/// Parse the registry's active power scheme, a GUID as text, optionally in
+/// braces: "381b4222-f694-41f0-9685-ff5bb260df2e". Anything else is None, so
+/// an unreadable scheme reports unknown rather than reading some other one.
+#[cfg(any(target_os = "windows", test))]
+fn parse_guid(raw: &str) -> Option<GuidParts> {
+    let text = raw.trim().trim_start_matches('{').trim_end_matches('}');
+    let fields: Vec<&str> = text.split('-').collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    let lengths = [8, 4, 4, 4, 12];
+    if fields.iter().zip(lengths).any(|(f, n)| f.len() != n) {
+        return None;
+    }
+    if !fields
+        .iter()
+        .all(|f| f.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    let mut d4 = [0u8; 8];
+    // The last two fields run together as the eight trailing bytes.
+    let tail: String = format!("{}{}", fields[3], fields[4]);
+    for (i, byte) in d4.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&tail[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(GuidParts {
+        d1: u32::from_str_radix(fields[0], 16).ok()?,
+        d2: u16::from_str_radix(fields[1], 16).ok()?,
+        d3: u16::from_str_radix(fields[2], 16).ok()?,
+        d4,
+    })
 }
 
 /// Parse a REG_SZ path (SCRNSAVE.EXE). Empty text means no saver.
@@ -1748,6 +2035,141 @@ fn read_screensaver_values(root: winreg::HKEY, path: &str) -> ScreenSaverValues 
     }
 }
 
+/// The power settings behind "require a password on wakeup" and "put the
+/// computer to sleep", as documented power-setting GUIDs. Stable since
+/// Windows Vista; `powercfg /q SCHEME_CURRENT <subgroup> <setting>` prints
+/// the same two.
+#[cfg(target_os = "windows")]
+const SUB_NONE: &str = "fea3413e-7e05-4911-9a71-700331f1c294";
+#[cfg(target_os = "windows")]
+const SETTING_CONSOLE_LOCK: &str = "0e796bdb-100d-47d6-a2d5-f7d2daa51f51";
+#[cfg(target_os = "windows")]
+const SUB_SLEEP: &str = "238c9fa8-0aad-41ed-83f4-97be242c8f20";
+#[cfg(target_os = "windows")]
+const SETTING_STANDBY_IDLE: &str = "29f6c1db-86da-48c5-9fdb-f2b67b1f44da";
+#[cfg(target_os = "windows")]
+const SETTING_HIBERNATE_IDLE: &str = "9d7815a6-7ee4-497e-8888-515a05f02364";
+#[cfg(target_os = "windows")]
+const SUB_VIDEO: &str = "7516b95f-f776-4464-8c53-06167f40cc99";
+#[cfg(target_os = "windows")]
+const SETTING_VIDEO_IDLE: &str = "3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e";
+
+/// Whether the host has a system battery. BATTERY_FLAG_NO_SYSTEM_BATTERY
+/// (128) is the one bit that answers it. 255 is the documented "unknown
+/// status" value, and it has that bit set, so it must be read as unknown
+/// rather than as a desktop — otherwise a laptop whose battery cannot be
+/// read has its battery-side settings dropped and can report a lock it does
+/// not have. A failed call stays None for the same reason.
+#[cfg(target_os = "windows")]
+fn has_battery() -> Option<bool> {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is to a live, fully initialised local.
+    if unsafe { GetSystemPowerStatus(&mut status) } == 0 {
+        return None;
+    }
+    match status.BatteryFlag {
+        255 => None,
+        flag => Some(flag & 128 == 0),
+    }
+}
+
+/// Which low-power states the firmware offers: (standby S1-S3, hibernate S4,
+/// Modern Standby). `powercfg /a` prints the same three. Each answers whether
+/// the matching idle timeout is a real lock trigger or a stored number that
+/// never fires.
+#[cfg(target_os = "windows")]
+fn power_states() -> (Option<bool>, Option<bool>, Option<bool>) {
+    use windows_sys::Win32::System::Power::{GetPwrCapabilities, SYSTEM_POWER_CAPABILITIES};
+    let mut caps: SYSTEM_POWER_CAPABILITIES = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is to a live, fully initialised local.
+    if unsafe { GetPwrCapabilities(&mut caps) } == 0 {
+        return (None, None, None);
+    }
+    (
+        Some(caps.SystemS1 != 0 || caps.SystemS2 != 0 || caps.SystemS3 != 0),
+        Some(caps.SystemS4 != 0),
+        Some(caps.AoAc != 0),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn guid_from(text: &str) -> Option<windows_sys::core::GUID> {
+    let parts = parse_guid(text)?;
+    Some(windows_sys::core::GUID {
+        data1: parts.d1,
+        data2: parts.d2,
+        data3: parts.d3,
+        data4: parts.d4,
+    })
+}
+
+/// Read one power value on the active scheme. The API resolves a scheme's
+/// defaults, which a raw registry walk does not: an untouched setting has no
+/// value under the scheme's own key and would read as unset.
+#[cfg(target_os = "windows")]
+fn power_value(
+    scheme: &windows_sys::core::GUID,
+    subgroup: &str,
+    setting: &str,
+    ac: bool,
+) -> Option<u32> {
+    use windows_sys::Win32::System::Power::{PowerReadACValueIndex, PowerReadDCValueIndex};
+    let subgroup = guid_from(subgroup)?;
+    let setting = guid_from(setting)?;
+    let mut value: u32 = 0;
+    // windows-sys types HKEY as an isize, not a pointer; 0 is the null root
+    // key, which asks the API for the running configuration.
+    let root = 0;
+    // SAFETY: every pointer is to a live local, and the API writes only the
+    // u32 it is handed. A non-zero return means it wrote nothing.
+    let status = unsafe {
+        if ac {
+            PowerReadACValueIndex(root, scheme, &subgroup, &setting, &mut value)
+        } else {
+            PowerReadDCValueIndex(root, scheme, &subgroup, &setting, &mut value)
+        }
+    };
+    (status == 0).then_some(value)
+}
+
+/// Read the power path: lock-on-wake, the idle timeouts, and which low-power
+/// states the firmware offers, for the active power scheme. Unprivileged.
+/// Every failure stays None, so an unreadable power configuration reports
+/// unknown, never a false "no".
+#[cfg(target_os = "windows")]
+fn read_power_lock_values() -> PowerLockValues {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    let active = reg_value_text(
+        HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes",
+        "ActivePowerScheme",
+    );
+    let Some(scheme) = active.as_deref().and_then(guid_from) else {
+        return PowerLockValues::default();
+    };
+    let standby = |ac| power_value(&scheme, SUB_SLEEP, SETTING_STANDBY_IDLE, ac).map(u64::from);
+    let hibernate = |ac| power_value(&scheme, SUB_SLEEP, SETTING_HIBERNATE_IDLE, ac).map(u64::from);
+    let display_off = |ac| power_value(&scheme, SUB_VIDEO, SETTING_VIDEO_IDLE, ac).map(u64::from);
+    let console_lock =
+        |ac| power_value(&scheme, SUB_NONE, SETTING_CONSOLE_LOCK, ac).map(|v| v != 0);
+    let (standby_available, hibernate_available, modern_standby) = power_states();
+    PowerLockValues {
+        console_lock_ac: console_lock(true),
+        console_lock_dc: console_lock(false),
+        standby_available,
+        hibernate_available,
+        modern_standby,
+        standby_ac_secs: standby(true),
+        standby_dc_secs: standby(false),
+        hibernate_ac_secs: hibernate(true),
+        hibernate_dc_secs: hibernate(false),
+        display_off_ac_secs: display_off(true),
+        display_off_dc_secs: display_off(false),
+        has_battery: has_battery(),
+    }
+}
+
 /// Read every screen-lock source from the registry. All three keys are
 /// readable without administrator rights. The build is x64, so no WOW64
 /// redirection applies to HKLM\SOFTWARE.
@@ -1765,6 +2187,7 @@ fn read_windows_screenlock_inputs() -> WindowsScreenLockInputs {
             r"Software\Policies\Microsoft\Windows\Control Panel\Desktop",
         ),
         user_preference: read_screensaver_values(HKEY_CURRENT_USER, r"Control Panel\Desktop"),
+        power: read_power_lock_values(),
     }
 }
 
@@ -6405,12 +6828,11 @@ zroot/ROOT/default / zfs rw 0 0
             },
             ..Default::default()
         };
-        let row = windows_screenlock_row(&inputs);
-        assert_eq!(row[0]["enabled"], "no");
-        assert!(row[0]["detail"]
-            .as_str()
-            .unwrap()
-            .contains("no screen saver selected"));
+        // The screensaver path alone answers here: the row folds this in with
+        // the sleep path, which has its own tests.
+        let verdict = screensaver_lock_verdict(&inputs);
+        assert_eq!(verdict.locks, Some(false));
+        assert!(verdict.detail.contains("no screen saver selected"));
         // An empty string is "(None)" too.
         let inputs = WindowsScreenLockInputs {
             user_preference: ScreenSaverValues {
@@ -6419,7 +6841,7 @@ zroot/ROOT/default / zfs rw 0 0
             },
             ..Default::default()
         };
-        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+        assert_eq!(screensaver_lock_verdict(&inputs).locks, Some(false));
     }
 
     #[test]
@@ -6475,7 +6897,7 @@ zroot/ROOT/default / zfs rw 0 0
             user_preference: saver("1", "0", "600"),
             ..Default::default()
         };
-        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+        assert_eq!(screensaver_lock_verdict(&inputs).locks, Some(false));
     }
 
     #[test]
@@ -6486,9 +6908,9 @@ zroot/ROOT/default / zfs rw 0 0
             user_preference: saver("1", "1", "0"),
             ..Default::default()
         };
-        let row = windows_screenlock_row(&inputs);
-        assert_eq!(row[0]["enabled"], "no");
-        assert_eq!(row[0]["delay_seconds"], 0);
+        let verdict = screensaver_lock_verdict(&inputs);
+        assert_eq!(verdict.locks, Some(false));
+        assert_eq!(verdict.delay_seconds, Some(0));
     }
 
     #[test]
@@ -6573,6 +6995,383 @@ zroot/ROOT/default / zfs rw 0 0
         assert_eq!(row[0]["enabled"], "unknown");
         assert!(row[0]["delay_seconds"].is_null());
         assert_eq!(row[0]["source"], "none");
+    }
+
+    /// A laptop with ordinary standby and no Modern Standby, so the standby
+    /// timeout is the only trigger and both power sources apply. Hibernate
+    /// and display-off are set to "never" so each test names its own trigger.
+    fn sleeps(console_lock: bool, ac: u64, dc: u64) -> PowerLockValues {
+        PowerLockValues {
+            console_lock_ac: Some(console_lock),
+            console_lock_dc: Some(console_lock),
+            standby_available: Some(true),
+            hibernate_available: Some(false),
+            modern_standby: Some(false),
+            standby_ac_secs: Some(ac),
+            standby_dc_secs: Some(dc),
+            hibernate_ac_secs: Some(0),
+            hibernate_dc_secs: Some(0),
+            display_off_ac_secs: Some(0),
+            display_off_dc_secs: Some(0),
+            has_battery: Some(true),
+        }
+    }
+
+    #[test]
+    fn guids_parse_in_both_spellings_the_registry_uses() {
+        let parsed = parse_guid("381b4222-f694-41f0-9685-ff5bb260df2e").unwrap();
+        assert_eq!(parsed.d1, 0x381b4222);
+        assert_eq!(parsed.d2, 0xf694);
+        assert_eq!(parsed.d3, 0x41f0);
+        assert_eq!(parsed.d4, [0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e]);
+        // Braces and padding are both shapes the registry hands back.
+        assert_eq!(
+            parse_guid("  {381b4222-f694-41f0-9685-ff5bb260df2e}  "),
+            Some(parsed)
+        );
+        // A scheme that cannot be parsed must not silently read another one.
+        assert_eq!(parse_guid(""), None);
+        assert_eq!(parse_guid("381b4222-f694-41f0-9685"), None);
+        assert_eq!(parse_guid("381b4222-f694-41f0-9685-ff5bb260df2"), None);
+        assert_eq!(parse_guid("zzzzzzzz-f694-41f0-9685-ff5bb260df2e"), None);
+    }
+
+    #[test]
+    fn sleep_lock_reports_the_worst_of_the_two_timeouts() {
+        // The machine is on one power source or the other, so "how long can
+        // this sit unlocked" is answered by the longer of the two.
+        let v = power_lock_verdict(&sleeps(true, 900, 600));
+        assert_eq!(v.locks, Some(true));
+        assert_eq!(v.delay_seconds, Some(900));
+        assert_eq!(v.source, "power_policy");
+    }
+
+    #[test]
+    fn sleep_lock_says_no_when_only_one_power_source_sleeps() {
+        // Measured on a Windows 11 laptop: mains and battery really do differ.
+        // A machine that never sleeps on mains sits unlocked whenever it is
+        // plugged in, so this is a "no", not a lock after 600s.
+        let v = power_lock_verdict(&sleeps(true, 0, 600));
+        assert_eq!(v.locks, Some(false));
+        assert_eq!(v.delay_seconds, Some(0));
+    }
+
+    #[test]
+    fn sleep_lock_says_no_when_only_one_power_source_asks_for_the_password() {
+        // "Require a password on wakeup" is stored per power source, and
+        // Group Policy exposes it as two settings. A laptop that asks when
+        // plugged in but not on battery wakes straight to the desktop every
+        // time it is unplugged.
+        let inputs = PowerLockValues {
+            console_lock_dc: Some(false),
+            ..sleeps(true, 600, 600)
+        };
+        assert_eq!(power_lock_verdict(&inputs).locks, Some(false));
+    }
+
+    #[test]
+    fn power_lock_says_no_when_the_host_has_no_low_power_state() {
+        // A VM stores a sleep timeout it can never act on. Reading the
+        // timeout alone would claim a lock that cannot happen.
+        let inputs = PowerLockValues {
+            standby_available: Some(false),
+            ..sleeps(true, 600, 600)
+        };
+        assert_eq!(power_lock_verdict(&inputs).locks, Some(false));
+        // Unreadable capabilities are unknown, not a host that never sleeps.
+        let inputs = PowerLockValues {
+            standby_available: None,
+            ..sleeps(true, 600, 600)
+        };
+        assert_eq!(power_lock_verdict(&inputs).locks, None);
+    }
+
+    #[test]
+    fn power_lock_reads_hibernate_when_that_is_the_only_state() {
+        // Measured on a Windows 11 laptop with Device Guard on: every standby
+        // state unavailable, hibernate the only one left, and the hibernate
+        // timeout set on battery. Judging the standby timeout alone called
+        // that host unlocked when it locks after three hours unplugged.
+        let inputs = PowerLockValues {
+            standby_available: Some(false),
+            hibernate_available: Some(true),
+            hibernate_ac_secs: Some(7200),
+            hibernate_dc_secs: Some(10800),
+            ..sleeps(true, 0, 0)
+        };
+        let v = power_lock_verdict(&inputs);
+        assert_eq!(v.locks, Some(true));
+        assert_eq!(v.delay_seconds, Some(10800));
+    }
+
+    #[test]
+    fn power_lock_counts_display_off_only_under_modern_standby() {
+        // On a Modern Standby host the display going dark IS entry into
+        // low-power idle, so it locks. Everywhere else a dark screen locks
+        // nothing, and counting it would pass a host that never locks.
+        let s0ix = PowerLockValues {
+            standby_available: Some(false),
+            modern_standby: Some(true),
+            display_off_ac_secs: Some(600),
+            display_off_dc_secs: Some(300),
+            ..sleeps(true, 0, 0)
+        };
+        let v = power_lock_verdict(&s0ix);
+        assert_eq!(v.locks, Some(true));
+        assert_eq!(v.delay_seconds, Some(600));
+
+        let no_s0ix = PowerLockValues {
+            modern_standby: Some(false),
+            ..s0ix
+        };
+        assert_eq!(power_lock_verdict(&no_s0ix).locks, Some(false));
+    }
+
+    #[test]
+    fn windows_screenlock_matches_the_reported_customer_machine() {
+        // Element Standard's machine (PROD-5063), from what they sent us:
+        // sign-in required "Every Time" (greyed out, so policy-managed);
+        // plugged in 15 min screen off / 30 min sleep; on battery 3 min /
+        // 5 min; and `powercfg /a` reporting S0 Low Power Idle available with
+        // S1-S3 unavailable *because* S0ix is supported.
+        //
+        // This is the shape the old code could not answer: no S1-S3, so the
+        // standby timeout looked irrelevant, and no secure screen saver, so
+        // that path says nothing. Under Modern Standby both the sleep and the
+        // display-off timeouts really do lock the host.
+        let inputs = WindowsScreenLockInputs {
+            power: PowerLockValues {
+                console_lock_ac: Some(true),
+                console_lock_dc: Some(true),
+                standby_available: Some(false),
+                hibernate_available: Some(true),
+                modern_standby: Some(true),
+                standby_ac_secs: Some(1800),
+                standby_dc_secs: Some(300),
+                // Not reported by the customer; "never" is the conservative
+                // reading and does not change the verdict.
+                hibernate_ac_secs: Some(0),
+                hibernate_dc_secs: Some(0),
+                display_off_ac_secs: Some(900),
+                display_off_dc_secs: Some(180),
+                has_battery: Some(true),
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        // Soonest trigger per source is display-off (900 mains, 180 battery);
+        // the worst case across the two is what the host can sit unlocked for.
+        assert_eq!(row[0]["delay_seconds"], 900);
+        assert_eq!(row[0]["source"], "power_policy");
+    }
+
+    #[test]
+    fn power_lock_counts_the_sleep_timeout_under_modern_standby() {
+        // S1-S3 gone because S0ix replaced them, and the display is set never
+        // to turn off: the sleep timeout is then the only thing that locks,
+        // and ignoring it would report a locking host as unlocked.
+        let inputs = PowerLockValues {
+            standby_available: Some(false),
+            hibernate_available: Some(false),
+            modern_standby: Some(true),
+            display_off_ac_secs: Some(0),
+            display_off_dc_secs: Some(0),
+            ..sleeps(true, 900, 300)
+        };
+        let v = power_lock_verdict(&inputs);
+        assert_eq!(v.locks, Some(true));
+        assert_eq!(v.delay_seconds, Some(900));
+    }
+
+    #[test]
+    fn power_lock_takes_the_soonest_trigger_within_one_power_source() {
+        // Standby and hibernate both fire; the screen is locked at the first.
+        let inputs = PowerLockValues {
+            hibernate_available: Some(true),
+            hibernate_ac_secs: Some(1800),
+            hibernate_dc_secs: Some(1800),
+            ..sleeps(true, 900, 900)
+        };
+        assert_eq!(power_lock_verdict(&inputs).delay_seconds, Some(900));
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_nothing_is_configured_anywhere() {
+        // No screen saver values at all is "not configured", which locks
+        // nothing -- not "unreadable". Treating it as unknown would mean a
+        // host with no screen lock by any mechanism could never be reported.
+        let inputs = WindowsScreenLockInputs {
+            power: sleeps(false, 600, 600),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+    }
+
+    #[test]
+    fn sleep_lock_ignores_the_battery_side_on_a_desktop() {
+        // A desktop returns a battery-side timeout that never applies.
+        let inputs = PowerLockValues {
+            has_battery: Some(false),
+            ..sleeps(true, 600, 0)
+        };
+        let v = power_lock_verdict(&inputs);
+        assert_eq!(v.locks, Some(true));
+        assert_eq!(v.delay_seconds, Some(600));
+    }
+
+    #[test]
+    fn sleep_lock_says_no_when_waking_needs_no_password() {
+        assert_eq!(
+            power_lock_verdict(&sleeps(false, 600, 600)).locks,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn sleep_lock_says_no_when_the_machine_never_sleeps() {
+        // Require-a-password is on, but nothing ever triggers it.
+        let v = power_lock_verdict(&sleeps(true, 0, 0));
+        assert_eq!(v.locks, Some(false));
+        assert_eq!(v.delay_seconds, Some(0));
+    }
+
+    #[test]
+    fn sleep_lock_stays_unknown_when_a_timeout_is_unreadable() {
+        // One readable zero says nothing about the other side.
+        let inputs = PowerLockValues {
+            standby_dc_secs: None,
+            ..sleeps(true, 0, 0)
+        };
+        assert_eq!(power_lock_verdict(&inputs).locks, None);
+        // A battery that cannot be read must not be taken for a desktop: the
+        // battery-side values would be dropped and a lock claimed without them.
+        let inputs = PowerLockValues {
+            has_battery: None,
+            ..sleeps(true, 900, 0)
+        };
+        assert_eq!(power_lock_verdict(&inputs).locks, None);
+        // Nothing read at all names no source, so the row can report "none".
+        let v = power_lock_verdict(&PowerLockValues::default());
+        assert_eq!(v.locks, None);
+        assert_eq!(v.source, "none");
+    }
+
+    #[test]
+    fn windows_screenlock_yes_from_sleep_when_the_saver_is_silent() {
+        // The Windows 11 default and the shape Element Standard reported
+        // (PROD-5063): a screensaver runs with a timeout but ScreenSaverIsSecure
+        // was never written, so the saver alone is "unknown". The machine still
+        // locks, through sign-in-on-wake.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: ScreenSaverValues {
+                secure: None,
+                ..saver("1", "1", "300")
+            },
+            power: sleeps(true, 1800, 900),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 1800);
+        assert_eq!(row[0]["source"], "power_policy");
+        // Both mechanisms stay visible in the evidence.
+        let detail = row[0]["detail"].as_str().unwrap();
+        assert!(detail.contains("ScreenSaverIsSecure=unset"));
+        assert!(detail.contains("ConsoleLockAC=true"));
+    }
+
+    #[test]
+    fn windows_screenlock_reports_the_soonest_locking_mechanism() {
+        // Both lock; the screen is locked at the earlier of the two.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: saver("1", "1", "300"),
+            power: sleeps(true, 1800, 900),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 300);
+        assert_eq!(row[0]["source"], "user");
+    }
+
+    #[test]
+    fn windows_screenlock_no_when_neither_mechanism_locks() {
+        // A definite "no" from both is a real answer, not "unknown".
+        let inputs = WindowsScreenLockInputs {
+            user_preference: saver("1", "0", "600"),
+            power: sleeps(false, 600, 600),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "no");
+    }
+
+    #[test]
+    fn windows_screenlock_unknown_when_one_mechanism_cannot_be_read() {
+        // The screensaver plainly does not lock, but the power configuration
+        // could not be read and might. Reporting "no" here would mark a
+        // locking machine non-compliant on evidence nobody has.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: saver("1", "0", "600"),
+            power: PowerLockValues::default(),
+            ..Default::default()
+        };
+        assert_eq!(windows_screenlock_row(&inputs)[0]["enabled"], "unknown");
+    }
+
+    #[test]
+    fn windows_screenlock_matches_a_measured_windows_11_laptop() {
+        // Every value measured on a real Windows 11 laptop (PROD-5063).
+        // `powercfg /a`: no standby state at all -- Device Guard disabled S3,
+        // the firmware offers neither S1/S2 nor Modern Standby -- leaving
+        // hibernate, which fires after three hours on battery and never on
+        // mains. CONSOLELOCK reads 1 on both sources through the API while
+        // `powercfg /q` hides it and the registry holds no value for it.
+        //
+        // On mains every available state is set to "never", so the power path
+        // is a definite "no" there and never reaches a delay. The secure
+        // screensaver is what locks this host, on either power source, at
+        // 300s -- so "any mechanism locks" gives yes at 300 from the saver.
+        let inputs = WindowsScreenLockInputs {
+            user_preference: ScreenSaverValues {
+                active: Some("1".into()),
+                secure: Some("1".into()),
+                timeout_seconds: Some("300".into()),
+                exe: Some(r"C:\Windows\System32\scrnsave.scr".into()),
+            },
+            power: PowerLockValues {
+                standby_available: Some(false),
+                hibernate_available: Some(true),
+                modern_standby: Some(false),
+                hibernate_ac_secs: Some(0),
+                hibernate_dc_secs: Some(10800),
+                display_off_ac_secs: Some(0),
+                display_off_dc_secs: Some(180),
+                ..sleeps(true, 0, 0)
+            },
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["enabled"], "yes");
+        assert_eq!(row[0]["delay_seconds"], 300);
+        assert_eq!(row[0]["source"], "user");
+        // The power path saw hibernate, not a dead standby timeout.
+        assert!(row[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("HibernateIdleDC=10800"));
+    }
+
+    #[test]
+    fn windows_screenlock_machine_policy_still_beats_the_sleep_path() {
+        let inputs = WindowsScreenLockInputs {
+            inactivity_timeout_secs: Some("900".into()),
+            power: sleeps(true, 60, 60),
+            ..Default::default()
+        };
+        let row = windows_screenlock_row(&inputs);
+        assert_eq!(row[0]["delay_seconds"], 900);
+        assert_eq!(row[0]["source"], "machine_inactivity_policy");
     }
 
     #[test]
