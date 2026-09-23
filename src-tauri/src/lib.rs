@@ -1719,7 +1719,7 @@ fn sleep_lock_verdict(sleep: &SleepLockValues) -> LockVerdict {
         return unreadable();
     }
     let timeouts: Vec<u64> = applies.into_iter().flatten().collect();
-    if timeouts.iter().any(|t| *t == 0) {
+    if timeouts.contains(&0) {
         return verdict(Some(false), Some(0));
     }
     verdict(Some(true), timeouts.into_iter().max())
