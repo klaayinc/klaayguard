@@ -1901,7 +1901,10 @@ fn parse_guid(raw: &str) -> Option<GuidParts> {
     if fields.iter().zip(lengths).any(|(f, n)| f.len() != n) {
         return None;
     }
-    if !fields.iter().all(|f| f.bytes().all(|b| b.is_ascii_hexdigit())) {
+    if !fields
+        .iter()
+        .all(|f| f.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
         return None;
     }
     let mut d4 = [0u8; 8];
@@ -7012,7 +7015,10 @@ zroot/ROOT/default / zfs rw 0 0
 
     #[test]
     fn sleep_lock_says_no_when_waking_needs_no_password() {
-        assert_eq!(sleep_lock_verdict(&sleeps(false, 600, 600)).locks, Some(false));
+        assert_eq!(
+            sleep_lock_verdict(&sleeps(false, 600, 600)).locks,
+            Some(false)
+        );
     }
 
     #[test]
