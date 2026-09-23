@@ -1857,7 +1857,8 @@ fn windows_screenlock_row(inputs: &WindowsScreenLockInputs) -> Value {
     let m = mechanisms
         .iter()
         .find(|m| m.locks == Some(false))
-        .unwrap_or(&&saver);
+        .copied()
+        .unwrap_or(&saver);
     screenlock_row("windows", "no", m.delay_seconds, m.source, &detail)
 }
 
@@ -1996,14 +1997,16 @@ fn power_value(
     let subgroup = guid_from(subgroup)?;
     let setting = guid_from(setting)?;
     let mut value: u32 = 0;
-    let null = std::ptr::null_mut();
+    // windows-sys types HKEY as an isize, not a pointer; 0 is the null root
+    // key, which asks the API for the running configuration.
+    let root = 0;
     // SAFETY: every pointer is to a live local, and the API writes only the
     // u32 it is handed. A non-zero return means it wrote nothing.
     let status = unsafe {
         if ac {
-            PowerReadACValueIndex(null, scheme, &subgroup, &setting, &mut value)
+            PowerReadACValueIndex(root, scheme, &subgroup, &setting, &mut value)
         } else {
-            PowerReadDCValueIndex(null, scheme, &subgroup, &setting, &mut value)
+            PowerReadDCValueIndex(root, scheme, &subgroup, &setting, &mut value)
         }
     };
     (status == 0).then_some(value)
