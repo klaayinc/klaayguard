@@ -2065,7 +2065,8 @@ fn read_sleep_lock_values() -> SleepLockValues {
     };
     let standby = |ac| power_value(&scheme, SUB_SLEEP, SETTING_STANDBY_IDLE, ac).map(u64::from);
     let display_off = |ac| power_value(&scheme, SUB_VIDEO, SETTING_VIDEO_IDLE, ac).map(u64::from);
-    let console_lock = |ac| power_value(&scheme, SUB_NONE, SETTING_CONSOLE_LOCK, ac).map(|v| v != 0);
+    let console_lock =
+        |ac| power_value(&scheme, SUB_NONE, SETTING_CONSOLE_LOCK, ac).map(|v| v != 0);
     SleepLockValues {
         console_lock_ac: console_lock(true),
         console_lock_dc: console_lock(false),
