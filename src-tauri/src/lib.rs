@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tauri::{Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
@@ -5100,15 +5100,47 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
     }
 }
 
-/// Check for updates immediately, then on a recurring interval (default 6h), so the
-/// always-on agent self-updates in place rather than only at restart.
+/// How often the update loop wakes to ask whether a check is due. Far shorter
+/// than the check period itself, so a host that resumes from suspend catches
+/// up within minutes instead of waiting out a monotonic timer.
+const UPDATE_POLL_SECONDS: u64 = 300;
+
+/// Whether `period` of WALL-CLOCK time has passed since the last check.
+///
+/// `tokio::time::interval` counts monotonic time, which does not advance while
+/// the host is suspended. A laptop that sleeps overnight therefore pushes its
+/// own 6 h check out by however long it slept: measured on a Linux laptop, a
+/// 1 h 23 m suspend moved the next check from 02:05 to about 03:29, and a
+/// machine asleep every night drifts by a working day. Comparing the system
+/// clock instead makes the schedule mean what it says.
+///
+/// A clock that moved backwards (an NTP step, or an RTC read before the
+/// timezone is known) reports due rather than waiting out a period that may
+/// never end.
+fn check_due(last: SystemTime, now: SystemTime, period: Duration) -> bool {
+    match now.duration_since(last) {
+        Ok(elapsed) => elapsed >= period,
+        Err(_) => true,
+    }
+}
+
+/// Check for updates immediately, then every `period` of wall-clock time
+/// (default 6h), so the always-on agent self-updates in place rather than only
+/// at restart — and a laptop that sleeps still updates on schedule.
 fn spawn_update_loop(app: tauri::AppHandle, api_base: String) {
     tauri::async_runtime::spawn(async move {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(update_check_interval_seconds()));
+        let period = Duration::from_secs(update_check_interval_seconds());
+        let poll = period.min(Duration::from_secs(UPDATE_POLL_SECONDS));
+        let mut interval = tokio::time::interval(poll);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last: Option<SystemTime> = None;
         loop {
             interval.tick().await; // first tick is immediate (startup check)
+            let now = SystemTime::now();
+            if last.is_some_and(|prev| !check_due(prev, now, period)) {
+                continue;
+            }
+            last = Some(now);
             log::info!("🚀 Update check against {}", api_base);
             run_update_check(&api_base, &app).await;
         }
@@ -5583,6 +5615,67 @@ pub fn run() {
         }
         _ => {}
     });
+}
+
+#[cfg(test)]
+mod update_schedule_tests {
+    use super::*;
+
+    const SIX_HOURS: Duration = Duration::from_secs(6 * 60 * 60);
+
+    #[test]
+    fn a_check_is_due_only_once_the_period_has_passed() {
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        assert!(!check_due(last, last, SIX_HOURS));
+        assert!(!check_due(
+            last,
+            last + SIX_HOURS - Duration::from_secs(1),
+            SIX_HOURS
+        ));
+        assert!(check_due(last, last + SIX_HOURS, SIX_HOURS));
+        assert!(check_due(
+            last,
+            last + SIX_HOURS + Duration::from_secs(1),
+            SIX_HOURS
+        ));
+    }
+
+    #[test]
+    fn suspended_time_still_counts_towards_the_next_check() {
+        // Measured on a Linux laptop: the last check ran at 20:05, the host
+        // slept 1 h 23 m, and tokio's monotonic interval pushed the next check
+        // from 02:05 to about 03:29. Wall-clock time does not care that the
+        // host was asleep, so at 02:05 the check is due.
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let six_hours_later_including_a_nap = last + SIX_HOURS;
+        assert!(check_due(last, six_hours_later_including_a_nap, SIX_HOURS));
+    }
+
+    #[test]
+    fn a_backwards_clock_reports_due_rather_than_waiting_forever() {
+        // An NTP step or an RTC read before the timezone is known can move the
+        // clock behind the last check. Waiting out a period measured from a
+        // future timestamp could stall updates indefinitely.
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let now = last - Duration::from_secs(3600);
+        assert!(check_due(last, now, SIX_HOURS));
+    }
+
+    #[test]
+    fn the_poll_never_outruns_a_short_period() {
+        // KLAAYGUARD_UPDATE_INTERVAL_SECONDS can be set below the poll for
+        // testing; the loop must then poll at the period, not five minutes.
+        let period = Duration::from_secs(60);
+        assert_eq!(
+            period.min(Duration::from_secs(UPDATE_POLL_SECONDS)),
+            Duration::from_secs(60)
+        );
+        let period = SIX_HOURS;
+        assert_eq!(
+            period.min(Duration::from_secs(UPDATE_POLL_SECONDS)),
+            Duration::from_secs(300)
+        );
+    }
 }
 
 #[cfg(test)]
