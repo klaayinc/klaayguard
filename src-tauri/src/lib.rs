@@ -5117,9 +5117,18 @@ const UPDATE_POLL_SECONDS: u64 = 300;
 /// A clock that moved backwards (an NTP step, or an RTC read before the
 /// timezone is known) reports due rather than waiting out a period that may
 /// never end.
+/// The tick that lands on the boundary can measure a few microseconds short of
+/// the period — tokio's timer and the system clock are different clocks — and a
+/// strict comparison would skip it and wait out another whole poll. Measured on
+/// a Windows test box with the period set to 120 s: checks came every 240 s,
+/// because every second tick lost the comparison by a hair. A second of slack
+/// absorbs that; it cannot make a check early enough to matter against periods
+/// measured in hours.
+const DUE_SLACK: Duration = Duration::from_secs(1);
+
 fn check_due(last: SystemTime, now: SystemTime, period: Duration) -> bool {
     match now.duration_since(last) {
-        Ok(elapsed) => elapsed >= period,
+        Ok(elapsed) => elapsed + DUE_SLACK >= period,
         Err(_) => true,
     }
 }
@@ -5629,7 +5638,7 @@ mod update_schedule_tests {
         assert!(!check_due(last, last, SIX_HOURS));
         assert!(!check_due(
             last,
-            last + SIX_HOURS - Duration::from_secs(1),
+            last + SIX_HOURS - Duration::from_secs(30),
             SIX_HOURS
         ));
         assert!(check_due(last, last + SIX_HOURS, SIX_HOURS));
@@ -5638,6 +5647,17 @@ mod update_schedule_tests {
             last + SIX_HOURS + Duration::from_secs(1),
             SIX_HOURS
         ));
+    }
+
+    #[test]
+    fn a_tick_that_lands_a_hair_early_still_counts() {
+        // tokio's timer and the system clock are different clocks, so the tick
+        // on the boundary can measure just short of the period. Without slack
+        // it is skipped and the next check waits another whole poll: measured
+        // on a Windows box at 240 s intervals for a 120 s period.
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let a_hair_early = last + SIX_HOURS - Duration::from_millis(2);
+        assert!(check_due(last, a_hair_early, SIX_HOURS));
     }
 
     #[test]
