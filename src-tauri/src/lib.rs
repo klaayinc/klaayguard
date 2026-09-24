@@ -5627,9 +5627,17 @@ mod update_schedule_tests {
     fn a_check_is_due_only_once_the_period_has_passed() {
         let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         assert!(!check_due(last, last, SIX_HOURS));
-        assert!(!check_due(last, last + SIX_HOURS - Duration::from_secs(1), SIX_HOURS));
+        assert!(!check_due(
+            last,
+            last + SIX_HOURS - Duration::from_secs(1),
+            SIX_HOURS
+        ));
         assert!(check_due(last, last + SIX_HOURS, SIX_HOURS));
-        assert!(check_due(last, last + SIX_HOURS + Duration::from_secs(1), SIX_HOURS));
+        assert!(check_due(
+            last,
+            last + SIX_HOURS + Duration::from_secs(1),
+            SIX_HOURS
+        ));
     }
 
     #[test]
