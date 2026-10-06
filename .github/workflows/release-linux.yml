@@ -31,10 +31,10 @@ jobs:
             api_url: "https://api.klaay.com"
             frontend_url: "https://app.klaay.com"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       - name: install tauri-cli
         run: cargo install tauri-cli --version "=2.11.4" --locked
