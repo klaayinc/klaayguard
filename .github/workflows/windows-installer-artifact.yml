@@ -55,17 +55,17 @@ jobs:
             api_url: "https://api.klaay.com"
             frontend_url: "https://app.klaay.com"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: x86_64-pc-windows-msvc
 
       # Prebuilt binary, as ci.yml does. cargo install compiles the CLI for
       # ten minutes on every run and the cargo cache does not cover it.
       - name: Install tauri-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: tauri-cli@2.11.4
 
@@ -128,7 +128,7 @@ jobs:
 
       - name: Azure login (OIDC)
         if: steps.sign.outputs.enabled == 'true'
-        uses: azure/login@v2
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
         with:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -136,7 +136,7 @@ jobs:
 
       - name: Sign installer (Azure Trusted Signing)
         if: steps.sign.outputs.enabled == 'true'
-        uses: azure/trusted-signing-action@v0
+        uses: azure/trusted-signing-action@1d365fec12862c4aa68fcac418143d73f0cea293 # v0.5.11
         with:
           endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
@@ -157,7 +157,7 @@ jobs:
           ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v.TrimStart("v")
 
       - name: Upload installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: klaayguard-windows-x64-${{ matrix.build }}
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
@@ -201,25 +201,25 @@ jobs:
             *) echo "run=false" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: steps.want.outputs.run == 'true'
 
       - name: Install Rust stable
         if: steps.want.outputs.run == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo build
         if: steps.want.outputs.run == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
           key: ${{ matrix.target }}-${{ matrix.build }}
 
       - name: Install tauri-cli
         if: steps.want.outputs.run == 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: tauri-cli@2.11.4
 
@@ -305,7 +305,7 @@ jobs:
 
       - name: Upload installers
         if: steps.want.outputs.run == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: klaayguard-macos-${{ matrix.arch }}-${{ matrix.build }}
           path: out/*
@@ -330,19 +330,19 @@ jobs:
             api_url: "https://api.klaay.com"
             frontend_url: "https://app.klaay.com"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: src-tauri
           key: x86_64-unknown-linux-gnu-${{ matrix.build }}
 
       - name: Install tauri-cli
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@183e4297cca2404691e9380e1307288dced5c82a # v2.87.25
         with:
           tool: tauri-cli@2.11.4
 
@@ -392,7 +392,7 @@ jobs:
           ls -l out
 
       - name: Upload installers
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: klaayguard-linux-x86_64-${{ matrix.build }}
           path: out/*

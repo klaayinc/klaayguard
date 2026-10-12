@@ -40,10 +40,10 @@ jobs:
             dmg_dir: src-tauri/target/x86_64-apple-darwin
             artifact_suffix: macOS_x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
