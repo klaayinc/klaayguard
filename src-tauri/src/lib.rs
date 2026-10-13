@@ -2742,7 +2742,7 @@ fn normalize_machine_id(raw: &str) -> Option<String> {
 /// secret — it stops other software from reusing our exact identifier, not a
 /// determined attacker who reads the key.
 fn hash_machine_id(machine_id: &str) -> String {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
     let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"com.klaay.klaayguard")
         .expect("HMAC accepts any key length");
     mac.update(machine_id.as_bytes());

@@ -59,10 +59,10 @@ sentry = { version = "0.42.0", default-features = false, features = [
 ] }
 keyring = "2"
 semver = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 # base64url for the PKCE verifier and its challenge (sign_in.rs).
 base64 = "0.23"
-hmac = "0.12"  # App-scoped hash of the machine id for stable Linux device identity
+hmac = "0.13"  # App-scoped hash of the machine id for stable Linux device identity
 getrandom = "0.4"  # CSPRNG for the PKCE verifier and the device identity (reuses the version already in-tree)
 # `default-features = false`, because the default set also carries `emoji`.
 # Only `paints_nothing` uses this crate, and it asks for one general category.
