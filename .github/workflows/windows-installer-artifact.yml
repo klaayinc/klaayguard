@@ -157,7 +157,7 @@ jobs:
           ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v.TrimStart("v")
 
       - name: Upload installer
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: klaayguard-windows-x64-${{ matrix.build }}
           path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
@@ -305,7 +305,7 @@ jobs:
 
       - name: Upload installers
         if: steps.want.outputs.run == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: klaayguard-macos-${{ matrix.arch }}-${{ matrix.build }}
           path: out/*
@@ -392,7 +392,7 @@ jobs:
           ls -l out
 
       - name: Upload installers
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: klaayguard-linux-x86_64-${{ matrix.build }}
           path: out/*
