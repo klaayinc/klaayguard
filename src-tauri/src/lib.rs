@@ -2873,7 +2873,7 @@ fn read_machine_id() -> Option<String> {
 /// 32 hex characters from the OS CSPRNG, for hosts with no other identity.
 fn generate_device_identity() -> Result<String, String> {
     let mut bytes = [0u8; 16];
-    getrandom::getrandom(&mut bytes).map_err(|e| format!("getrandom failed: {}", e))?;
+    getrandom::fill(&mut bytes).map_err(|e| format!("getrandom failed: {}", e))?;
     Ok(hex_lower(&bytes))
 }
 
