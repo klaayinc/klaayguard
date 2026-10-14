@@ -27,18 +27,21 @@
 //! keep the plugin. This module serves macOS, and compiles under `test` so the
 //! Linux CI runner exercises it.
 
+use nix::fcntl::{Flock, FlockArg};
 use std::fs::{File, OpenOptions};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The lock file, locked. Dropping it unlocks the file, and the lock lives no
+/// longer than the open file description either way.
+pub(crate) type HeldLock = Flock<File>;
 
 /// What happened when this process tried to become the agent.
 #[derive(Debug)]
 pub(crate) enum Claim {
-    /// This process is the agent for this login. Hold the file for the whole
-    /// process lifetime: `flock` binds to the open file description, so
-    /// dropping the `File` releases the lock without a sound.
-    Held(File),
+    /// This process is the agent for this login. Hold the lock for the whole
+    /// process lifetime: dropping it releases the lock without a sound.
+    Held(HeldLock),
     /// Another agent owns it. This process must exit.
     Taken,
     /// The lock could not be evaluated. The caller runs anyway and reports it:
@@ -78,7 +81,7 @@ pub(crate) fn claim_agent_lock(path: &Path, attempts: u32, backoff: Duration) ->
     let attempts = attempts.max(1);
     for attempt in 0..attempts {
         match try_claim(path) {
-            Ok(Some(file)) => return Claim::Held(file),
+            Ok(Some(lock)) => return Claim::Held(lock),
             Ok(None) => {
                 if attempt + 1 < attempts && !backoff.is_zero() {
                     std::thread::sleep(backoff);
@@ -145,9 +148,9 @@ fn between_lock_and_check(path: &Path) {
     }
 }
 
-/// One attempt: `Ok(Some(file))` holds it, `Ok(None)` means someone else does
+/// One attempt: `Ok(Some(lock))` holds it, `Ok(None)` means someone else does
 /// (or the file was replaced), `Err` means the lock could not be evaluated.
-fn try_claim(path: &Path) -> std::io::Result<Option<File>> {
+fn try_claim(path: &Path) -> std::io::Result<Option<HeldLock>> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -161,22 +164,18 @@ fn try_claim(path: &Path) -> std::io::Result<Option<File>> {
         .truncate(false)
         .open(path)?;
 
-    if let Err(e) = nix::fcntl::flock(
-        file.as_raw_fd(),
-        nix::fcntl::FlockArg::LockExclusiveNonblock,
-    ) {
-        if e == nix::errno::Errno::EWOULDBLOCK {
-            return Ok(None);
-        }
-        return Err(std::io::Error::from_raw_os_error(e as i32));
-    }
+    let lock = match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => lock,
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => return Ok(None),
+        Err((_, e)) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+    };
 
     between_lock_and_check(path);
 
-    if !same_inode(&file, path)? {
+    if !same_inode(&lock, path)? {
         return Ok(None);
     }
-    Ok(Some(file))
+    Ok(Some(lock))
 }
 
 #[cfg(test)]
@@ -193,7 +192,7 @@ mod tests {
             .join(name)
     }
 
-    fn held(claim: Claim) -> File {
+    fn held(claim: Claim) -> HeldLock {
         match claim {
             Claim::Held(f) => f,
             other => panic!("expected the lock to be held, got {other:?}"),
