@@ -2083,13 +2083,13 @@ fn power_states() -> (Option<bool>, Option<bool>, Option<bool>) {
     use windows_sys::Win32::System::Power::{GetPwrCapabilities, SYSTEM_POWER_CAPABILITIES};
     let mut caps: SYSTEM_POWER_CAPABILITIES = unsafe { std::mem::zeroed() };
     // SAFETY: the pointer is to a live, fully initialised local.
-    if unsafe { GetPwrCapabilities(&mut caps) } == 0 {
+    if !unsafe { GetPwrCapabilities(&mut caps) } {
         return (None, None, None);
     }
     (
-        Some(caps.SystemS1 != 0 || caps.SystemS2 != 0 || caps.SystemS3 != 0),
-        Some(caps.SystemS4 != 0),
-        Some(caps.AoAc != 0),
+        Some(caps.SystemS1 || caps.SystemS2 || caps.SystemS3),
+        Some(caps.SystemS4),
+        Some(caps.AoAc),
     )
 }
 
@@ -2118,9 +2118,8 @@ fn power_value(
     let subgroup = guid_from(subgroup)?;
     let setting = guid_from(setting)?;
     let mut value: u32 = 0;
-    // windows-sys types HKEY as an isize, not a pointer; 0 is the null root
-    // key, which asks the API for the running configuration.
-    let root = 0;
+    // A null root key asks the API for the running configuration.
+    let root = std::ptr::null_mut();
     // SAFETY: every pointer is to a live local, and the API writes only the
     // u32 it is handed. A non-zero return means it wrote nothing.
     let status = unsafe {

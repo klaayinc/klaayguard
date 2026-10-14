@@ -28,7 +28,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tokio",
  "unicode-properties",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
  "winreg",
  "zbus 5.19.0",
 ]
