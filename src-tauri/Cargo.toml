@@ -48,7 +48,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # roots (see reqwest above). Re-add the defaults we depend on: debug-images
 # for symbolication of stripped release binaries, and release-health for
 # session tracking. Both are lost when default features go off.
-sentry = { version = "0.42.0", default-features = false, features = [
+sentry = { version = "0.49.3", default-features = false, features = [
     "backtrace",
     "contexts",
     "panic",
