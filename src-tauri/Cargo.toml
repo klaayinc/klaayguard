@@ -72,7 +72,8 @@ unicode-properties = { version = "0.1.4", default-features = false, features = [
 ] }
 
 [target.'cfg(unix)'.dependencies]
-nix = "0.26"  # For Unix-specific system calls if needed
+# `fs` for the macOS single-instance `Flock` and `access`, `user` for `getuid`.
+nix = { version = "0.31", features = ["fs", "user"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Session-bus probe for a StatusNotifier host (tray support detection).

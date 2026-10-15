@@ -5214,11 +5214,11 @@ fn compiled_api_base_url() -> &'static str {
     option_env!("APP_DEFAULT_API_BASE_URL").unwrap_or("https://api.klaay.com")
 }
 
-/// The lock this agent holds for as long as it runs. `flock` binds to the open
-/// file description, so the lock lives exactly as long as this `File`; letting
-/// it drop would release this login without a sound.
+/// The lock this agent holds for as long as it runs. The lock lives exactly as
+/// long as this value; letting it drop would release this login without a
+/// sound.
 #[cfg(target_os = "macos")]
-static AGENT_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+static AGENT_LOCK: std::sync::OnceLock<single_instance::HeldLock> = std::sync::OnceLock::new();
 
 /// Claim this login, or exit because another agent already holds it.
 ///
@@ -5243,13 +5243,13 @@ fn claim_this_login() {
     // this login. Five attempts 400 ms apart sleep four times, so the loser
     // concedes after 1.6 s.
     match single_instance::claim_agent_lock(&path, 5, std::time::Duration::from_millis(400)) {
-        single_instance::Claim::Held(file) => {
-            // A full cell hands the file straight back inside `Err`, where
-            // `let _ =` would drop it and close the fd. One caller reaches
+        single_instance::Claim::Held(lock) => {
+            // A full cell hands the lock straight back inside `Err`, where
+            // `let _ =` would drop it and release it. One caller reaches
             // here today, so the cell is always empty. Report the second
             // caller rather than swallow it: whoever adds one needs to see
-            // that this file, not the parked one, is the lock being closed.
-            if AGENT_LOCK.set(file).is_err() {
+            // that this lock, not the parked one, is the one being released.
+            if AGENT_LOCK.set(lock).is_err() {
                 append_early_log(
                     "[single_instance] the lock was claimed twice; the second file is closed",
                 );
