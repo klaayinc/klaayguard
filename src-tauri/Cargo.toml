@@ -57,7 +57,7 @@ sentry = { version = "0.49.3", default-features = false, features = [
     "reqwest",
     "rustls",
 ] }
-keyring = "2"
+keyring = "4"
 semver = "1.0"
 sha2 = "0.11"
 # base64url for the PKCE verifier and its challenge (sign_in.rs).
