@@ -84,7 +84,7 @@ zbus = "5"
 # Screen-lock policy lives in the registry. Pinned to the version embed-resource
 # already brings into Cargo.lock, so this adds no new crate and no new
 # cargo-audit surface.
-winreg = "0.55"
+winreg = "0.56"
 # Password and lockout policy through NetUserModalsGet, which any user may
 # call; `net accounts` wraps the same call but prints localized labels.
 # Win32_System_Power reads the screen lock Windows 11 users actually set
