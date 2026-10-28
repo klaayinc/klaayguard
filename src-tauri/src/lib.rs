@@ -3645,6 +3645,26 @@ fn may_write_launch_agent(
     installed && current_exe.starts_with(installed_bundle)
 }
 
+/// Why this process is not the installed app, or `None` when it is.
+///
+/// The LaunchAgent writer and the updater both act on `/Applications` on behalf
+/// of the running binary, so both ask this one question and log this one reason.
+#[cfg(any(target_os = "macos", test))]
+fn not_the_installed_app(
+    current_exe: &std::path::Path,
+    installed_bundle: &std::path::Path,
+    installed: bool,
+) -> Option<String> {
+    if may_write_launch_agent(current_exe, installed_bundle, installed) {
+        return None;
+    }
+    Some(format!(
+        "this build runs from {:?}, and the installed app is {}",
+        current_exe,
+        if installed { "elsewhere" } else { "missing" }
+    ))
+}
+
 /// The API base to write into the LaunchAgent.
 ///
 /// Always the compiled value. The plist hands the agent `VITE_API_BASE_URL`, so
@@ -3707,16 +3727,8 @@ async fn install_launch_agent() -> Result<String, String> {
     let app_bundle_path = std::path::Path::new("/Applications/KlaayGuard.app");
     let installed_exists = app_bundle_path.exists();
 
-    if !may_write_launch_agent(&current_exe, app_bundle_path, installed_exists) {
-        let msg = format!(
-            "not writing the LaunchAgent: this build runs from {:?}, and the installed app is {}",
-            current_exe,
-            if installed_exists {
-                "elsewhere"
-            } else {
-                "missing"
-            }
-        );
+    if let Some(reason) = not_the_installed_app(&current_exe, app_bundle_path, installed_exists) {
+        let msg = format!("not writing the LaunchAgent: {}", reason);
         log::info!("{}", msg);
         return Ok(msg);
     }
@@ -5245,6 +5257,25 @@ fn report_update_failure_once(msg: &str) {
 /// One update check: if a newer build is offered, download + verify + install it
 /// (which restarts the app). No-op if already current.
 async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
+    // The install swaps /Applications/KlaayGuard.app. A build that runs from
+    // anywhere else would replace the installed app with a release.
+    #[cfg(target_os = "macos")]
+    {
+        let installed_bundle = std::path::Path::new("/Applications/KlaayGuard.app");
+        let current_exe = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(e) => {
+                log::warn!("⏭️  Skipping the update check: no executable path: {}", e);
+                return;
+            }
+        };
+        if let Some(reason) =
+            not_the_installed_app(&current_exe, installed_bundle, installed_bundle.exists())
+        {
+            log::info!("⏭️  Skipping the update check: {}", reason);
+            return;
+        }
+    }
     match check_for_updates_internal(api_base).await {
         Ok(Some(update)) => {
             log::info!("🔄 Update available, starting download and install process...");
@@ -6595,6 +6626,36 @@ mod update_selection_tests {
 #[cfg(test)]
 mod happy_path_tests {
     use super::*;
+
+    // A build outside /Applications must not run the updater: the update
+    // installs into /Applications/KlaayGuard.app, so a debug build pointed at a
+    // Kiln that serves a newer release replaced the installed app eight times.
+    #[test]
+    fn a_build_outside_applications_is_not_the_installed_app() {
+        use std::path::Path;
+        let installed = Path::new("/Applications/KlaayGuard.app");
+
+        assert_eq!(
+            not_the_installed_app(
+                Path::new("/Applications/KlaayGuard.app/Contents/MacOS/KlaayGuard"),
+                installed,
+                true
+            ),
+            None
+        );
+
+        let debug_build = Path::new("/Users/dev/src/klaayguard/src-tauri/target/debug/KlaayGuard");
+        let reason = not_the_installed_app(debug_build, installed, true)
+            .expect("a debug build must be refused");
+        assert!(
+            reason.contains("the installed app is elsewhere"),
+            "{reason}"
+        );
+
+        let reason = not_the_installed_app(debug_build, installed, false)
+            .expect("no installed app must be refused");
+        assert!(reason.contains("the installed app is missing"), "{reason}");
+    }
 
     // The LaunchAgent plist is one shared file. It names the app to launch and
     // injects the API base that app then talks to. Whoever writes it decides
