@@ -267,6 +267,8 @@ fn run_builtin_check(check: &str) -> Value {
         "disk_encryption" => collect_disk_encryption(),
         #[cfg(target_os = "linux")]
         "screenlock" => collect_screenlock(),
+        #[cfg(target_os = "linux")]
+        "auto_update" => collect_auto_update(),
         #[cfg(target_os = "windows")]
         "screenlock" => collect_screenlock_windows(),
         #[cfg(target_os = "windows")]
@@ -283,6 +285,162 @@ fn run_builtin_check(check: &str) -> Value {
             json!([])
         }
     }
+}
+
+/// Assemble the single auto_update row. `enabled` is "yes", "no" or "unknown".
+#[cfg(any(target_os = "linux", test))]
+fn auto_update_row(enabled: &str, source: &str, detail: &str) -> Value {
+    json!([{
+        "enabled": enabled,
+        "source": source,
+        "detail": detail,
+    }])
+}
+
+/// `apt-config shell NAME KEY ...` prints `NAME='value'` for each key that is
+/// set, after it merges every file in /etc/apt/apt.conf.d, and nothing for a
+/// key that is not.
+#[cfg(any(target_os = "linux", test))]
+fn parse_apt_config_shell(out: &str) -> std::collections::HashMap<String, String> {
+    out.lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            Some((
+                name.trim().to_string(),
+                value.trim().trim_matches('\'').to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// APT installs updates by itself only when unattended-upgrades is installed,
+/// APT::Periodic::Unattended-Upgrade is set and non-zero, APT::Periodic::Enable
+/// is not "0", and the timer that runs it is not disabled. No answer from
+/// systemctl says nothing about the timer.
+#[cfg(any(target_os = "linux", test))]
+fn auto_update_row_apt(
+    enable: Option<&str>,
+    unattended: Option<&str>,
+    installed: bool,
+    timer: Option<&str>,
+) -> Value {
+    if !installed {
+        return auto_update_row("no", "apt", "unattended-upgrades is not installed");
+    }
+    if enable == Some("0") {
+        return auto_update_row("no", "apt", "APT::Periodic::Enable is 0");
+    }
+    if matches!(unattended, None | Some("") | Some("0")) {
+        return auto_update_row("no", "apt", "APT::Periodic::Unattended-Upgrade is off");
+    }
+    if matches!(timer, Some("disabled") | Some("masked")) {
+        return auto_update_row("no", "apt", "apt-daily-upgrade.timer is disabled");
+    }
+    auto_update_row("yes", "apt", "unattended-upgrades installs updates")
+}
+
+/// `apply_updates` in the `[commands]` section of a dnf automatic.conf.
+#[cfg(any(target_os = "linux", test))]
+fn parse_dnf_apply_updates(text: &str) -> Option<bool> {
+    let mut in_commands = false;
+    for line in text.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_commands = line == "[commands]";
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if in_commands && key.trim() == "apply_updates" {
+            return match value.trim().to_ascii_lowercase().as_str() {
+                "yes" | "true" | "1" | "on" => Some(true),
+                "no" | "false" | "0" | "off" => Some(false),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// dnf-automatic-install.timer always applies updates. The plain automatic
+/// timer applies them only with `apply_updates = yes`; dnf5 ships `no`.
+#[cfg(any(target_os = "linux", test))]
+fn auto_update_row_dnf(
+    timer_enabled: bool,
+    install_timer_enabled: bool,
+    apply: Option<bool>,
+) -> Value {
+    if install_timer_enabled {
+        return auto_update_row("yes", "dnf", "dnf-automatic-install.timer is enabled");
+    }
+    if !timer_enabled {
+        return auto_update_row("no", "dnf", "no dnf automatic timer is enabled");
+    }
+    if apply == Some(true) {
+        return auto_update_row("yes", "dnf", "dnf automatic applies updates");
+    }
+    auto_update_row("no", "dnf", "dnf automatic does not apply updates")
+}
+
+/// `systemctl is-enabled` prints the state on stdout and exits non-zero for
+/// every state but enabled, so read stdout whatever the exit code.
+#[cfg(target_os = "linux")]
+fn systemctl_is_enabled(unit: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.args(["is-enabled", unit]);
+    apply_appimage_sanitization(&mut cmd);
+    cmd.output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether the package manager installs updates by itself, read unprivileged.
+#[cfg(target_os = "linux")]
+fn collect_auto_update() -> Value {
+    if binary_on_path("apt-config") {
+        let mut cmd = std::process::Command::new("apt-config");
+        cmd.args([
+            "shell",
+            "E",
+            "APT::Periodic::Enable",
+            "U",
+            "APT::Periodic::Unattended-Upgrade",
+        ]);
+        apply_appimage_sanitization(&mut cmd);
+        let out = cmd
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let vars = parse_apt_config_shell(&out);
+        return auto_update_row_apt(
+            vars.get("E").map(String::as_str),
+            vars.get("U").map(String::as_str),
+            std::path::Path::new("/usr/bin/unattended-upgrade").exists(),
+            systemctl_is_enabled("apt-daily-upgrade.timer").as_deref(),
+        );
+    }
+    if binary_on_path("dnf5") || binary_on_path("dnf") {
+        let enabled = |unit| systemctl_is_enabled(unit).as_deref() == Some("enabled");
+        let apply = [
+            "/etc/dnf/automatic.conf",
+            "/usr/share/dnf5/dnf5-plugins/automatic.conf",
+        ]
+        .iter()
+        .find_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| parse_dnf_apply_updates(&t))
+        });
+        return auto_update_row_dnf(
+            enabled("dnf5-automatic.timer") || enabled("dnf-automatic.timer"),
+            enabled("dnf-automatic-install.timer"),
+            apply,
+        );
+    }
+    auto_update_row("unknown", "none", "neither apt nor dnf is installed")
 }
 
 // ---------------------------------------------------------------------------
@@ -6632,6 +6790,135 @@ mod happy_path_tests {
     #[test]
     fn builtin_check_unknown_is_empty() {
         assert_eq!(run_builtin_check("nope"), json!([]));
+    }
+
+    // ----- automatic updates -----
+
+    fn auto_update_enabled(rows: &Value) -> &str {
+        rows[0]["enabled"].as_str().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn builtin_auto_update_reports_one_row_with_a_verdict() {
+        let rows = run_builtin_check("auto_update");
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert!(["yes", "no", "unknown"].contains(&auto_update_enabled(&rows)));
+        assert!(rows[0]["source"].is_string());
+    }
+
+    #[test]
+    fn apt_config_shell_output_parses_to_a_map() {
+        let vars = parse_apt_config_shell("E='1'\nU='1'\n");
+        assert_eq!(vars.get("E").map(String::as_str), Some("1"));
+        assert_eq!(vars.get("U").map(String::as_str), Some("1"));
+        assert!(parse_apt_config_shell("").is_empty());
+    }
+
+    #[test]
+    fn apt_auto_update_yes_when_unattended_upgrades_runs() {
+        let rows = auto_update_row_apt(None, Some("1"), true, Some("enabled"));
+        assert_eq!(auto_update_enabled(&rows), "yes");
+        assert_eq!(rows[0]["source"], "apt");
+    }
+
+    #[test]
+    fn apt_auto_update_no_when_periodic_jobs_are_off() {
+        // The Docker ubuntu image ships APT::Periodic::Enable "0", which stops
+        // every periodic job, unattended-upgrade included.
+        let rows = auto_update_row_apt(Some("0"), Some("1"), true, Some("enabled"));
+        assert_eq!(auto_update_enabled(&rows), "no");
+        assert!(rows[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("APT::Periodic::Enable"));
+    }
+
+    #[test]
+    fn apt_auto_update_no_when_unattended_upgrade_is_unset_or_zero() {
+        assert_eq!(
+            auto_update_enabled(&auto_update_row_apt(None, None, true, None)),
+            "no"
+        );
+        assert_eq!(
+            auto_update_enabled(&auto_update_row_apt(None, Some("0"), true, None)),
+            "no"
+        );
+    }
+
+    #[test]
+    fn apt_auto_update_no_when_the_package_is_missing() {
+        let rows = auto_update_row_apt(None, Some("1"), false, None);
+        assert_eq!(auto_update_enabled(&rows), "no");
+        assert_eq!(rows[0]["detail"], "unattended-upgrades is not installed");
+    }
+
+    #[test]
+    fn apt_auto_update_no_when_the_upgrade_timer_is_disabled() {
+        let rows = auto_update_row_apt(None, Some("1"), true, Some("disabled"));
+        assert_eq!(auto_update_enabled(&rows), "no");
+        assert!(rows[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("apt-daily-upgrade.timer"));
+    }
+
+    #[test]
+    fn apt_auto_update_yes_when_systemctl_gives_no_answer() {
+        let rows = auto_update_row_apt(None, Some("1"), true, None);
+        assert_eq!(auto_update_enabled(&rows), "yes");
+    }
+
+    #[test]
+    fn dnf_apply_updates_parses_the_commands_section() {
+        assert_eq!(
+            parse_dnf_apply_updates("[commands]\napply_updates = yes\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_dnf_apply_updates("[commands]\napply_updates = no\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_dnf_apply_updates("[commands]\ndownload_updates = yes\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn dnf_auto_update_follows_apply_updates_on_the_automatic_timer() {
+        assert_eq!(
+            auto_update_enabled(&auto_update_row_dnf(true, false, Some(true))),
+            "yes"
+        );
+        assert_eq!(
+            auto_update_enabled(&auto_update_row_dnf(true, false, Some(false))),
+            "no"
+        );
+        // dnf5 ships apply_updates = no, so an unset key does not apply.
+        assert_eq!(
+            auto_update_enabled(&auto_update_row_dnf(true, false, None)),
+            "no"
+        );
+        assert_eq!(
+            auto_update_row_dnf(true, false, Some(true))[0]["source"],
+            "dnf"
+        );
+    }
+
+    #[test]
+    fn dnf_auto_update_yes_from_the_install_timer() {
+        assert_eq!(
+            auto_update_enabled(&auto_update_row_dnf(false, true, None)),
+            "yes"
+        );
+    }
+
+    #[test]
+    fn dnf_auto_update_no_when_no_timer_is_enabled() {
+        let rows = auto_update_row_dnf(false, false, Some(true));
+        assert_eq!(auto_update_enabled(&rows), "no");
+        assert_eq!(rows[0]["detail"], "no dnf automatic timer is enabled");
     }
 
     // ----- disk encryption -----
