@@ -5262,19 +5262,18 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let installed_bundle = std::path::Path::new("/Applications/KlaayGuard.app");
-        match std::env::current_exe() {
-            Ok(current_exe) => {
-                if let Some(reason) =
-                    not_the_installed_app(&current_exe, installed_bundle, installed_bundle.exists())
-                {
-                    log::info!("⏭️  Skipping the update check: {}", reason);
-                    return;
-                }
-            }
+        let current_exe = match std::env::current_exe() {
+            Ok(path) => path,
             Err(e) => {
                 log::warn!("⏭️  Skipping the update check: no executable path: {}", e);
                 return;
             }
+        };
+        if let Some(reason) =
+            not_the_installed_app(&current_exe, installed_bundle, installed_bundle.exists())
+        {
+            log::info!("⏭️  Skipping the update check: {}", reason);
+            return;
         }
     }
     match check_for_updates_internal(api_base).await {
