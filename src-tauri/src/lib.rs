@@ -408,12 +408,14 @@ fn collect_auto_update() -> Value {
             "APT::Periodic::Unattended-Upgrade",
         ]);
         apply_appimage_sanitization(&mut cmd);
-        let out = cmd
+        let Some(out) = cmd
             .output()
             .ok()
             .filter(|o| o.status.success())
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+        else {
+            return auto_update_row("unknown", "apt", "apt-config did not answer");
+        };
         let vars = parse_apt_config_shell(&out);
         return auto_update_row_apt(
             vars.get("E").map(String::as_str),
@@ -423,6 +425,11 @@ fn collect_auto_update() -> Value {
         );
     }
     if binary_on_path("dnf5") || binary_on_path("dnf") {
+        // dnf automatic runs only from a systemd timer, so without systemctl
+        // the timers say nothing either way.
+        if !binary_on_path("systemctl") {
+            return auto_update_row("unknown", "dnf", "systemctl is not installed");
+        }
         let enabled = |unit| systemctl_is_enabled(unit).as_deref() == Some("enabled");
         let apply = [
             "/etc/dnf/automatic.conf",
