@@ -52,7 +52,7 @@ jobs:
       # Prebuilt binary, as ci.yml does. cargo install compiles the CLI for
       # ten minutes on every run and the cargo cache does not cover it.
       - name: Install tauri-cli
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: tauri-cli@2.11.4
 
