@@ -1408,6 +1408,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// decrypted, 7 = encryption pending a restart, 3 = encrypting (protection
 /// still off), 1 = fully encrypted and on, 5 = suspended (encrypted, key in
 /// the clear). 4 and 6 follow the same numbering and are not yet observed.
+/// The property's own value list (IPropertyDescription::GetEnumTypeList)
+/// names 8 "Waiting for activation" and has no 0.
 #[cfg(any(target_os = "windows", test))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum BitLockerProtection {
@@ -1425,6 +1427,9 @@ enum BitLockerProtection {
     Locked,
     /// 7: encryption chosen, waiting for the restart that starts it.
     PendingRestart,
+    /// 8: device encryption encrypted the disk but bound no protector, so the
+    /// key is in the clear.
+    WaitingForActivation,
     Other(i64),
 }
 
@@ -1439,6 +1444,7 @@ fn parse_bitlocker_protection(raw: Option<&str>) -> Option<BitLockerProtection> 
         5 => BitLockerProtection::Suspended,
         6 => BitLockerProtection::Locked,
         7 => BitLockerProtection::PendingRestart,
+        8 => BitLockerProtection::WaitingForActivation,
         other => BitLockerProtection::Other(other),
     })
 }
@@ -1474,6 +1480,11 @@ fn windows_disk_encryption_rows(
         Some(BitLockerProtection::PendingRestart) => {
             ("no", "none", "encryption pending a restart".to_string())
         }
+        Some(BitLockerProtection::WaitingForActivation) => (
+            "no",
+            "bitlocker",
+            "encrypted, waiting for activation; key in the clear".to_string(),
+        ),
         Some(BitLockerProtection::Other(n)) => (
             "unknown",
             "bitlocker",
@@ -7846,6 +7857,15 @@ zroot/ROOT/default / zfs rw 0 0
             parse_bitlocker_protection(Some("7")),
             Some(BitLockerProtection::PendingRestart)
         );
+        assert_eq!(
+            parse_bitlocker_protection(Some("8")),
+            Some(BitLockerProtection::WaitingForActivation)
+        );
+        // Windows' own list of values for the property has no 0.
+        assert_eq!(
+            parse_bitlocker_protection(Some("0")),
+            Some(BitLockerProtection::Other(0))
+        );
         assert_eq!(parse_bitlocker_protection(Some("")), None);
         assert_eq!(parse_bitlocker_protection(None), None);
     }
@@ -7863,6 +7883,21 @@ zroot/ROOT/default / zfs rw 0 0
         assert!(!yes(BitLockerProtection::Encrypting));
         assert!(!yes(BitLockerProtection::Decrypting));
         assert!(!yes(BitLockerProtection::PendingRestart));
+        assert!(!yes(BitLockerProtection::WaitingForActivation));
+    }
+
+    #[test]
+    fn windows_disk_encryption_waiting_for_activation_is_no() {
+        // Device encryption has encrypted the disk but bound no protector, so
+        // the key sits in the clear, as with a suspended volume.
+        let rows =
+            windows_disk_encryption_rows("C:", Some(BitLockerProtection::WaitingForActivation), "");
+        assert_eq!(rows[1]["root_encrypted"], "no");
+        assert_eq!(rows[0]["mechanism"], "bitlocker");
+        assert!(rows[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for activation"));
     }
 
     #[test]
