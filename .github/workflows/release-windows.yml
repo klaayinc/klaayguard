@@ -42,7 +42,7 @@ jobs:
             api_url: "https://api.klaay.com"
             frontend_url: "https://app.klaay.com"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
@@ -52,7 +52,7 @@ jobs:
       # Prebuilt binary, as ci.yml does. cargo install compiles the CLI for
       # ten minutes on every run and the cargo cache does not cover it.
       - name: Install tauri-cli
-        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: tauri-cli@2.11.4
 

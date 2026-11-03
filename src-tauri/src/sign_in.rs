@@ -157,7 +157,7 @@ pub async fn claim(api_base_url: &str, code: &str, verifier: &str) -> Result<Str
 /// 32 random bytes, base64url-encoded - the PKCE verifier.
 fn random_secret() -> Option<String> {
     let mut buf = [0u8; 32];
-    getrandom::getrandom(&mut buf).ok()?;
+    getrandom::fill(&mut buf).ok()?;
     Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf))
 }
 

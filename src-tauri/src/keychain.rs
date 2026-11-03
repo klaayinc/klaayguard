@@ -219,7 +219,7 @@ pub fn delete_token() -> Result<(), String> {
     let Ok(entry) = entry_for(KEYCHAIN_ACCOUNT) else {
         return Ok(());
     };
-    match entry.delete_password() {
+    match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => match keyring_get(KEYCHAIN_ACCOUNT) {
             Ok(Some(_)) => Err(format!(

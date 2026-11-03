@@ -26,6 +26,7 @@ Only settings, never content. It reports:
 - operating system version;
 - whether the disk is encrypted;
 - whether the screen lock is on;
+- whether the computer installs updates by itself;
 - the list of user accounts on the computer (names only, not their files);
 - the list of apps that start at login.
 
