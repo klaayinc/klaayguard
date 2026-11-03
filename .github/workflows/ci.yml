@@ -59,7 +59,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-audit
 
@@ -68,7 +68,7 @@ jobs:
         run: cargo audit
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: cargo-deny
 
@@ -219,7 +219,7 @@ jobs:
         run: rake
 
       - name: Install tauri-cli
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: tauri-cli@2.11.4
 
@@ -279,7 +279,7 @@ jobs:
         run: ./.github/scripts/fetch-osquery-windows.ps1
 
       - name: Install tauri-cli
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
         with:
           tool: tauri-cli@2.11.4
 
