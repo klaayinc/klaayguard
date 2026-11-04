@@ -22,7 +22,7 @@ jobs:
         # Install any other dependencies your script might need
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@885d1462b80bc1c1c7f0b00334ad271f09369c55 # v2.10.0
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
     - name: Login to Docker Hub
       if: github.event_name != 'pull_request'
