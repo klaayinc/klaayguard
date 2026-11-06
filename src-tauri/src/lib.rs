@@ -1488,7 +1488,10 @@ fn windows_disk_encryption_rows(
         Some(BitLockerProtection::Other(n)) => (
             "unknown",
             "bitlocker",
-            format!("unrecognised BitLockerProtection value {}", n),
+            format!(
+                "unrecognised BitLockerProtection value {}; please contact Klaay Support",
+                n
+            ),
         ),
         None => (
             "unknown",
@@ -7919,6 +7922,17 @@ zroot/ROOT/default / zfs rw 0 0
             .as_str()
             .unwrap()
             .contains("blocked by application control"));
+    }
+
+    #[test]
+    fn windows_disk_encryption_value_0_is_unknown_and_points_to_support() {
+        // No source defines 0, so the row says who to ask instead of guessing.
+        let rows = windows_disk_encryption_rows("C:", parse_bitlocker_protection(Some("0")), "");
+        assert_eq!(rows[1]["root_encrypted"], "unknown");
+        assert_eq!(
+            rows[0]["detail"],
+            "unrecognised BitLockerProtection value 0; please contact Klaay Support"
+        );
     }
 
     #[test]
