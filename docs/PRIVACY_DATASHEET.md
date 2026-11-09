@@ -1,7 +1,7 @@
 # KlaayGuard Privacy Datasheet
 
 **Product:** KlaayGuard desktop agent
-**Version of this document:** 2026-09-11
+**Version of this document:** 2026-11-09
 **Audience:** Customer security and privacy reviewers (incl. BYOD deployments)
 
 ## 1. Overview
@@ -28,6 +28,8 @@ The agent runs only the queries the Klaay server instructs it to. The current pr
 | `bitlocker_info` (Windows only) | Per-volume drive letter, protection status, conversion status, encryption method. Readable only when the agent runs elevated; a standard install sends no rows | Raw evidence behind the `disk_encryption` verdict | Data at rest (CTRL-165) |
 | `windows_security_center` (Windows only) | Windows Security Center verdicts: firewall, antivirus, antispyware, automatic updates, user account control, internet settings, security center service | Verify firewall, antivirus, and update posture | Antivirus (CTRL-152), Endpoint (CTRL-151), Security patches (CTRL-084) |
 | `windows_security_products` (Windows only) | Each registered security product: name, type, state, state timestamp, signatures-up-to-date flag | Verify antivirus and firewall products are on and current | Antivirus (CTRL-152) |
+| `macos_malware_protection` (macOS only) | The XProtect version from its `Info.plist`, and the `ConfigDataInstall` value from `com.apple.SoftwareUpdate` in `/Library/Preferences` and `/Library/Managed Preferences` | Verify the built-in antivirus still installs its definitions | Antivirus (CTRL-152) |
+| `linux_clamav` (Linux only) | Two counts: whether a `clamd` program exists at `/usr/sbin`, `/usr/bin`, `/usr/local/sbin` or `/usr/local/bin`, and whether a process named `clamd` runs | Verify ClamAV is installed and running | Antivirus (CTRL-152) |
 | `patches` (Windows only) | Installed hotfix ID, description, install date | Patch-level verification | Security patches (CTRL-084) |
 | `password_policy` (Windows only) | The local account policy from `NetUserModalsGet`: minimum password length, maximum and minimum password age, password history size, lockout threshold, lockout duration and window | Verify password and lockout configuration | Password configuration (CTRL-103) |
 | `screenlock_registry` (Windows only) | The raw `ScreenSaveActive`, `ScreenSaverIsSecure`, and `ScreenSaveTimeOut` values under `HKEY_CURRENT_USER\Control Panel\Desktop` | Raw evidence behind the `screenlock` verdict | Auto screen lock (CTRL-097) |
@@ -41,12 +43,12 @@ No password values, hashes, or password contents of any kind are collected. On W
 KlaayGuard does **not** collect any of the following:
 
 - Browser history, bookmarks, cookies, or saved credentials
-- File contents, file listings, or directory contents
+- File contents, file listings, or directory contents. On Linux, `linux_clamav` checks only whether `clamd` exists at four fixed paths and sends a count
 - Keystrokes, clipboard contents, or input events
 - Screen captures or screen recordings
 - Microphone, camera, or any media input
 - Geolocation
-- Running-process names, command-line arguments, or process metadata
+- Running-process names, command-line arguments, or process metadata. On Linux, `linux_clamav` counts the processes named `clamd` on the device and sends only that count
 - Network connections, listening ports, DNS queries, or ARP tables
 - Installed application inventory (deb/rpm/msi packages)
 - USB or PCI device inventory
