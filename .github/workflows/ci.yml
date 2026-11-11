@@ -242,10 +242,18 @@ jobs:
           test -n "$RPM"
           ./.github/scripts/validate-linux-rpm.sh "$RPM"
 
-      # Proves the postinstall restarts the agent it replaces. Without that
-      # step a package upgrade leaves the old process running the old binary,
-      # and Linux has no supervisor to notice until the next login. Root,
-      # because the postinstall runs as root and starts the agent with runuser.
+  # Proves the postinstall restarts the agent it replaces. Without that
+  # step a package upgrade leaves the old process running the old binary,
+  # and Linux has no supervisor to notice until the next login. Root,
+  # because the postinstall runs as root and starts the agent with runuser.
+  # Its own job: it takes 3-4 minutes, reads only linux/postinst.sh and
+  # builds its own stand-in binary, so it needs nothing the bundle job builds.
+  postinst-linux:
+    name: postinst restarts the old agent (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: postinst restarts the old agent
         working-directory: src-tauri
         run: sudo bash scripts/test-postinst-restarts-agent.sh
