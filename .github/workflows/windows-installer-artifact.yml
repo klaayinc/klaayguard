@@ -315,6 +315,7 @@ jobs:
     if: inputs.platform == 'linux' || inputs.platform == 'all'
     name: Linux x86_64 (${{ matrix.build }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -347,9 +348,8 @@ jobs:
           tool: tauri-cli@2.11.4
 
       - name: Install Tauri system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+        timeout-minutes: 15
+        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
 
       - name: Fetch osquery sidecar
         env:

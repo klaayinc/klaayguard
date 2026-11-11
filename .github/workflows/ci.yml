@@ -19,6 +19,9 @@ jobs:
   test:
     name: Test & lint (Linux x86_64)
     runs-on: ubuntu-22.04
+    # Normal runs take a few minutes. A stalled step must fail well before the
+    # six-hour default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -33,9 +36,9 @@ jobs:
           workspaces: src-tauri
 
       - name: Install Tauri system dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          ./.github/scripts/apt-install.sh \
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake
 
@@ -129,6 +132,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       # Every target that release ships. (release-linux drops arm64, so that one
@@ -163,9 +167,9 @@ jobs:
 
       - name: Install Tauri system dependencies (Linux)
         if: runner.os == 'Linux'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          ./.github/scripts/apt-install.sh \
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake
 
@@ -193,6 +197,7 @@ jobs:
   bundle-linux:
     name: Bundle check (Linux deb)
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -205,9 +210,9 @@ jobs:
           workspaces: src-tauri
 
       - name: Install Tauri system dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          ./.github/scripts/apt-install.sh \
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
