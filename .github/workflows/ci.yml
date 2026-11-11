@@ -203,6 +203,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          shared-key: bundle-linux
 
       - name: Install Tauri system dependencies
         run: |
@@ -223,24 +224,15 @@ jobs:
         with:
           tool: tauri-cli@2.11.4
 
-      - name: Build deb and rpm
+      - name: Build deb
         working-directory: src-tauri
-        run: cargo tauri build --bundles deb rpm
+        run: cargo tauri build --bundles deb
 
       - name: Validate deb contents
         run: |
           DEB=$(find src-tauri/target/release/bundle/deb -name "*.deb" | head -n1)
           test -n "$DEB"
           ./.github/scripts/validate-linux-deb.sh "$DEB"
-
-      # The rpm ships the same two maintainer scripts, and they branch on rpm's
-      # own argument forms. Nothing else in the repository builds one, so
-      # without this the branch could rot while the deb stayed green.
-      - name: Validate rpm contents
-        run: |
-          RPM=$(find src-tauri/target/release/bundle/rpm -name "*.rpm" | head -n1)
-          test -n "$RPM"
-          ./.github/scripts/validate-linux-rpm.sh "$RPM"
 
       # Proves the postinstall restarts the agent it replaces. Without that
       # step a package upgrade leaves the old process running the old binary,
@@ -249,6 +241,53 @@ jobs:
       - name: postinst restarts the old agent
         working-directory: src-tauri
         run: sudo bash scripts/test-postinst-restarts-agent.sh
+
+  # The rpm builds in its own job so it runs beside the deb job, not after it.
+  # It shares the cargo cache with bundle-linux. The rpm ships the same two
+  # maintainer scripts as the deb, and they branch on rpm's own argument forms.
+  # Nothing else in the repository builds one, so without this the branch could
+  # rot while the deb stayed green.
+  bundle-linux-rpm:
+    name: Bundle check (Linux rpm)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri
+          shared-key: bundle-linux
+
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
+
+      - name: Fetch osquery sidecar
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: rake
+
+      - name: Install tauri-cli
+        uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
+        with:
+          tool: tauri-cli@2.11.4
+
+      - name: Build rpm
+        working-directory: src-tauri
+        run: cargo tauri build --bundles rpm
+
+      - name: Validate rpm contents
+        run: |
+          RPM=$(find src-tauri/target/release/bundle/rpm -name "*.rpm" | head -n1)
+          test -n "$RPM"
+          ./.github/scripts/validate-linux-rpm.sh "$RPM"
 
   # Build the Windows NSIS installer the way release does, then install it
   # silently on the runner and assert on the result: the Run key, the sidecar,
