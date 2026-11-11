@@ -280,6 +280,37 @@ so every retry returns `1000` again. Windows Installer codes do not apply
 here. This is an NSIS package: `0` is success, `1` is a user abort and `2` is
 an abort by the script.
 
+### Installer exit code 1001
+
+The installer exits `1001` when it could not remove an earlier install. It
+installs the new version anyway, so the machine keeps an agent. The earlier
+install stays beside it. The usual cause is an `.msi` install in
+`Program Files` and a person who declined the elevation prompt. Remove the
+earlier install from **Settings > Apps**, then run the installer again. Map
+`1001` the same way as `1000`: **Success**, not **Retry**.
+
+## Earlier versions
+
+Every installer removes every earlier KlaayGuard install before it installs
+the new version. This holds on every path: interactive, silent, and the
+self-update.
+
+- **Windows.** The installer removes each KlaayGuard entry in Add/Remove
+  Programs: per-user and per-machine, NSIS and `.msi`, in any folder. It keeps
+  the sign-in. It cannot reach the per-user installs of other Windows accounts,
+  because it runs as the user. `src-tauri/windows/hooks.nsi` holds the sweep.
+- **macOS.** The `.pkg` preinstall stops and deletes every bundle with the
+  identifier `com.klaay.app` in `/Applications` and in each `~/Applications`,
+  whatever its name. It also removes the `KlaayGuard.plist` login job that
+  v0.1.0 to v0.1.5 wrote. It keeps the current LaunchAgent and the sign-in.
+  `src-tauri/macos/scripts/preinstall` holds the sweep.
+- **Linux.** The package manager removes the earlier package: the same package
+  on an upgrade, and the pre-rename `klaay` package through `Conflicts`,
+  `Replaces` and `Obsoletes`. The postinstall replaces an agent that runs from
+  an AppImage or from `/usr/bin/klaay` with the package agent. It also removes
+  the `KlaayGuard.desktop` login entry that v0.1.0 to v0.1.5 wrote. An AppImage
+  file is a download, not an install, so it stays on disk.
+
 ## Automatic updates
 
 The agent checks `GET /klaayguard/updates/latest` at startup and then every

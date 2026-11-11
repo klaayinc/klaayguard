@@ -2,7 +2,7 @@
 # Verifies build-macos-pkg.sh produces a well-formed installer:
 #   - the payload installs KlaayGuard.app into /Applications,
 #   - the payload cannot be relocated out of /Applications,
-#   - the postinstall script is embedded and executable, and
+#   - the preinstall and postinstall scripts are embedded and executable, and
 #   - that postinstall fails the install when no app was placed.
 # Uses a tiny fake .app so it runs fast and touches nothing on the real system
 # (no `sudo installer`). Full install-time behaviour is covered by the
@@ -87,6 +87,12 @@ test -f "$post" || { echo "FAIL: postinstall not embedded in pkg"; exit 1; }
 test -x "$post" || { echo "FAIL: postinstall is not executable"; exit 1; }
 grep -q -- "--install-agent" "$post" || { echo "FAIL: postinstall does not invoke the --install-agent seam"; exit 1; }
 
+# preinstall must ride along beside it. Without it the payload writes over one
+# bundle and every other earlier install stays on the Mac.
+pre="$(dirname "$post")/preinstall"
+test -f "$pre" || { echo "FAIL: preinstall not embedded in pkg; earlier versions stay installed"; exit 1; }
+test -x "$pre" || { echo "FAIL: preinstall is not executable"; exit 1; }
+
 # Payload must land KlaayGuard.app in /Applications.
 payload="$component/Payload"
 test -f "$payload" || { echo "FAIL: no Payload in component.pkg"; exit 1; }
@@ -105,4 +111,4 @@ if bash "$post" "" "" "$empty_volume" >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "PASS: pkg pins /Applications/KlaayGuard.app, embeds an executable postinstall that calls --install-agent, and fails an install that placed no app"
+echo "PASS: pkg pins /Applications/KlaayGuard.app, embeds an executable preinstall and a postinstall that calls --install-agent, and fails an install that placed no app"

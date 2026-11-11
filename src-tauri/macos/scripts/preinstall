@@ -1,0 +1,128 @@
+#!/bin/bash
+# macOS .pkg preinstall. Installer runs it as root before it writes the
+# payload. It removes every earlier KlaayGuard install on the target volume, so
+# the new version lands on a clean Mac and is the only one left.
+#
+# The payload alone does not do this. It writes /Applications/KlaayGuard.app
+# and nothing else:
+#
+# - A copy that a .dmg put in ~/Applications, or a bundle under another name
+#   ("KlaayGuard (1).app", the pre-rename "klaay.app"), stays and keeps its
+#   own agent.
+# - Installer merges the new bundle into the old one, so a file only the older
+#   build shipped stays inside it and breaks the code signature.
+# - v0.1.0 to v0.1.5 used tauri-plugin-autostart. Its job,
+#   ~/Library/LaunchAgents/KlaayGuard.plist, starts the app at login beside the
+#   com.klaay.klaayguard job, and no later version removes it.
+#
+# The bundle identifier, not the name, decides what is ours. Every build ever
+# shipped carries com.klaay.app, whatever the bundle is called.
+#
+# The current job, com.klaay.klaayguard, stays. The postinstall rewrites and
+# reloads it, and a failed install must not also lose the login start.
+set -u
+
+# $3 is the destination volume: "/" for the usual install, a mountpoint when
+# the user picks another disk.
+VOLUME="${3:-/}"
+VOLUME="${VOLUME%/}"
+BUNDLE_ID="com.klaay.app"
+LAUNCHCTL="${LAUNCHCTL:-/bin/launchctl}"
+
+# How long, in seconds, an agent may ignore SIGTERM before SIGKILL. A cap on
+# the clock, never on a tick count. The test shortens it.
+STOP_WAIT_SECONDS="${STOP_WAIT_SECONDS:-5}"
+
+log() { /usr/bin/logger -t com.klaay.klaayguard.preinstall "$1"; echo "$1"; }
+
+# Every KlaayGuard bundle installed on the volume, one path per line: the
+# shared /Applications and each user's ~/Applications.
+installed_bundles() {
+  local dir app id
+  for dir in "$VOLUME/Applications" "$VOLUME"/Users/*/Applications; do
+    [ -d "$dir" ] || continue
+    for app in "$dir"/*.app; do
+      [ -d "$app" ] || continue
+      id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null) || continue
+      [ "$id" = "$BUNDLE_ID" ] && printf '%s\n' "$app"
+    done
+  done
+}
+
+# A path as a literal for `pkill -f`, which reads an extended regex. A bundle
+# named "KlaayGuard (1).app" is otherwise an unbalanced group, pkill exits 2,
+# and the agent keeps running from a deleted bundle.
+regex_literal() {
+  # shellcheck disable=SC2016 # the class lists `$` itself, not an expansion
+  printf '%s' "$1" | /usr/bin/sed 's/[][\.*^$(){}?+|]/\\&/g'
+}
+
+# Stop every process that runs from inside the bundle, the agent and its
+# osquery sidecar, for every user. Root may, and an agent on a deleted bundle
+# reports from an earlier build until that user logs out.
+stop_bundle_processes() {
+  local pattern started
+  pattern="^$(regex_literal "$1")/Contents/MacOS/"
+  /usr/bin/pkill -f "$pattern" 2>/dev/null || return 0
+  started=$SECONDS
+  while /usr/bin/pgrep -f "$pattern" >/dev/null 2>&1; do
+    if [ $((SECONDS - started)) -ge "$STOP_WAIT_SECONDS" ]; then
+      log "preinstall: a process in $1 ignored SIGTERM for ${STOP_WAIT_SECONDS}s; forcing"
+      /usr/bin/pkill -9 -f "$pattern" 2>/dev/null || true
+      break
+    fi
+    /bin/sleep 0.1
+  done
+}
+
+# Unload and delete the tauri-plugin-autostart job of every user. The file
+# name alone is not proof: take it only when it starts a KlaayGuard bundle.
+remove_legacy_launch_agents() {
+  local home plist uid
+  for home in "$VOLUME"/Users/*; do
+    plist="$home/Library/LaunchAgents/KlaayGuard.plist"
+    [ -f "$plist" ] || continue
+    /usr/bin/grep -q 'KlaayGuard\.app' "$plist" || continue
+    uid=$(/usr/bin/stat -f %u "$home" 2>/dev/null) || uid=""
+    # Unload first, so launchd does not start the app again from the job.
+    # Nothing is loaded for a user who is not logged in, and that is fine.
+    [ -n "$uid" ] && "$LAUNCHCTL" bootout "gui/$uid/KlaayGuard" 2>/dev/null
+    if /bin/rm -f "$plist"; then
+      log "preinstall: removed the tauri-plugin-autostart job $plist"
+    else
+      log "preinstall: ERROR could not remove $plist"
+    fi
+  done
+}
+
+main() {
+  local app removed=0 left=0
+
+  while IFS= read -r app; do
+    log "preinstall: removing the earlier install $app"
+    stop_bundle_processes "$app"
+    if /bin/rm -rf "$app" && [ ! -e "$app" ]; then
+      removed=$((removed + 1))
+    else
+      log "preinstall: ERROR could not remove $app"
+      left=$((left + 1))
+    fi
+  done < <(installed_bundles)
+
+  remove_legacy_launch_agents
+
+  # Fail the install rather than add a second copy beside one that stays. A
+  # non-zero preinstall stops Installer before it writes anything, so the Mac
+  # keeps the version it had, and the job restarts it.
+  if [ "$left" -gt 0 ]; then
+    log "preinstall: ERROR $left earlier install(s) remain; stopping the install"
+    exit 1
+  fi
+  log "preinstall: removed $removed earlier install(s)"
+  exit 0
+}
+
+# Run only when Installer executes this file by its own name.
+case "${0##*/}" in
+  preinstall) main ;;
+esac

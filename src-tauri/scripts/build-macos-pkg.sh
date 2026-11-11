@@ -2,8 +2,9 @@
 # Builds a macOS .pkg installer around a pre-built KlaayGuard.app.
 #
 # Tauri's bundler does not emit .pkg, so we wrap the .app with Apple's native
-# pkgbuild/productbuild. The pkg carries a postinstall script that registers the
-# launchd LaunchAgent at install time (see macos/scripts/postinstall).
+# pkgbuild/productbuild. The pkg carries a preinstall script that removes every
+# earlier install (see macos/scripts/preinstall), and a postinstall script that
+# registers the launchd LaunchAgent at install time (see macos/scripts/postinstall).
 #
 # Signs the installer when INSTALLER_SIGNING_IDENTITY is set (a "Developer ID
 # Installer" identity — distinct from the "Developer ID Application" identity
@@ -21,6 +22,7 @@ IDENTIFIER="com.klaay.klaayguard"
 SCRIPTS_DIR="$(cd "$(dirname "$0")/../macos/scripts" && pwd)"
 
 test -d "$APP_PATH" || { echo "app not found: $APP_PATH" >&2; exit 1; }
+test -x "$SCRIPTS_DIR/preinstall" || { echo "preinstall missing or not executable in $SCRIPTS_DIR" >&2; exit 1; }
 test -x "$SCRIPTS_DIR/postinstall" || { echo "postinstall missing or not executable in $SCRIPTS_DIR" >&2; exit 1; }
 
 workdir="$(mktemp -d)"

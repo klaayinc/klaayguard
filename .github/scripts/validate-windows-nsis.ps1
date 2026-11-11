@@ -1,10 +1,14 @@
 # Assert that a KlaayGuard NSIS installer gives a customer a working install.
 # Runs on a throwaway CI runner: it installs silently, checks the registry,
 # checks the version, then uninstalls silently and checks the cleanup.
-# Usage: validate-windows-nsis.ps1 -Installer <path> -Version <x.y.z>
+# Usage: validate-windows-nsis.ps1 -Installer <path> -Version <x.y.z> [-Msi <path>]
+# -Msi names an .msi build of the app. With it, the script first plants the
+# earlier installs a customer machine can hold, and checks the installer
+# removes them all before it installs.
 param(
     [Parameter(Mandatory = $true)][string]$Installer,
-    [Parameter(Mandatory = $true)][string]$Version
+    [Parameter(Mandatory = $true)][string]$Version,
+    [string]$Msi = ""
 )
 $ErrorActionPreference = "Stop"
 $failures = 0
@@ -54,9 +58,101 @@ function Invoke-Installer([string]$Path, [string[]]$Arguments, [int]$TimeoutSeco
     return $p
 }
 
+# Every KlaayGuard entry in Add/Remove Programs: the per-user list, and the
+# per-machine list in both registry views. The name is the one every release
+# shipped under, or the pre-rename "klaay".
+function Get-KlaayGuardEntries {
+    $roots = @(
+        "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )
+    foreach ($root in $roots) {
+        Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if ($p -and ($p.DisplayName -eq "KlaayGuard" -or $p.DisplayName -eq "klaay")) {
+                [pscustomobject]@{ Key = $_.Name; Location = "$($p.InstallLocation)".Trim('"'); Msi = ($p.WindowsInstaller -eq 1) }
+            }
+        }
+    }
+}
+
+# --- 1a. Earlier installs ------------------------------------------------------
+# The installer must remove every earlier install before it writes a file, on
+# every path that reaches it. /S is the one that skips the template's own
+# "uninstall first" page, and it is the path the self-updater and every
+# deployment tool take. Plant what a customer machine can hold:
+#   - a per-user NSIS install in another folder, under an older uninstall key,
+#     with its agent running;
+#   - a per-machine .msi install, the format early releases shipped, with its
+#     agent running.
+$legacyDir = "C:\KlaayGuardLegacy"
+$msiDir = Join-Path $env:ProgramFiles "KlaayGuard"
+$planted = $false
+if ($Msi) {
+    $Msi = (Resolve-Path $Msi).Path
+    $uninstallRoot = "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+
+    # NSIS reads /D= raw, so it must come last and carry no quotes.
+    $proc = Invoke-Installer $Installer @("/S", "/D=$legacyDir")
+    if (-not $proc -or $proc.ExitCode -ne 0) { Fail "could not plant the earlier NSIS install in $legacyDir" }
+    # Move its entry to a key name an older build used, and mark it older. Drop
+    # the remembered folder, so the install under test picks the default one
+    # and the two do not overlap.
+    & reg.exe copy "$uninstallRoot\KlaayGuard" "$uninstallRoot\com.klaay.app" /s /f | Out-Null
+    & reg.exe delete "$uninstallRoot\KlaayGuard" /f | Out-Null
+    Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\com.klaay.app" -Name DisplayVersion -Value "0.0.1"
+    Remove-Item -Path "HKCU:\Software\Klaay\KlaayGuard" -Recurse -ErrorAction SilentlyContinue
+
+    $proc = Invoke-Installer "msiexec.exe" @("/i", "`"$Msi`"", "/qn", "/norestart")
+    if (-not $proc -or $proc.ExitCode -ne 0) { Fail "could not plant the earlier MSI install (msiexec exited $($proc.ExitCode))" }
+    Start-Process -FilePath "$msiDir\KlaayGuard.exe" | Out-Null
+
+    $before = @(Get-KlaayGuardEntries)
+    $legacyAgent = $null
+    $deadline = (Get-Date).AddSeconds(60)
+    do {
+        Start-Sleep -Seconds 1
+        $running = @(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue | Where-Object { $_.Path })
+        $legacyAgent = $running | Where-Object { $_.Path -like "$legacyDir\*" }
+        $msiAgent = $running | Where-Object { $_.Path -like "$msiDir\*" }
+    } until (($legacyAgent -and $msiAgent) -or (Get-Date) -gt $deadline)
+
+    # A plant that did not take makes every check below pass for nothing.
+    if ($before.Count -eq 2 -and ($before | Where-Object Msi) -and (Test-Path "$legacyDir\KlaayGuard.exe") -and (Test-Path "$msiDir\KlaayGuard.exe") -and $legacyAgent -and $msiAgent) {
+        Pass "planted an earlier NSIS install and an earlier MSI install, both running"
+        $planted = $true
+    } else {
+        Fail "the earlier installs did not plant: $($before.Count) entries, legacy agent: $([bool]$legacyAgent), MSI agent: $([bool]$msiAgent)"
+    }
+}
+
 $proc = Invoke-Installer $Installer @("/S")
 if ($proc -and $proc.ExitCode -eq 0) { Pass "silent install exits 0" }
 elseif ($proc) { Fail "silent install exited $($proc.ExitCode)" }
+
+# --- 1b. Only the new install remains ------------------------------------------
+if ($planted) {
+    $after = @(Get-KlaayGuardEntries)
+    $defaultDir = Join-Path $env:LOCALAPPDATA "KlaayGuard"
+    if ($after.Count -eq 1 -and -not $after[0].Msi -and $after[0].Location -eq $defaultDir) {
+        Pass "exactly one KlaayGuard entry remains, the new install in $defaultDir"
+    } else {
+        Fail "$($after.Count) KlaayGuard entries remain after the install, expected only the new one: $(($after | ForEach-Object { "$($_.Key) -> $($_.Location)" }) -join '; ')"
+    }
+    if (Test-Path "$legacyDir\KlaayGuard.exe") { Fail "the earlier NSIS install in $legacyDir survived" }
+    else { Pass "the earlier NSIS install in $legacyDir is gone" }
+    if (Test-Path $legacyDir) { Fail "the folder $legacyDir survived the uninstall" }
+    if (Test-Path "$msiDir\KlaayGuard.exe") { Fail "the earlier MSI install in $msiDir survived" }
+    else { Pass "the earlier MSI install in $msiDir is gone" }
+    $stale = @(Get-Process -Name KlaayGuard -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like "$legacyDir\*" -or $_.Path -like "$msiDir\*" })
+    if ($stale.Count -gt 0) { Fail "$($stale.Count) agent(s) still run from an earlier install: $(($stale | ForEach-Object Path) -join ', ')" }
+    else { Pass "no agent runs from an earlier install" }
+    $runAfter = Get-ItemProperty -Path $runKey -Name KlaayGuard -ErrorAction SilentlyContinue
+    if ($runAfter -and $runAfter.KlaayGuard -like "*$defaultDir\KlaayGuard.exe*") { Pass "the Run value names the new install" }
+    else { Fail "the Run value names '$($runAfter.KlaayGuard)', not the new install in $defaultDir" }
+}
 
 # Wait for a process to appear, and return it. The installer starts the agent
 # through the shell, so it arrives a moment after the installer exits.
