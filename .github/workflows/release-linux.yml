@@ -39,6 +39,19 @@ jobs:
       - name: install tauri-cli
         run: cargo install tauri-cli --version "=2.11.4" --locked
 
+      # Caches dependency builds only. It must run before "Set bundle version",
+      # which edits Cargo.toml: the cache key hashes Cargo.toml, so a later
+      # step would give every release a new key and a cold build.
+      # The three build variants share one key: only the app crate reads
+      # KLAAY_ENV and the URLs, and rust-cache never saves the app crate.
+      # Only main saves, so dev releases read main's cache and add no copy.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri
+          key: x86_64-unknown-linux-gnu-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: (Ubuntu) install dependencies
         run: |
           sudo apt-get update
