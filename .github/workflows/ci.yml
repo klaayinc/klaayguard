@@ -8,6 +8,9 @@ on:
   push:
     branches: [main, dev]
 
+# Only `main` saves the Rust build caches (`save-if` on each rust-cache step).
+# Pull requests restore main's cache but never write their own: the repository
+# sits at the 10 GB Actions cache limit, and per-PR copies evict main's caches.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -31,6 +34,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri system dependencies
         run: |
@@ -92,6 +96,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Fetch osquery sidecar
         env:
@@ -159,6 +164,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: ${{ matrix.target }}
 
       - name: Install Tauri system dependencies (Linux)
@@ -203,6 +209,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri system dependencies
         run: |
@@ -272,6 +279,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: x86_64-pc-windows-msvc-bundle
 
       - name: Fetch osquery sidecar
