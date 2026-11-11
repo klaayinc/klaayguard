@@ -225,7 +225,9 @@ jobs:
 
       - name: Build deb and rpm
         working-directory: src-tauri
-        run: cargo tauri build --bundles deb rpm
+        run: >
+          cargo tauri build --bundles deb rpm
+          --config '{"bundle":{"linux":{"rpm":{"compression":{"type":"gzip","level":1}}}}}'
 
       - name: Validate deb contents
         run: |
