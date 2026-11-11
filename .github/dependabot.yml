@@ -3,7 +3,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     # A major update arrives in its own pull request.
     groups:
       github-actions:
@@ -13,7 +13,7 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/src-tauri"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     # A major update arrives in its own pull request.
     groups:
       cargo:
