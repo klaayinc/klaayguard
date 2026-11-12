@@ -47,8 +47,12 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      # Prebuilt binary, as ci.yml does. cargo install compiles the CLI for
+      # 3-10 minutes on every run.
       - name: install tauri-cli
-        run: cargo install tauri-cli --version "=2.11.4" --locked
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: tauri-cli@2.11.4
 
       # Caches dependency builds only. It must run before "Set bundle version",
       # which edits Cargo.toml: the cache key hashes Cargo.toml, so a later
