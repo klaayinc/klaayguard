@@ -8,6 +8,9 @@ on:
   push:
     branches: [main, dev]
 
+# Only `main` saves the Rust build caches (`save-if` on each rust-cache step).
+# Pull requests restore main's cache but never write their own: the repository
+# sits at the 10 GB Actions cache limit, and per-PR copies evict main's caches.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,6 +22,9 @@ jobs:
   test:
     name: Test & lint (Linux x86_64)
     runs-on: ubuntu-22.04
+    # Normal runs take a few minutes. A stalled step must fail well before the
+    # six-hour default.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -31,11 +37,12 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri system dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          ./.github/scripts/apt-install.sh \
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake
 
@@ -92,6 +99,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Fetch osquery sidecar
         env:
@@ -129,6 +137,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       # Every target that release ships. (release-linux drops arm64, so that one
@@ -159,13 +168,14 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: ${{ matrix.target }}
 
       - name: Install Tauri system dependencies (Linux)
         if: runner.os == 'Linux'
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          ./.github/scripts/apt-install.sh \
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake
 
@@ -193,6 +203,7 @@ jobs:
   bundle-linux:
     name: Bundle check (Linux deb)
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -204,11 +215,12 @@ jobs:
         with:
           workspaces: src-tauri
           shared-key: bundle-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri system dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          ./.github/scripts/apt-install.sh \
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
@@ -234,10 +246,18 @@ jobs:
           test -n "$DEB"
           ./.github/scripts/validate-linux-deb.sh "$DEB"
 
-      # Proves the postinstall restarts the agent it replaces. Without that
-      # step a package upgrade leaves the old process running the old binary,
-      # and Linux has no supervisor to notice until the next login. Root,
-      # because the postinstall runs as root and starts the agent with runuser.
+  # Proves the postinstall restarts the agent it replaces. Without that
+  # step a package upgrade leaves the old process running the old binary,
+  # and Linux has no supervisor to notice until the next login. Root,
+  # because the postinstall runs as root and starts the agent with runuser.
+  # Its own job: it takes 3-4 minutes, reads only linux/postinst.sh and
+  # builds its own stand-in binary, so it needs nothing the bundle job builds.
+  postinst-linux:
+    name: postinst restarts the old agent (Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - name: postinst restarts the old agent
         working-directory: src-tauri
         run: sudo bash scripts/test-postinst-restarts-agent.sh
@@ -261,11 +281,12 @@ jobs:
         with:
           workspaces: src-tauri
           shared-key: bundle-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install Tauri system dependencies
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          ./.github/scripts/apt-install.sh \
             libwebkit2gtk-4.1-dev libappindicator3-dev \
             librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
@@ -311,6 +332,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           key: x86_64-pc-windows-msvc-bundle
 
       - name: Fetch osquery sidecar

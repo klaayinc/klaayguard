@@ -14,6 +14,7 @@ jobs:
   build-upload-linux-x86_64:
     name: Linux x86_64 (${{ matrix.build }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 60
     permissions:
       contents: write
     strategy:
@@ -43,10 +44,22 @@ jobs:
         with:
           tool: tauri-cli@2.11.4
 
+      # Caches dependency builds only. It must run before "Set bundle version",
+      # which edits Cargo.toml: the cache key hashes Cargo.toml, so a later
+      # step would give every release a new key and a cold build.
+      # The three build variants share one key: only the app crate reads
+      # KLAAY_ENV and the URLs, and rust-cache never saves the app crate.
+      # Only main saves, so dev releases read main's cache and add no copy.
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: src-tauri
+          key: x86_64-unknown-linux-gnu-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: (Ubuntu) install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+        timeout-minutes: 15
+        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
 
       - name: Setup osquery binaries (Linux)
         env:
