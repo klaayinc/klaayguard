@@ -38,7 +38,7 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-for fn in agent_pids restart_running_agents main; do
+for fn in agent_pids earlier_agent_pids remove_legacy_autostart restart_running_agents main; do
   if ! grep -q "^${fn}()" "$POSTINST"; then
     echo "FAIL: $POSTINST defines no ${fn}(); a package install leaves the old agent running"
     exit 1
@@ -463,6 +463,78 @@ done
 systemctl stop 'klaayguard-agent-*' 2>/dev/null || true
 pkill -f "^$installed" 2>/dev/null || true
 sleep 0.3
+
+# An earlier version can run from a path this package never wrote. The AppImage
+# mounts itself under a `.mount_*` directory, and the pre-rename package put
+# its binary at /usr/bin/klaay. Both claim the same single-instance name as the
+# package agent, so while one runs the new build exits at start and the machine
+# reports from the earlier version. The install must hand each one over to the
+# package binary, for the same user, in the same session.
+#
+# Whether `pgrep -f` sees a path, within two seconds.
+started_at() {
+  local end=$((SECONDS + 2))
+  until pgrep -f "^$1" >/dev/null 2>&1 || [ $SECONDS -ge $end ]; do sleep 0.1; done
+  pgrep -f "^$1" | head -1
+}
+gone_within() {
+  local end=$((SECONDS + 2))
+  until ! alive "$1" || [ $SECONDS -ge $end ]; do sleep 0.1; done
+  ! alive "$1"
+}
+appimage_exe="$workdir/.mount_KlaayGtest/usr/bin/KlaayGuard"
+legacy_exe="$workdir/legacy/klaay"
+mkdir -p "$(dirname "$appimage_exe")" "$(dirname "$legacy_exe")"
+cp "$elsewhere" "$appimage_exe"
+cp "$elsewhere" "$legacy_exe"
+chmod -R 755 "$workdir/.mount_KlaayGtest" "$workdir/legacy"
+LEGACY_BIN="$legacy_exe"
+
+echo "==> an AppImage agent must be replaced by the package agent"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$appimage_exe" &
+appimage_pid="$(started_at "$appimage_exe")"
+[ -n "$appimage_pid" ] || { echo "FAIL: the fake AppImage agent did not start"; exit 1; }
+restart_running_agents "$installed"
+gone_within "$appimage_pid" \
+  || { echo "FAIL: the AppImage agent still runs; it holds the single-instance name and the package agent exits"; exit 1; }
+handover="$(wait_for_agent "$installed")"
+[ -n "$handover" ] || { echo "FAIL: no package agent replaced the AppImage agent; the machine is unmonitored"; exit 1; }
+[ "$(owner_of "${handover%% *}")" = "$TEST_USER" ] \
+  || { echo "FAIL: the package agent that replaced the AppImage runs as $(owner_of "${handover%% *}"), not $TEST_USER"; exit 1; }
+pkill -f "^$installed" 2>/dev/null || true
+
+echo "==> an agent of the pre-rename klaay package must be replaced too"
+runuser -u "$TEST_USER" -- env DISPLAY=":99" "$legacy_exe" &
+legacy_pid="$(started_at "$legacy_exe")"
+[ -n "$legacy_pid" ] || { echo "FAIL: the fake klaay agent did not start"; exit 1; }
+restart_running_agents "$installed"
+gone_within "$legacy_pid" \
+  || { echo "FAIL: the klaay agent still runs beside the package agent"; exit 1; }
+[ -n "$(wait_for_agent "$installed")" ] \
+  || { echo "FAIL: no package agent replaced the klaay agent; the machine is unmonitored"; exit 1; }
+pkill -f "^$installed" 2>/dev/null || true
+alive "$elsewhere_pid" || { echo "FAIL: the handover killed a build that is not an earlier install"; exit 1; }
+
+# tauri-plugin-autostart, which v0.1.0 to v0.1.5 used, wrote its own login
+# entry under the app's name. The agent now writes klaayguard.desktop, so on a
+# machine that ran those builds both entries start an agent at every login.
+echo "==> the tauri-plugin-autostart entry of an earlier version must go"
+test_home="$(getent passwd "$TEST_USER" | cut -d: -f6)"
+autostart_dir="$test_home/.config/autostart"
+mkdir -p "$autostart_dir"
+printf '[Desktop Entry]\nType=Application\nName=KlaayGuard\nExec=/usr/bin/KlaayGuard\n' > "$autostart_dir/KlaayGuard.desktop"
+printf '[Desktop Entry]\nType=Application\nName=KlaayGuard\nExec=/usr/bin/KlaayGuard\n' > "$autostart_dir/klaayguard.desktop"
+test_home_b="$(getent passwd "$TEST_USER_B" | cut -d: -f6)"
+mkdir -p "$test_home_b/.config/autostart"
+printf '[Desktop Entry]\nType=Application\nName=Other\nExec=/opt/other/tool\n' > "$test_home_b/.config/autostart/KlaayGuard.desktop"
+remove_legacy_autostart
+[ -e "$autostart_dir/KlaayGuard.desktop" ] \
+  && { echo "FAIL: the tauri-plugin-autostart entry survived; it starts an agent at every login"; exit 1; }
+[ -f "$autostart_dir/klaayguard.desktop" ] \
+  || { echo "FAIL: the install removed the current autostart entry"; exit 1; }
+[ -f "$test_home_b/.config/autostart/KlaayGuard.desktop" ] \
+  || { echo "FAIL: the install removed a KlaayGuard.desktop that does not start KlaayGuard"; exit 1; }
+rm -rf "$autostart_dir" "$test_home_b/.config/autostart"
 
 # A first install has nothing to restart, and that is not a failure. The
 # branch also carries the line that tells an operator which of the two silent

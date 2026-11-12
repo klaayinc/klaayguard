@@ -38,6 +38,12 @@ grep -qE 'remove \| purge \| 0' <<<"$SCRIPTS" \
   && pass "the removal path reads rpm's erase argument" \
   || fail "the removal path does not distinguish rpm's erase (0) from its upgrade (1)"
 
+# Before the rename the package was called klaay. Obsoletes is what makes
+# `rpm -U` and dnf remove it while they install this one.
+grep -qx 'klaay' <<<"$(rpm -qp --obsoletes "$RPM" 2>/dev/null)" \
+  && pass "obsoletes the pre-rename klaay package" \
+  || fail "the rpm does not obsolete klaay; the pre-rename package stays installed"
+
 # The binary and the sidecar must be in the payload, as they are in the deb.
 FILES="$(rpm -qpl "$RPM" 2>/dev/null)"
 grep -qx '/usr/bin/KlaayGuard' <<<"$FILES" \

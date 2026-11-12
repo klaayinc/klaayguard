@@ -1,12 +1,20 @@
 #!/bin/sh
 # Package postinstall for the .deb and the .rpm. It refreshes the desktop
-# databases, then restarts the agent this install replaces.
+# databases, removes what earlier versions left behind, then restarts every
+# agent this install replaces onto the new binary.
+#
+# The package manager removes the earlier package itself: the same package on
+# an upgrade, and the pre-rename klaay package through Conflicts, Replaces and
+# Obsoletes in tauri.conf.json. What it cannot see is handled here: an agent
+# that an AppImage runs, and the login entry tauri-plugin-autostart wrote.
 #
 # dpkg and rpm both fail the package when this script exits non-zero, so every
 # step is best-effort.
 set -e
 
 AGENT_BIN=/usr/bin/KlaayGuard
+# The binary of the package before the rename to KlaayGuard.
+LEGACY_BIN=/usr/bin/klaay
 
 # The session variables the agent needs to reach the tray, and the XDG bases
 # that decide which directories it reads and writes. The replacement inherits
@@ -53,6 +61,43 @@ agent_pids() {
     exe=$(readlink "$proc/exe" 2>/dev/null) || continue
     if [ "$exe" = "$bin" ] || [ "$exe" = "$bin (deleted)" ]; then
       echo "${proc#/proc/}"
+    fi
+  done
+}
+
+# Every process running an earlier KlaayGuard that this package did not write:
+# an AppImage, which runs from its own `.mount_*` directory, and the pre-rename
+# package's binary.
+#
+# Each one claims the same single-instance name as the package agent. While one
+# runs, the new build exits at start, and the machine reports from the earlier
+# version. The same root check as `agent_pids` applies.
+earlier_agent_pids() {
+  for proc in /proc/[0-9]*; do
+    [ "$(readlink "$proc/root" 2>/dev/null)" = "/" ] || continue
+    exe=$(readlink "$proc/exe" 2>/dev/null) || continue
+    case "${exe% (deleted)}" in
+      "$LEGACY_BIN" | */.mount_*/usr/bin/KlaayGuard | */.mount_*/usr/bin/klaay)
+        echo "${proc#/proc/}"
+        ;;
+    esac
+  done
+}
+
+# Delete the login entry tauri-plugin-autostart wrote for v0.1.0 to v0.1.5.
+#
+# The agent now writes klaayguard.desktop. On a machine that ran those builds
+# the old KlaayGuard.desktop stays beside it, and both start an agent at every
+# login. The file name alone is not proof: take it only when it starts ours.
+remove_legacy_autostart() {
+  getent passwd | cut -d: -f6 | sort -u | while IFS= read -r home; do
+    entry="$home/.config/autostart/KlaayGuard.desktop"
+    [ -f "$entry" ] || continue
+    grep -qE '^Exec=.*(KlaayGuard|klaay)' "$entry" || continue
+    if rm -f "$entry"; then
+      log "postinst: removed the tauri-plugin-autostart entry $entry"
+    else
+      log "postinst: ERROR could not remove $entry"
     fi
   done
 }
@@ -119,7 +164,9 @@ restart_running_agents() {
   # another user's process. dpkg's root has that capability, so the silence was
   # the defect rather than the blindness.
   restarted=""
-  pids=$(agent_pids "$bin")
+  # The agents of earlier installs go the same way: stopped, then replaced by
+  # this package's binary for the same user, in the same session.
+  pids=$(agent_pids "$bin"; earlier_agent_pids)
   if [ -z "$pids" ]; then
     log "postinst: no agent runs $bin; nothing to restart"
     return 0
@@ -245,6 +292,7 @@ main() {
   # Restarting there interrupts a healthy agent for nothing.
   case "${1:-configure}" in
     configure | 1 | 2)
+      remove_legacy_autostart || true
       restart_running_agents "$AGENT_BIN" || true
       ;;
     *)

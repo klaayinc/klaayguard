@@ -102,6 +102,14 @@ else
   fail "control archive has no postrm"
 fi
 
+# Before the rename the package was called klaay. Conflicts plus Replaces is
+# the pair that makes dpkg remove it while it installs this one; Conflicts
+# alone makes dpkg refuse the install, and Replaces alone leaves both installed.
+grep -qE '^Conflicts:.*\bklaay\b' control/control && pass "Conflicts with the pre-rename klaay package" \
+  || fail "control file does not conflict with klaay; the pre-rename package stays installed"
+grep -qE '^Replaces:.*\bklaay\b' control/control && pass "Replaces the pre-rename klaay package" \
+  || fail "control file does not replace klaay; dpkg refuses the install instead of removing it"
+
 # The package must declare its runtime dependencies.
 grep -q '^Depends: ..*' control/control && pass "Depends declared" \
   || fail "control file declares no Depends"

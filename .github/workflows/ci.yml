@@ -127,6 +127,13 @@ jobs:
         working-directory: src-tauri
         run: bash scripts/test-postinstall-stops-agent.sh
 
+      # Proves the .pkg preinstall removes every earlier install before the
+      # payload lands: a copy in ~/Applications, a bundle under another name,
+      # and the login job tauri-plugin-autostart left behind in v0.1.0 to v0.1.5.
+      - name: preinstall removes earlier versions
+        working-directory: src-tauri
+        run: bash scripts/test-preinstall-removes-old-versions.sh
+
       # Proves the .pkg pins its payload to /Applications. Left unwired, this
       # test existed while the installer shipped a relocatable bundle, so a Mac
       # holding another com.klaay.app copy took the app instead.
@@ -309,16 +316,21 @@ jobs:
       # current release and installs it — so every assertion below would read a
       # different binary than the one this job built. With no reachable API the
       # check fails harmlessly and the installed 0.1.12 stays 0.1.12.
+      # The .msi is not shipped. Early releases shipped one, so the check
+      # installs it first, as the earlier version a customer machine can hold,
+      # and proves the NSIS installer removes it.
       - name: Build NSIS installer
         working-directory: src-tauri
         env:
           VITE_API_BASE_URL: http://127.0.0.1:9
-        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis
+        run: cargo tauri build --target x86_64-pc-windows-msvc --bundles nsis msi
 
       - name: Validate installer
         shell: pwsh
         run: |
           $exe = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "NSIS installer missing" }
+          $msi = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -Filter *.msi | Select-Object -First 1
+          if (-not $msi) { throw "MSI missing; the earlier-install check needs it" }
           $v = (Get-Content VERSION -Raw).Trim()
-          ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v
+          ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v -Msi $msi.FullName
