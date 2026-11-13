@@ -2,17 +2,23 @@
 
 Date: 2026-11-13. Machine: Apple silicon Mac, macOS 26. Branch: this PR.
 This report covers step 1 of `fewer-release-variants.md` (sections 3, 8, 10
-tests 1 and 2, and the appendix). It changes no workflow.
+tests 1 and 2, and the appendix). Later commits in this PR also edit the
+macOS release workflows (section 7).
 
 ## Answer
 
 One universal build works. `cargo tauri build --target universal-apple-darwin`
 makes one app that holds both slices, one `.dmg`, and the `.pkg` script wraps
-it with no change. Two things need a decision or a fix before release:
+it with no change. An install of the unsigned universal `.pkg` through the
+macOS Installer worked on an Apple silicon Mac (section 6). Two things stay
+open before release:
 
-- The arch gate in `main.rs` reports a mismatch when the app runs under
-  Rosetta on Apple silicon (section 5).
-- Signing, notarization and a real Intel Mac were not tested (section 6).
+- Signing and notarization were not tested. No signing identity exists on the
+  test Mac (section 4).
+- A real Intel Mac was not tested (section 9).
+
+The arch gate in `main.rs` reported a mismatch under Rosetta. This PR fixes it
+(section 5).
 
 ## 1. Sidecar: Tauri does not merge
 
@@ -116,7 +122,7 @@ Native, Apple silicon, three runs of 12 to 15 seconds:
 - `keychain: token load failed: A default keychain could not be found`. This
   comes from the empty `HOME`, not from the build.
 
-Under Rosetta (`arch -x86_64 …/KlaayGuard`):
+Under Rosetta (`arch -x86_64 …/KlaayGuard`), before the fix in this PR:
 
 - The gate reports a mismatch. stderr:
   `Architecture mismatch: app built for x86_64 but running on arm64 (Apple Silicon) hardware. Please install the arm64 build of KlaayGuard.`
@@ -126,17 +132,57 @@ Under Rosetta (`arch -x86_64 …/KlaayGuard`):
 - Cause: Rosetta runs the x86_64 slice, so `std::env::consts::ARCH` is
   `x86_64`, and `sysctl hw.optional.arm64` still returns 1.
 
+The fix: `arch_mismatch(is_arm_hw, built_arch)` in `main.rs` now returns true
+only for an arm64 process on an Intel Mac. An x86_64 process on Apple silicon
+is not a mismatch, because Rosetta runs it. Four unit tests cover the four
+cases (`cargo test tests::` on macOS). The first run of the new tests failed
+before the change and passed after it.
+
 Not verified:
 
-- The tray icon. The screenshot of this session was black, so I could not
-  see the menu bar. The log shows the tray-only setup ran. It does not show
-  the icon.
-- A posture report reaching kiln. The run had no sign-in.
 - A real Intel Mac. On Intel the x86_64 slice runs with `hw.optional.arm64`
   = 0, which the gate accepts, by the code. Not run.
 - macOS 10.13 or 10.14.
 
-## 6. What a real change touches
+## 6. Install test (customer path)
+
+Goal: the flow a customer sees, with only the signing step missing.
+
+Build: `KLAAY_ENV=development`, `VITE_API_BASE_URL=http://localhost:51289`,
+`VITE_FRONTEND_URL=http://localhost:5173`, version stamped `0.99.0` for the
+test only (the stamp is not committed). The build points at a local kiln and
+a local Earthenware, started with `composefork up` in a kiln worktree. The
+unsigned `.pkg` (41280998 bytes) came from a local web server, so the browser
+added the quarantine mark, as it does for a customer download.
+
+Steps, done by Emil in the Mac UI: download in the browser, open the file,
+accept the unsigned-package warning in System Settings, click through the
+Installer with the admin password in its window, sign in on the local page
+with a seeded test user. Emil reported that the flow worked.
+
+Checked by command after the install:
+
+| Check | Output |
+|---|---|
+| `CFBundleShortVersionString` of `/Applications/KlaayGuard.app` | `0.99.0` |
+| `lipo -archs` on the main binary | `x86_64 arm64` |
+| `lipo -archs` on `klaayguard-osqueryi` | `x86_64 arm64` |
+| `ls -d /Applications/KlaayGuard*.app` | one app |
+| `pgrep -fl "KlaayGuard.app/Contents/MacOS"` | one process |
+| Newest device row in the local kiln database | `agent_version` `0.99.0` |
+
+What the customer sees in the Installer comes from `Distribution`. The
+v0.1.69 `.pkg` and the universal `.pkg` have the same `Distribution` apart
+from the version and the size: no `Resources` folder, so no welcome, license
+or conclusion page, and `customize="never"`. The scripts are the same.
+
+Not covered: the signed and notarized package (v0.1.69 is signed and
+notarized: `pkgutil --check-signature`, `spctl --assess --type install` =
+`accepted`, `stapler validate` = worked), the Hub download page, the old
+`.dmg` updater path, the tray icon (I did not see the screen), and a real
+Intel Mac.
+
+## 7. What a real change touches
 
 Checked against the appendix of the proposal and the files in this tree.
 Line numbers are from this branch.
@@ -148,7 +194,9 @@ Done in this PR:
   `vendor_binaries`, so `verify` checks it. `fetch` (line 332) needs no edit:
   it invokes the `OSQUERYI_PATH` task that now makes the file.
 
-Not in this PR (the task forbids workflow changes):
+Also in this PR: the workflow edits below, the README edit and the gate fix.
+The release workflows run only for a release. No CI run on this PR builds
+them, so they stay untested until a release.
 
 - `.github/workflows/release-macos.yml`
   - Matrix lines 23-41: replace `arch: [arm64, x64]` and its two includes with
@@ -170,14 +218,17 @@ Not in this PR (the task forbids workflow changes):
     `KlaayGuard_<v>_macOS_x64_<env>.dmg`.
 - `.github/workflows/windows-installer-artifact.yml`: matrix lines 186-192
   and the `.dmg` and `.pkg` names (lines 290 and 295) change the same way.
+- `src-tauri/src/main.rs`: the gate. The function `arch_mismatch` replaces the
+  inline match. The arm `(true, "x86_64")` is gone. Under Rosetta the app
+  runs translated, as a thin x64 build does today.
+- `README.md`: the asset names and the macOS bullet.
+
+Not in this PR:
+
 - `.github/workflows/ci.yml` lines 154-157: no rename. Branch protection
   needs `Build (aarch64-apple-darwin)` and `Build (x86_64-apple-darwin)`. CI
   then never builds the universal target. The appendix does not list a new
   job. A job that runs this trial is a decision for Emil.
-- `src-tauri/src/main.rs` lines 77-81: the gate. The arm `(true, "x86_64")`
-  fires under Rosetta. It must not fire for a universal build. Choose one:
-  drop that arm, or skip the check when `proc_translated` is 1. Under
-  Rosetta the app then runs translated, as a thin x64 build does today.
 - `src-tauri/src/lib.rs`: no edit for step 1. `select_dmg_asset` (line 3905)
   keeps `.dmg` plus `macOS_arm64` or `macOS_x64`, so each old updater finds
   its name. The updater work (`SelectedUpdate` line 3827, path line 4728,
@@ -189,11 +240,11 @@ Not in this PR (the task forbids workflow changes):
   appendix lists them. `macOS_universal` has neither `_x64_` nor
   `_arm64_`, so kiln gives it no label today. Deploy kiln and the Hub first
   (section 8 of the proposal). I did not open these repos.
-- Docs: README, `docs/OVERVIEW.md`, `docs/EMPLOYEE_GUIDE.md`, the comment in
+- Docs: `docs/OVERVIEW.md`, `docs/EMPLOYEE_GUIDE.md`, the comment in
   `src-tauri/macos/scripts/postinstall`. The appendix lists them. Not
   checked here.
 
-## 7. Asset names to use
+## 8. Asset names to use
 
 Per environment `<env>` in `development`, `staging`, `production`:
 
@@ -206,11 +257,16 @@ Per environment `<env>` in `development`, `staging`, `production`:
 The two `.dmg` files are the same bytes. Tauri names its output
 `KlaayGuard_<bundle version>_universal.dmg`, so the workflow must rename it.
 
-## 8. Open after this trial
+## 9. Open after this trial
 
 - Real Intel Mac test (install, one process, tray, posture report).
-- Signed, notarized `.pkg`: `codesign --verify --deep --strict`, `spctl`,
-  `stapler validate`. Needs the CI certificates.
-- Tray icon on screen, and a posture report to kiln, on Apple silicon.
-- The gate fix in `main.rs`.
+- Signed, notarized universal `.pkg`: `codesign --verify --deep --strict`,
+  `spctl`, `stapler validate`. Needs the CI certificates, which are not on
+  the test Mac.
+- Tray icon on screen on Apple silicon (I did not see it).
+- The old `.dmg` updater path with the universal `.dmg` under the
+  `macOS_arm64` and `macOS_x64` names.
+- The release workflow edits run only in a release.
+- Deploy order: kiln and the Hub first, then the release (section 8 of the
+  proposal). `macOS_universal` has no label in kiln today.
 - macOS 10.13 and 10.14 behavior.
