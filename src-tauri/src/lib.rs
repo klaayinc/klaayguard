@@ -3915,6 +3915,36 @@ fn select_dmg_asset<'a>(
         })
 }
 
+/// Pick the universal `.pkg` installer. Only the `macOS_universal` name counts:
+/// older releases shipped per-arch `.pkg` files that this updater never trusted.
+#[cfg(any(target_os = "macos", test))]
+fn select_pkg_asset(assets: &[ReleaseAsset]) -> Option<&ReleaseAsset> {
+    assets.iter().find(|asset| {
+        asset
+            .original_name
+            .as_deref()
+            .is_some_and(|n| n.ends_with(".pkg") && n.contains("macOS_universal"))
+    })
+}
+
+/// The macOS update asset: the universal `.pkg` when the release has one, else
+/// the per-arch `.dmg` that every older release carries.
+#[cfg(any(target_os = "macos", test))]
+fn select_macos_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    arch_tag: &str,
+    arch_label: &str,
+) -> Option<&'a ReleaseAsset> {
+    select_pkg_asset(assets).or_else(|| select_dmg_asset(assets, arch_tag, arch_label))
+}
+
+/// A `.pkg` is a xar archive; a `.dmg` is not. The download carries no type, so
+/// the bytes decide which install path runs.
+#[cfg(any(target_os = "macos", test))]
+fn is_pkg_payload(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"xar!")
+}
+
 /// Whether `bytes` hashes to `expected` (bare hex or "sha256:"-prefixed).
 fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
     use sha2::{Digest, Sha256};
@@ -4595,7 +4625,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         };
 
         #[cfg(target_os = "macos")]
-        if let Some(dmg_asset) = select_dmg_asset(&release.assets, arch_tag, arch_label) {
+        if let Some(dmg_asset) = select_macos_asset(&release.assets, arch_tag, arch_label) {
             log::info!(
                 "✅ Selected {} update: {} (ID: {})",
                 arch_tag,
@@ -4615,7 +4645,10 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 sha256: dmg_asset.sha256.clone(),
             }));
         } else {
-            log::warn!("⚠️  No {} DMG asset found in release assets", arch_tag);
+            log::warn!(
+                "⚠️  No {} .pkg or DMG asset found in release assets",
+                arch_tag
+            );
         }
     } else if release_semver < current_semver {
         log::info!(
@@ -4724,8 +4757,12 @@ async fn download_and_install_update_internal(
         // world-known ~/Downloads/KlaayGuard-update.dmg. The signature gate in
         // replace_application verifies the *mounted* bundle, so this is defense-in-depth
         // against a local process swapping the file between write and mount (TOCTOU).
-        let dmg_path =
-            std::env::temp_dir().join(format!("KlaayGuard-update-{}.dmg", std::process::id()));
+        let is_pkg = is_pkg_payload(&bytes);
+        let dmg_path = std::env::temp_dir().join(format!(
+            "KlaayGuard-update-{}.{}",
+            std::process::id(),
+            if is_pkg { "pkg" } else { "dmg" }
+        ));
 
         log::info!("💾 Staging to: {:?}", dmg_path);
 
@@ -4740,9 +4777,15 @@ async fn download_and_install_update_internal(
 
         log::info!("✅ Update downloaded successfully to: {:?}", dmg_path);
 
-        // Mount the DMG and replace the app
         log::info!("🔄 Starting application replacement process...");
-        replace_application(&dmg_path, app).await?;
+        if is_pkg {
+            let result = install_from_pkg(&dmg_path);
+            let _ = std::fs::remove_file(&dmg_path);
+            result?;
+            relaunch_after_update(app);
+        } else {
+            replace_application(&dmg_path, app).await?;
+        }
 
         Ok(())
     }
@@ -5127,7 +5170,12 @@ fn stage_verify_and_swap(
     }
     match std::fs::rename(&staged, target_app) {
         Ok(()) => {
-            let _ = std::fs::remove_dir_all(&backup);
+            // A bundle installed by the root-run .pkg is root-owned inside, so a
+            // user cannot delete it. The swap already worked; leave the hidden
+            // copy and say so.
+            if let Err(e) = std::fs::remove_dir_all(&backup) {
+                log::warn!("⚠️  Could not remove the old app {:?}: {}", backup, e);
+            }
             log::info!("✅ New app swapped into place");
             Ok(())
         }
@@ -5139,6 +5187,134 @@ fn stage_verify_and_swap(
             Err(format!("Failed to swap new app into place: {}", e))
         }
     }
+}
+
+/// Whether a `pkgutil --check-signature` report shows a notarization-grade
+/// signature from our team. The leaf certificate (chain entry 1) must be a
+/// Developer ID Installer cert whose line ends in our exact team id in
+/// parentheses, so a lookalike id or our id on another chain entry fails.
+#[cfg(target_os = "macos")]
+fn pkg_signature_report_ok(report: &str) -> Result<(), String> {
+    let not_ours = || {
+        format!(
+            "update package not signed by Klaay team {} (rejecting)",
+            KLAAY_TEAM_ID
+        )
+    };
+    let signed = report.lines().any(|l| {
+        l.trim()
+            .starts_with("Status: signed by a developer certificate issued by Apple")
+    });
+    let leaf_ok = report
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("1. "))
+        .is_some_and(|l| {
+            l.starts_with("1. Developer ID Installer:")
+                && l.ends_with(&format!("({})", KLAAY_TEAM_ID))
+        });
+    if signed && leaf_ok {
+        Ok(())
+    } else {
+        Err(not_ours())
+    }
+}
+
+/// The trust gate for a downloaded `.pkg`: signed by our team, then accepted
+/// by Gatekeeper as a notarized installer. Runs before anything is unpacked.
+#[cfg(target_os = "macos")]
+fn verify_pkg_signature(pkg_path: &std::path::Path) -> Result<(), String> {
+    let check = std::process::Command::new("/usr/sbin/pkgutil")
+        .arg("--check-signature")
+        .arg(pkg_path)
+        .output()
+        .map_err(|e| format!("pkgutil spawn failed: {}", e))?;
+    pkg_signature_report_ok(&String::from_utf8_lossy(&check.stdout))?;
+
+    let assess = std::process::Command::new("/usr/sbin/spctl")
+        .args(["--assess", "--type", "install", "--verbose=4"])
+        .arg(pkg_path)
+        .output()
+        .map_err(|e| format!("spctl spawn failed: {}", e))?;
+    if !assess.status.success() {
+        return Err(format!(
+            "Gatekeeper assessment of the package failed (not notarized/accepted): {}",
+            String::from_utf8_lossy(&assess.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// First `KlaayGuard.app` under `dir`, searched a few levels deep. It never
+/// descends into a bundle.
+#[cfg(target_os = "macos")]
+fn find_app_bundle(dir: &std::path::Path, depth: u8) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == "KlaayGuard.app") {
+            return Some(path);
+        }
+        if depth > 0 && path.is_dir() {
+            if let Some(found) = find_app_bundle(&path, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Unpack the package as the current user and return its `KlaayGuard.app`.
+/// `pkgutil --expand-full` needs no privilege and runs none of the package's
+/// scripts. `dest` must not exist yet.
+#[cfg(target_os = "macos")]
+fn expand_pkg_app(
+    pkg_path: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let expand = std::process::Command::new("/usr/sbin/pkgutil")
+        .arg("--expand-full")
+        .arg(pkg_path)
+        .arg(dest)
+        .output()
+        .map_err(|e| format!("pkgutil spawn failed: {}", e))?;
+    if !expand.status.success() {
+        return Err(format!(
+            "pkgutil --expand-full failed: {}",
+            String::from_utf8_lossy(&expand.stderr).trim()
+        ));
+    }
+    find_app_bundle(dest, 4).ok_or_else(|| "KlaayGuard.app not found in the package".to_string())
+}
+
+/// Verify the `.pkg`, unpack it, and hand its app to the same stage, verify,
+/// and swap that the `.dmg` path uses. The package's preinstall and postinstall
+/// scripts do not run: they need root, and the swap keeps the existing launchd
+/// job and data in place.
+#[cfg(target_os = "macos")]
+fn install_from_pkg(pkg_path: &std::path::Path) -> Result<(), String> {
+    install_from_pkg_to(
+        pkg_path,
+        std::path::Path::new("/Applications/KlaayGuard.app"),
+    )
+}
+
+/// `install_from_pkg` with the target named, so a test can aim it at a copy.
+#[cfg(target_os = "macos")]
+fn install_from_pkg_to(
+    pkg_path: &std::path::Path,
+    target_app: &std::path::Path,
+) -> Result<(), String> {
+    verify_pkg_signature(pkg_path).inspect_err(|e| {
+        log::error!("❌ Update package verification failed: {}", e);
+        sentry::capture_message(&format!("update_signature_rejected:{}", e), Level::Error);
+    })?;
+
+    let work = std::env::temp_dir().join(format!("KlaayGuard-pkg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let result =
+        expand_pkg_app(pkg_path, &work).and_then(|app| stage_verify_and_swap(&app, target_app));
+    let _ = std::fs::remove_dir_all(&work);
+    result
 }
 
 /// Verify and install the mounted bundle into `/Applications`.
@@ -5207,7 +5383,13 @@ async fn replace_application(
     }
 
     result?;
+    relaunch_after_update(app);
+    Ok(())
+}
 
+/// Hand the agent to its relauncher after a successful swap.
+#[cfg(target_os = "macos")]
+fn relaunch_after_update(app: &tauri::AppHandle) {
     match update_relaunch(std::env::var("KLAAYGUARD_LAUNCHD").as_deref() == Ok("1")) {
         Relaunch::LeaveItToLaunchd => {
             log::info!("🎉 Updated; exiting so launchd relaunches the new build");
@@ -5218,7 +5400,6 @@ async fn replace_application(
             // moves to KeepAlive={SuccessfulExit:false} must stop using
             // app.exit, or launchd will never bring the agent back.
             app.exit(0);
-            Ok(())
         }
         Relaunch::RestartSelf => {
             log::info!("🎉 Application updated successfully! Restarting...");
@@ -6535,6 +6716,72 @@ mod update_selection_tests {
             9
         );
         assert!(select_dmg_asset(&assets, "macOS_arm64", "Apple silicon").is_none());
+    }
+
+    // A release that ships the universal .pkg beside the two legacy-named
+    // .dmg copies of the same universal app.
+    fn manifest_with_universal_pkg() -> Vec<ReleaseAsset> {
+        serde_json::from_str(
+            r#"[
+              {"id":1,"name":"Linux (Debian/Ubuntu .deb)","original_name":"KlaayGuard_0.1.71_Linux_x86_64_production.deb","sha256":"aa"},
+              {"id":2,"name":"MacOS (Apple silicon)","original_name":"KlaayGuard_0.1.71_macOS_arm64_production.dmg","sha256":"bb"},
+              {"id":3,"name":"MacOS (Intel)","original_name":"KlaayGuard_0.1.71_macOS_x64_production.dmg","sha256":"cc"},
+              {"id":5,"name":"MacOS (Installer)","original_name":"KlaayGuard_0.1.71_macOS_universal_production.pkg","sha256":"ee"}
+            ]"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prefers_the_universal_pkg_over_the_dmg_on_every_arch() {
+        let assets = manifest_with_universal_pkg();
+        for (tag, label) in [("macOS_arm64", "Apple silicon"), ("macOS_x64", "Intel")] {
+            let sel = select_macos_asset(&assets, tag, label).unwrap();
+            assert_eq!(sel.id, 5, "{tag} must pick the universal .pkg");
+        }
+    }
+
+    #[test]
+    fn falls_back_to_the_dmg_when_the_release_has_no_pkg() {
+        let assets = manifest();
+        assert_eq!(
+            select_macos_asset(&assets, "macOS_arm64", "Apple silicon")
+                .unwrap()
+                .id,
+            2
+        );
+        assert_eq!(
+            select_macos_asset(&assets, "macOS_x64", "Intel")
+                .unwrap()
+                .id,
+            3
+        );
+    }
+
+    #[test]
+    fn an_arch_specific_pkg_is_not_a_universal_pkg() {
+        // Releases before the universal app shipped per-arch .pkg files. Only
+        // the universal one is a known-good update source.
+        let assets: Vec<ReleaseAsset> = serde_json::from_str(
+            r#"[
+              {"id":2,"name":"a","original_name":"KlaayGuard_0.1.69_macOS_arm64_production.dmg","sha256":"bb"},
+              {"id":6,"name":"b","original_name":"KlaayGuard_0.1.69_macOS_arm64_production.pkg","sha256":"ff"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            select_macos_asset(&assets, "macOS_arm64", "Apple silicon")
+                .unwrap()
+                .id,
+            2
+        );
+    }
+
+    #[test]
+    fn a_pkg_download_is_recognised_by_its_xar_header() {
+        assert!(is_pkg_payload(b"xar!\x00\x1c\x00\x01rest"));
+        assert!(!is_pkg_payload(b"koly-dmg-trailer"));
+        assert!(!is_pkg_payload(b""));
     }
 
     #[test]
@@ -8627,5 +8874,147 @@ listener {
         assert_eq!(m["device_uuid"], "device-abc");
         assert_eq!(m["app_version"], env!("CARGO_PKG_VERSION"));
         assert!(!m["app_version"].as_str().unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod pkg_update_tests {
+    use super::*;
+
+    // Output of `pkgutil --check-signature` on the shipped v0.1.69 .pkg.
+    const SIGNED_BY_KLAAY: &str = "Package \"KlaayGuard_0.1.69_macOS_arm64_development.pkg\":
+   Status: signed by a developer certificate issued by Apple for distribution
+   Notarization: trusted by the Apple notary service
+   Signed with a trusted timestamp on: 2026-11-12 13:40:50 +0000
+   Certificate Chain:
+    1. Developer ID Installer: Emil Kampp (8QK45RW8QK)
+       Expires: 2031-07-07 10:01:52 +0000
+    2. Developer ID Certification Authority
+       Expires: 2031-09-17 00:00:00 +0000
+    3. Apple Root CA
+       Expires: 2035-02-09 21:40:36 +0000
+";
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kg-pkg-test-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn pkgbuild(args: &[&str], out: &std::path::Path) {
+        let built = std::process::Command::new("/usr/bin/pkgbuild")
+            .args(args)
+            .arg(out)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "pkgbuild failed");
+    }
+
+    #[test]
+    fn accepts_a_package_signed_by_the_klaay_team() {
+        assert_eq!(pkg_signature_report_ok(SIGNED_BY_KLAAY), Ok(()));
+    }
+
+    #[test]
+    fn refuses_a_package_signed_by_another_team() {
+        let other = SIGNED_BY_KLAAY.replace("8QK45RW8QK", "ABCDE12345");
+        assert!(pkg_signature_report_ok(&other).is_err());
+    }
+
+    #[test]
+    fn refuses_a_forged_team_that_only_contains_ours() {
+        let forged = SIGNED_BY_KLAAY.replace("(8QK45RW8QK)", "(8QK45RW8QK9)");
+        assert!(pkg_signature_report_ok(&forged).is_err());
+        // Our id on a non-leaf line must not count either.
+        let moved = SIGNED_BY_KLAAY
+            .replace("Emil Kampp (8QK45RW8QK)", "Evil (ZZZZZZZZZZ)")
+            .replace(
+                "2. Developer ID Certification Authority",
+                "2. Developer ID Installer: Evil (8QK45RW8QK)",
+            );
+        assert!(pkg_signature_report_ok(&moved).is_err());
+    }
+
+    #[test]
+    fn refuses_a_report_that_says_no_signature() {
+        let text = "Package \"x.pkg\":\n   Status: no signature\n";
+        assert!(pkg_signature_report_ok(text).is_err());
+    }
+
+    #[test]
+    fn refuses_a_real_unsigned_package() {
+        let dir = scratch_dir("unsigned");
+        let pkg = dir.join("unsigned.pkg");
+        pkgbuild(
+            &[
+                "--nopayload",
+                "--identifier",
+                "test.unsigned",
+                "--version",
+                "1",
+            ],
+            &pkg,
+        );
+        let err = verify_pkg_signature(&pkg).unwrap_err();
+        assert!(err.contains("not signed by Klaay"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_the_app_inside_an_expanded_package() {
+        let dir = scratch_dir("expand");
+        let contents = dir.join("root/KlaayGuard.app/Contents");
+        std::fs::create_dir_all(&contents).unwrap();
+        std::fs::write(contents.join("marker"), "x").unwrap();
+        let pkg = dir.join("app.pkg");
+        let root = dir.join("root");
+        pkgbuild(
+            &[
+                "--identifier",
+                "test.app",
+                "--version",
+                "1",
+                "--install-location",
+                "/Applications",
+                "--root",
+                root.to_str().unwrap(),
+            ],
+            &pkg,
+        );
+        let app = expand_pkg_app(&pkg, &dir.join("expanded")).unwrap();
+        assert!(app.ends_with("KlaayGuard.app"));
+        assert!(app.join("Contents/marker").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Manual end-to-end run against real signed release packages:
+    //   KG_E2E_PKG=<signed .pkg> KG_E2E_TARGET=<older KlaayGuard.app copy> \
+    //     cargo test --lib e2e_updates -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs KG_E2E_PKG and KG_E2E_TARGET"]
+    fn e2e_updates_an_older_app_from_a_signed_pkg() {
+        let pkg = std::path::PathBuf::from(std::env::var("KG_E2E_PKG").unwrap());
+        let target = std::path::PathBuf::from(std::env::var("KG_E2E_TARGET").unwrap());
+        install_from_pkg_to(&pkg, &target).unwrap();
+        verify_klaay_signature(&target).unwrap();
+    }
+
+    #[test]
+    fn a_package_without_the_app_is_an_error() {
+        let dir = scratch_dir("noapp");
+        let pkg = dir.join("empty.pkg");
+        pkgbuild(
+            &[
+                "--nopayload",
+                "--identifier",
+                "test.empty",
+                "--version",
+                "1",
+            ],
+            &pkg,
+        );
+        assert!(expand_pkg_app(&pkg, &dir.join("expanded")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
