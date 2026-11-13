@@ -77,8 +77,10 @@ jobs:
           test -f src-tauri/vendor/klaayguard-osqueryi-aarch64-apple-darwin || (echo "Missing macOS arm64 sidecar" && exit 1)
           test -f src-tauri/vendor/klaayguard-osqueryi-x86_64-apple-darwin || (echo "Missing macOS x64 sidecar" && exit 1)
           test -f src-tauri/vendor/klaayguard-osqueryi-universal-apple-darwin || (echo "Missing macOS universal sidecar" && exit 1)
-          lipo -archs src-tauri/vendor/klaayguard-osqueryi-universal-apple-darwin | grep -q "x86_64" || (echo "Universal sidecar has no x86_64 slice" && exit 1)
-          lipo -archs src-tauri/vendor/klaayguard-osqueryi-universal-apple-darwin | grep -q "arm64" || (echo "Universal sidecar has no arm64 slice" && exit 1)
+          ARCHS=$(lipo -archs src-tauri/vendor/klaayguard-osqueryi-universal-apple-darwin)
+          echo "Universal sidecar slices: $ARCHS"
+          case "$ARCHS" in *x86_64*) ;; *) echo "Universal sidecar has no x86_64 slice" >&2; exit 1 ;; esac
+          case "$ARCHS" in *arm64*) ;; *) echo "Universal sidecar has no arm64 slice" >&2; exit 1 ;; esac
 
       - name: Set bundle version from release
         run: |
