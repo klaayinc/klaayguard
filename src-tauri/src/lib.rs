@@ -9942,4 +9942,87 @@ mod token_renewal_tests {
 
         assert_eq!(requests(&seen), 0);
     }
+
+    /// The renewal against a real kiln, through the code the agent runs.
+    ///
+    /// `KLAAYGUARD_E2E_TOKENS` names a JSON file of `{"case": "<token>"}`;
+    /// `KLAAYGUARD_E2E_API` defaults to staging. It refuses production. Each
+    /// token is treated as due (the clock is set a day before its `exp`), and
+    /// `/me` is asked about the old and the new token afterwards. Tokens are
+    /// never printed.
+    ///
+    /// cargo test --lib staging_renewal -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs KLAAYGUARD_E2E_TOKENS and a kiln to talk to"]
+    async fn staging_renewal() {
+        let api = std::env::var("KLAAYGUARD_E2E_API").unwrap_or("https://api.klaay.dev".into());
+        assert!(
+            !keychain::is_production_target(&api),
+            "refusing to renew against production: {api}"
+        );
+        let path = std::env::var("KLAAYGUARD_E2E_TOKENS").expect("KLAAYGUARD_E2E_TOKENS");
+        let tokens: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("tokens file"))
+                .expect("tokens JSON");
+
+        let payload = |t: &str| -> Value {
+            use base64::Engine;
+            t.split('.')
+                .nth(1)
+                .and_then(|p| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(p)
+                        .ok()
+                })
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(Value::Null)
+        };
+        let me = |i: Identity| match i {
+            Identity::Rejected => "rejected",
+            Identity::Accepted(_) => "accepted",
+            Identity::Unknown => "unknown",
+        };
+
+        for (case, old) in tokens {
+            let state = signed_in(&api, &old);
+            let (save, saved) = store();
+            let exp = token_renewal::claims(&old)
+                .and_then(|c| c.exp)
+                .expect("exp");
+            let step = renew_token_if_due(
+                &state,
+                &client(),
+                &mut schedule(),
+                &save,
+                Instant::now(),
+                exp - DAY,
+            )
+            .await;
+            let new = held(&state).unwrap_or_default();
+            let renewed = new != old;
+            let (o, n) = (payload(&old), payload(&new));
+            let stored = saved.lock().unwrap().len();
+            let me_old = me(fetch_identity(&api, &old).await);
+            let me_new = if renewed {
+                me(fetch_identity(&api, &new).await)
+            } else {
+                "-"
+            };
+            println!(
+                "{case}: step={step:?} stored={} | old account_id={} accounts={} \
+                 | new account_id={} accounts={} client={} exp_days={} jti_changed={} \
+                 | /me old={} new={}",
+                stored,
+                o["account_id"],
+                o["accounts"],
+                n["account_id"],
+                n["accounts"],
+                n["client"],
+                (n["exp"].as_i64().unwrap_or(0) - chrono::Utc::now().timestamp()) / DAY,
+                o["jti"] != n["jti"],
+                me_old,
+                me_new,
+            );
+        }
+    }
 }
