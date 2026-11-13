@@ -4625,15 +4625,15 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         };
 
         #[cfg(target_os = "macos")]
-        if let Some(dmg_asset) = select_macos_asset(&release.assets, arch_tag, arch_label) {
+        if let Some(update_asset) = select_macos_asset(&release.assets, arch_tag, arch_label) {
             log::info!(
                 "✅ Selected {} update: {} (ID: {})",
                 arch_tag,
-                dmg_asset
+                update_asset
                     .original_name
                     .as_deref()
-                    .unwrap_or(&dmg_asset.name),
-                dmg_asset.id
+                    .unwrap_or(&update_asset.name),
+                update_asset.id
             );
             log::info!(
                 "🚀 Update available: {} -> {}",
@@ -4641,8 +4641,8 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 release.version
             );
             return Ok(Some(SelectedUpdate {
-                asset_id: dmg_asset.id.to_string(),
-                sha256: dmg_asset.sha256.clone(),
+                asset_id: update_asset.id.to_string(),
+                sha256: update_asset.sha256.clone(),
             }));
         } else {
             log::warn!(
@@ -4754,19 +4754,19 @@ async fn download_and_install_update_internal(
         }
 
         // Stage the download in a private, process-scoped temp path rather than the
-        // world-known ~/Downloads/KlaayGuard-update.dmg. The signature gate in
-        // replace_application verifies the *mounted* bundle, so this is defense-in-depth
-        // against a local process swapping the file between write and mount (TOCTOU).
+        // world-known ~/Downloads/KlaayGuard-update.dmg. Both install paths verify the
+        // staged app's signature before the swap, so this is defense-in-depth against a
+        // local process swapping the file between write and install (TOCTOU).
         let is_pkg = is_pkg_payload(&bytes);
-        let dmg_path = std::env::temp_dir().join(format!(
+        let update_path = std::env::temp_dir().join(format!(
             "KlaayGuard-update-{}.{}",
             std::process::id(),
             if is_pkg { "pkg" } else { "dmg" }
         ));
 
-        log::info!("💾 Staging to: {:?}", dmg_path);
+        log::info!("💾 Staging to: {:?}", update_path);
 
-        let mut file = std::fs::File::create(&dmg_path).map_err(|e| {
+        let mut file = std::fs::File::create(&update_path).map_err(|e| {
             log::error!("❌ Failed to create update file: {}", e);
             format!("Failed to create update file: {}", e)
         })?;
@@ -4775,16 +4775,16 @@ async fn download_and_install_update_internal(
             format!("Write error: {}", e)
         })?;
 
-        log::info!("✅ Update downloaded successfully to: {:?}", dmg_path);
+        log::info!("✅ Update downloaded successfully to: {:?}", update_path);
 
         log::info!("🔄 Starting application replacement process...");
         if is_pkg {
-            let result = install_from_pkg(&dmg_path);
-            let _ = std::fs::remove_file(&dmg_path);
+            let result = install_from_pkg(&update_path);
+            let _ = std::fs::remove_file(&update_path);
             result?;
             relaunch_after_update(app);
         } else {
-            replace_application(&dmg_path, app).await?;
+            replace_application(&update_path, app).await?;
         }
 
         Ok(())
