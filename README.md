@@ -39,6 +39,11 @@ sequenceDiagram
 
     %% Collection loop
     loop Every 15 minutes
+        opt Token has fewer than 14 days left
+            Agent->>API: POST /authenticate (Bearer token, upgrade mode)
+            API-->>Agent: new 3-month token
+            Agent->>Agent: Hold and store the new token
+        end
         Agent->>API: GET /klaayguard/config (Bearer token)
         API-->>Agent: Query set (id + optional SQL)
         Agent->>Osquery: Run each read-only query (--json)
@@ -60,6 +65,12 @@ Key properties:
   try comes one collection interval later. Each wait doubles, up to 24 hours.
   Each `401`/`403` opens sign-in again. With no stored token, the agent sends
   nothing and opens nothing.
+- **Token renewal:** a token lasts three months. Once fewer than 14 days are
+  left, the agent asks `POST /authenticate` for a new one before the next
+  cycle. It names the token's own account when the token names one, then
+  holds and stores the new token. A renewal that fails for any reason (network,
+  `401`, `403`, `429`, `5xx`) keeps the current token, and the agent asks again
+  6 hours later. Only the collection cycle signs the agent out.
 - **osquery is bundled.** It ships as a Tauri sidecar named
   `klaayguard-osqueryi`, so it never collides with a system osquery install.
   The agent needs no admin rights to run.
@@ -195,6 +206,8 @@ All variables are optional.
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `900` | Collection loop interval |
 | `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS, Windows, Linux AppImage) |
 | `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` | `60` | Minimum gap between sign-in nudges |
+| `KLAAYGUARD_TOKEN_RENEW_WITHIN_SECONDS` | `1209600` | Renew the token once it has less than this left (14 days) |
+| `KLAAYGUARD_TOKEN_RENEW_RETRY_SECONDS` | `21600` | Least time between two renewal requests |
 
 ### API endpoints
 
@@ -203,6 +216,7 @@ All variables are optional.
 | `POST /cli_auth_requests` | Register the loopback sign-in | none |
 | `POST /cli_auth_requests/claim` | Exchange the one-time code for a token | none |
 | `GET /me` | Validate the token and name the signed-in person | Bearer |
+| `POST /authenticate` | Renew the token in its last 14 days (upgrade mode) | Bearer |
 | `GET /klaayguard/config` | Fetch the query set | Bearer |
 | `POST /klaayguard/data` | Send collected rows | Bearer |
 | `GET /klaayguard/updates/latest` | Update manifest | none |
