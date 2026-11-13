@@ -75,11 +75,10 @@ that differ only in their baked-in URLs. Asset naming:
 KlaayGuard_<version>_<macOS_universal|macOS_arm64|macOS_x64|Linux_x86_64|Windows_x64>_<variant>.<ext>
 ```
 
-- **macOS:** one universal build for Apple Silicon and Intel. The
-  `KlaayGuard_<version>_macOS_universal_<variant>.pkg` installer is preferred,
-  see below. The same universal `.dmg` (drag to Applications) ships under two
-  names, `macOS_arm64` and `macOS_x64`, because every updater up to v0.1.69
-  looks for those names.
+- **macOS:** one universal build for Apple Silicon and Intel, shipped only as
+  `KlaayGuard_<version>_macOS_universal_<variant>.pkg`, see below. Releases
+  before the `.dmg` removal also hold a `.dmg` under the names `macOS_arm64`
+  and `macOS_x64`.
 - **Linux:** `.deb`, `.rpm`, and `.AppImage`.
 - **Windows:** an `.exe` installer (NSIS), x64 only. It needs no
   administrator rights. Klaay does not sign it yet, so Windows shows a
@@ -133,28 +132,27 @@ KLAAY_ENV=development VITE_API_BASE_URL=http://localhost:3000 VITE_FRONTEND_URL=
   cargo tauri build && open src-tauri/target/release/bundle/macos/KlaayGuard.app
 ```
 
-### macOS installer (`.pkg`) vs disk image (`.dmg`)
+### macOS installer (`.pkg`)
 
-The release pipeline ships **both** a drag-to-Applications `.dmg` and a
-double-click `.pkg` installer. The installer is preferred for first-time setup:
-its `postinstall` script ([`src-tauri/macos/scripts/postinstall`](src-tauri/macos/scripts/postinstall))
+The release pipeline ships a double-click `.pkg` installer as the only macOS
+installer. Its `postinstall` script ([`src-tauri/macos/scripts/postinstall`](src-tauri/macos/scripts/postinstall))
 registers the launchd LaunchAgent **at install time**, so auto-start and the
 `KeepAlive` auto-restart are active immediately — the user never has to
-launch the app first. (The DMG relies on the app installing its own agent on
-first launch, which is skipped if the user drags it to /Applications but never
-opens it.)
+launch the app first.
 
 The postinstall reuses the app's own logic through the `--install-agent` CLI
 seam rather than re-implementing `launchctl` in shell; the app still
 self-installs the agent on launch as an idempotent fallback. The in-app
-auto-updater always uses the `.dmg` (the agent is already running during an
-update, so the first-launch gap does not apply).
+auto-updater downloads the `.pkg`, checks that team `8QK45RW8QK` signed it,
+unpacks it as the user, and swaps the app in. It does not run the package
+scripts (the agent is already running during an update, so the first-launch
+gap does not apply).
 
 Building the signed installer requires a **Developer ID Installer** identity
 (separate from the Developer ID Application cert used to codesign the `.app`),
 provided to CI as the `APPLE_INSTALLER_CERTIFICATE` /
-`APPLE_INSTALLER_CERTIFICATE_PASSWORD` secrets. Until those are configured the
-`.pkg` step is skipped and only the `.dmg` ships. Build one locally with:
+`APPLE_INSTALLER_CERTIFICATE_PASSWORD` secrets. Without them the macOS release
+job fails. Build one locally with:
 
 ```bash
 # after `cargo tauri build` has produced KlaayGuard.app
