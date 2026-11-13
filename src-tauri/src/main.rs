@@ -2,6 +2,44 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+/// True when this process cannot run on this hardware.
+///
+/// An x86_64 process on Apple silicon is not a mismatch: Rosetta runs it. The
+/// universal app also runs its x86_64 slice there when a user sets Open using
+/// Rosetta. Only an arm64 process on an Intel Mac cannot run.
+#[cfg(target_os = "macos")]
+fn arch_mismatch(is_arm_hw: bool, built_arch: &str) -> bool {
+    matches!((is_arm_hw, built_arch), (false, "aarch64") | (false, "arm"))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::arch_mismatch;
+
+    #[test]
+    fn x86_64_slice_on_apple_silicon_is_not_a_mismatch() {
+        // The universal app runs its x86_64 slice under Rosetta on Apple silicon.
+        assert!(!arch_mismatch(true, "x86_64"));
+    }
+
+    #[test]
+    fn arm64_slice_on_apple_silicon_is_not_a_mismatch() {
+        assert!(!arch_mismatch(true, "aarch64"));
+    }
+
+    #[test]
+    fn x86_64_slice_on_intel_is_not_a_mismatch() {
+        assert!(!arch_mismatch(false, "x86_64"));
+    }
+
+    #[test]
+    fn arm64_slice_on_intel_is_a_mismatch() {
+        // An arm64 slice cannot run on an Intel Mac.
+        assert!(arch_mismatch(false, "aarch64"));
+        assert!(arch_mismatch(false, "arm"));
+    }
+}
+
 fn main() {
     // Early panic hook: write to the platform log directory before Tauri and
     // its logger exist. Uses the same directory as tauri-plugin-log, so one
@@ -75,10 +113,7 @@ fn main() {
         }
 
         if let Some(is_arm_hw) = is_apple_silicon_hw {
-            let mismatch = matches!(
-                (is_arm_hw, built_arch),
-                (true, "x86_64") | (false, "aarch64") | (false, "arm")
-            );
+            let mismatch = arch_mismatch(is_arm_hw, built_arch);
 
             if mismatch {
                 let human_built = if built_arch == "aarch64" {
