@@ -72,11 +72,14 @@ Each release carries three variants â€” `development`, `staging`, `production` â
 that differ only in their baked-in URLs. Asset naming:
 
 ```
-KlaayGuard_<version>_<macOS_arm64|macOS_x64|Linux_x86_64|Windows_x64>_<variant>.<ext>
+KlaayGuard_<version>_<macOS_universal|macOS_arm64|macOS_x64|Linux_x86_64|Windows_x64>_<variant>.<ext>
 ```
 
-- **macOS:** `.dmg` (drag to Applications) and `.pkg` installer (preferred,
-  see below). Apple Silicon and Intel are separate builds.
+- **macOS:** one universal build for Apple Silicon and Intel. The
+  `KlaayGuard_<version>_macOS_universal_<variant>.pkg` installer is preferred,
+  see below. The same universal `.dmg` (drag to Applications) ships under two
+  names, `macOS_arm64` and `macOS_x64`, because every updater up to v0.1.69
+  looks for those names.
 - **Linux:** `.deb`, `.rpm`, and `.AppImage`.
 - **Windows:** an `.exe` installer (NSIS), x64 only. It needs no
   administrator rights. Klaay does not sign it yet, so Windows shows a
