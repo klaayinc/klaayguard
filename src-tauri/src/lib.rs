@@ -6674,6 +6674,10 @@ mod signed_out_retry_tests {
         Ok(None)
     }
 
+    fn store_unreadable() -> Result<Option<String>, String> {
+        Err("the keychain is locked".to_string())
+    }
+
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
     }
@@ -6807,6 +6811,36 @@ mod signed_out_retry_tests {
         assert_eq!(retry.attempts, 2);
     }
 
+    // A locked or broken credential store is no reason to stop the schedule.
+    // The agent sends nothing, stays signed out, and tries the store again at
+    // the next wait.
+    #[tokio::test]
+    async fn an_unreadable_store_sends_nothing_and_keeps_the_schedule() {
+        let app = tauri::test::mock_app();
+        let (api, seen) = api_answering("401 Unauthorized").await;
+        let state = quiet_state(&api);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+        retry.attempts = 1;
+        retry.next_at = Some(now);
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            store_unreadable,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(requests(&seen), 0);
+        assert_eq!(*lock_read(&state.auth_token), None);
+        assert_eq!(retry.attempts, 2);
+        assert_eq!(retry.next_at, Some(now + secs(1800)));
+    }
+
     // The retry is the stored token's one chance to work. When the server
     // accepts it, the agent keeps it and the schedule starts over.
     #[tokio::test]
@@ -6864,8 +6898,7 @@ mod signed_out_retry_tests {
         assert_eq!(retry.next_at, None);
     }
 
-    // The promise to Emil: whatever the count, the agent tries again within
-    // 24 hours.
+    // Whatever the count, the agent tries again within 24 hours.
     #[tokio::test]
     async fn the_gap_between_tries_never_passes_24_hours() {
         let app = tauri::test::mock_app();
