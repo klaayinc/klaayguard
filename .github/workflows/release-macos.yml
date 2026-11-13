@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         build: [development, staging, production]
-        arch: [arm64, x64]
+        arch: [universal]
         include:
           - build: development
             api_url: "http://localhost:3000"
@@ -31,14 +31,10 @@ jobs:
           - build: production
             api_url: "https://api.klaay.com"
             frontend_url: "https://app.klaay.com"
-          - arch: arm64
-            target: aarch64-apple-darwin
-            dmg_dir: src-tauri/target/aarch64-apple-darwin
-            artifact_suffix: macOS_arm64
-          - arch: x64
-            target: x86_64-apple-darwin
-            dmg_dir: src-tauri/target/x86_64-apple-darwin
-            artifact_suffix: macOS_x64
+          - arch: universal
+            target: universal-apple-darwin
+            dmg_dir: src-tauri/target/universal-apple-darwin
+            artifact_suffix: macOS_universal
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -80,6 +76,11 @@ jobs:
           ls -l src-tauri/vendor || true
           test -f src-tauri/vendor/klaayguard-osqueryi-aarch64-apple-darwin || (echo "Missing macOS arm64 sidecar" && exit 1)
           test -f src-tauri/vendor/klaayguard-osqueryi-x86_64-apple-darwin || (echo "Missing macOS x64 sidecar" && exit 1)
+          test -f src-tauri/vendor/klaayguard-osqueryi-universal-apple-darwin || (echo "Missing macOS universal sidecar" && exit 1)
+          ARCHS=$(lipo -archs src-tauri/vendor/klaayguard-osqueryi-universal-apple-darwin)
+          echo "Universal sidecar slices: $ARCHS"
+          case "$ARCHS" in *x86_64*) ;; *) echo "Universal sidecar has no x86_64 slice" >&2; exit 1 ;; esac
+          case "$ARCHS" in *arm64*) ;; *) echo "Universal sidecar has no arm64 slice" >&2; exit 1 ;; esac
 
       - name: Set bundle version from release
         run: |
@@ -196,10 +197,15 @@ jobs:
             DMG_PATH=$(find ${{ matrix.dmg_dir }} -name "*.dmg" -type f | head -n1 || true)
           fi
           if [ -n "${DMG_PATH:-}" ]; then
-            RENAMED_DMG="KlaayGuard_${VERSION}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.dmg"
-            cp "$DMG_PATH" "$RENAMED_DMG"
-            uploaded+=("$RENAMED_DMG")
-            echo "Added to upload: $RENAMED_DMG"
+            # Every updater from v0.1.13 to v0.1.69 asks for a .dmg whose name
+            # holds macOS_arm64 or macOS_x64. The one universal .dmg ships under
+            # both names, so each old updater finds its name.
+            for legacy in macOS_arm64 macOS_x64; do
+              RENAMED_DMG="KlaayGuard_${VERSION}_${legacy}_${{ matrix.build }}.dmg"
+              cp "$DMG_PATH" "$RENAMED_DMG"
+              uploaded+=("$RENAMED_DMG")
+              echo "Added to upload: $RENAMED_DMG"
+            done
           else
             echo "DMG not found; attempting .app.tar.gz fallback"
             APP_TGZ_PATH=$(find ${{ matrix.dmg_dir }} -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)

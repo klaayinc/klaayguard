@@ -25,7 +25,7 @@ on:
         default: "windows"
         type: string
       arch:
-        description: "macOS arch: arm64, x64, or both"
+        description: "Ignored. macOS builds one universal app. Kept so existing callers still work."
         required: false
         default: "arm64"
         type: string
@@ -171,7 +171,7 @@ jobs:
       fail-fast: false
       matrix:
         build: [development, staging, production]
-        arch: [arm64, x64]
+        arch: [universal]
         include:
           - build: development
             api_url: "http://localhost:3000"
@@ -182,24 +182,17 @@ jobs:
           - build: production
             api_url: "https://api.klaay.com"
             frontend_url: "https://app.klaay.com"
-          - arch: arm64
-            target: aarch64-apple-darwin
-            bundle_dir: src-tauri/target/aarch64-apple-darwin
-            artifact_suffix: macOS_arm64
-          - arch: x64
-            target: x86_64-apple-darwin
-            bundle_dir: src-tauri/target/x86_64-apple-darwin
-            artifact_suffix: macOS_x64
+          - arch: universal
+            target: universal-apple-darwin
+            bundle_dir: src-tauri/target/universal-apple-darwin
+            artifact_suffix: macOS_universal
     steps:
-      - name: Skip arch not requested
+      # The macOS build is one universal app, so the arch input no longer picks
+      # a leg. The step stays so every later `if` keeps its condition.
+      - name: Run the universal leg
         id: want
         shell: bash
-        run: |
-          case "${{ inputs.arch }}" in
-            both) echo "run=true" >> "$GITHUB_OUTPUT" ;;
-            "${{ matrix.arch }}") echo "run=true" >> "$GITHUB_OUTPUT" ;;
-            *) echo "run=false" >> "$GITHUB_OUTPUT" ;;
-          esac
+        run: echo "run=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.want.outputs.run == 'true'
@@ -208,7 +201,7 @@ jobs:
         if: steps.want.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Cache cargo build
         if: steps.want.outputs.run == 'true'
@@ -287,7 +280,11 @@ jobs:
           test -n "$APP_PATH" || { echo "KlaayGuard.app missing" >&2; exit 1; }
           DMG=$(find ${{ matrix.bundle_dir }} -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1)
           test -n "$DMG" || { echo "dmg missing" >&2; exit 1; }
-          cp "$DMG" "out/KlaayGuard_${V}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.dmg"
+          # The one universal .dmg ships under both legacy arch names, as the
+          # release does, so every updater from v0.1.13 to v0.1.69 finds its name.
+          for legacy in macOS_arm64 macOS_x64; do
+            cp "$DMG" "out/KlaayGuard_${V}_${legacy}_${{ matrix.build }}.dmg"
+          done
 
           echo "$APPLE_INSTALLER_CERTIFICATE" | base64 --decode > installer_certificate.p12
           security import installer_certificate.p12 -k build.keychain \
