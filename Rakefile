@@ -220,6 +220,7 @@ file OSQUERYI_PATH => [OSQUERYD_PATH] do
     sh "mkdir -p #{DIR_SIDECAR}"
     sh "cp #{OSQUERYD_PATH} #{OSQUERYI_PATH}-aarch64-apple-darwin"
     sh "cp #{OSQUERYD_PATH} #{OSQUERYI_PATH}-x86_64-apple-darwin"
+    sh "cp #{OSQUERYD_PATH} #{OSQUERYI_PATH}-universal-apple-darwin"
 end
 
 OSQUERYI_LINUX_X64_PATH = File.join(DIR_SIDECAR, "klaayguard-osqueryi-x86_64-unknown-linux-gnu")
@@ -272,6 +273,7 @@ def vendor_binaries
         [
             "#{OSQUERYI_PATH}-aarch64-apple-darwin",
             "#{OSQUERYI_PATH}-x86_64-apple-darwin",
+            "#{OSQUERYI_PATH}-universal-apple-darwin",
         ]
     elsif platform =~ /linux/
         arch = begin
