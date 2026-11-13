@@ -55,8 +55,11 @@ Key properties:
 - **No local database.** Rows go directly from osquery to the POST. Nothing
   is buffered on disk.
 - **Retries:** on `429`, `5xx`, or network errors the agent retries after
-  60 s, then 120 s. A `401`/`403` clears the in-memory token and prompts
-  sign-in instead.
+  60 s, then 120 s. A `401`/`403` clears the in-memory token and opens
+  sign-in instead. The agent then tries again with the stored token. The first
+  try comes one collection interval later. Each wait doubles, up to 24 hours.
+  Each `401`/`403` opens sign-in again. With no stored token, the agent sends
+  nothing and opens nothing.
 - **osquery is bundled.** It ships as a Tauri sidecar named
   `klaayguard-osqueryi`, so it never collides with a system osquery install.
   The agent needs no admin rights to run.

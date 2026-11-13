@@ -3580,6 +3580,120 @@ async fn run_cycle<R: tauri::Runtime>(
     Ok(())
 }
 
+/// The longest gap between two tries while the agent holds no valid token.
+const SIGNED_OUT_RETRY_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The wait before the next try, after `attempts` tries that ended signed out.
+/// It starts at `base`, doubles with each try, and stops at 24 hours.
+fn signed_out_retry_delay(attempts: u32, base: Duration) -> Duration {
+    // Past 31 doublings the product is already over any ceiling, and a larger
+    // shift would overflow the multiplier.
+    let doublings = attempts.saturating_sub(1).min(31);
+    base.saturating_mul(1u32 << doublings)
+        .min(SIGNED_OUT_RETRY_CEILING)
+}
+
+/// The schedule of tries while the agent holds no valid token.
+///
+/// A 401 clears the token from memory and opens sign-in once. Without this
+/// schedule nothing asked again: the person who closed that page, or never saw
+/// it, left the device silent until the next restart. The stored token is the
+/// token the server rejected, so each try gets the same 401, and the 401 opens
+/// sign-in again.
+struct SignedOutRetry {
+    base: Duration,
+    attempts: u32,
+    next_at: Option<Instant>,
+}
+
+impl SignedOutRetry {
+    fn new(base: Duration) -> Self {
+        Self {
+            base,
+            attempts: 0,
+            next_at: None,
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.next_at.is_none_or(|at| now >= at)
+    }
+
+    /// Count a try that ended signed out, and set the time of the next one.
+    fn record_attempt(&mut self, now: Instant) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.next_at = Some(now + signed_out_retry_delay(self.attempts, self.base));
+    }
+
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.next_at = None;
+    }
+}
+
+/// One tick of the collection loop.
+///
+/// Signed in, it runs a cycle. If that cycle ends signed out, the 401 counts as
+/// the first try. Signed out, it waits for the schedule, then resumes the
+/// stored token and runs a cycle with it. A stored token the server still
+/// rejects signs the agent out again and opens sign-in again. Nothing stored
+/// means the person signed out, or never signed in: there is nothing to send.
+async fn collection_tick<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    retry: &mut SignedOutRetry,
+    load_stored_token: fn() -> Result<Option<String>, String>,
+    now: Instant,
+) -> Result<(), String> {
+    let signed_in = |state: &Arc<AppState>| lock_read(&state.auth_token).is_some();
+
+    if signed_in(state) {
+        let result = run_cycle(app, state, client).await;
+        if signed_in(state) {
+            retry.reset();
+        } else {
+            retry.record_attempt(now);
+        }
+        return result;
+    }
+
+    if !retry.due(now) {
+        return Ok(());
+    }
+    retry.record_attempt(now);
+
+    // The credential store blocks (D-Bus, Keychain): keep it off the workers.
+    let stored = tauri::async_runtime::spawn_blocking(load_stored_token)
+        .await
+        .map_err(|e| e.to_string())?;
+    let token = match stored {
+        Ok(Some(token)) => token,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            log::error!("keychain: token load failed: {}", e);
+            sentry::capture_message(&format!("keychain_token_load_failed: {}", e), Level::Error);
+            return Ok(());
+        }
+    };
+    // A sign-in that finished while the store was read holds a newer token.
+    // Never write the stored one over it.
+    {
+        let mut held = lock_write(&state.auth_token);
+        if held.is_some() {
+            return Ok(());
+        }
+        *held = Some(token);
+    }
+
+    add_breadcrumb("auth", "signed_out_retry", Level::Info);
+    let result = run_cycle(app, state, client).await;
+    if signed_in(state) {
+        retry.reset();
+    }
+    result
+}
+
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         // The config GET and data POST are small: give the whole request a
@@ -3600,9 +3714,10 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         // acquired between ticks (a sign-in after a sign-out or a 401) collects
         // at once and restarts the interval from there, instead of waiting out
         // the rest of the period behind a tray that says "Fetching now…".
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(collection_interval_seconds()));
+        let base = Duration::from_secs(collection_interval_seconds());
+        let mut interval = tokio::time::interval(base);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut retry = SignedOutRetry::new(base);
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -3610,7 +3725,16 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                     interval.reset();
                 }
             }
-            if let Err(e) = run_cycle(&app, &state, &client).await {
+            if let Err(e) = collection_tick(
+                &app,
+                &state,
+                &client,
+                &mut retry,
+                keychain::load_token,
+                Instant::now(),
+            )
+            .await
+            {
                 log::error!("cycle error: {}", e);
                 emit_error(
                     &app,
@@ -6472,6 +6596,298 @@ mod session_end_tests {
             label_once_written(&state).await,
             Some("Alice Andersen".to_string())
         );
+    }
+}
+
+// A 401 signs the agent out, and a signed-out agent used to stop for good: with
+// no token the cycle returned at once, and nothing ever asked again. These
+// tests hold the new rule. A signed-out agent with a stored token tries again,
+// with a wait that doubles up to 24 hours, and each 401 opens sign-in again.
+#[cfg(test)]
+mod signed_out_retry_tests {
+    use super::session_label_tests::state_at;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const BASE: Duration = Duration::from_secs(900);
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+
+    /// The `Authorization` header of each request the API has received.
+    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// A loopback API that answers every request with `status` and records the
+    /// `Authorization` header it carried.
+    async fn api_answering(status: &'static str) -> (String, Seen) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let base = format!("http://{}", listener.local_addr().expect("local addr"));
+        let seen: Seen = Arc::default();
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let received = socket.read(&mut request).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&request[..received]).into_owned();
+                    let header = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                        .unwrap_or("")
+                        .to_string();
+                    recorded.lock().unwrap().push(header);
+                    let reply = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                         Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    );
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    fn requests(seen: &Seen) -> usize {
+        seen.lock().unwrap().len()
+    }
+
+    fn client() -> reqwest::Client {
+        http_client(Some(Duration::from_secs(10)))
+    }
+
+    /// A state that nudges nobody: a nudge one moment old keeps these tests
+    /// from opening a browser.
+    fn quiet_state(base: &str) -> Arc<AppState> {
+        let state = state_at(base);
+        *lock_write(&state.last_focus_at) = Some(Instant::now());
+        state
+    }
+
+    fn stored_stale_token() -> Result<Option<String>, String> {
+        Ok(Some("stale-token".to_string()))
+    }
+
+    fn nothing_stored() -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn the_wait_doubles_from_the_collection_interval() {
+        assert_eq!(signed_out_retry_delay(1, BASE), secs(900));
+        assert_eq!(signed_out_retry_delay(2, BASE), secs(1800));
+        assert_eq!(signed_out_retry_delay(3, BASE), secs(3600));
+        assert_eq!(signed_out_retry_delay(7, BASE), secs(57_600));
+    }
+
+    #[test]
+    fn the_wait_never_passes_24_hours() {
+        assert_eq!(signed_out_retry_delay(8, BASE), DAY);
+        assert_eq!(signed_out_retry_delay(60, BASE), DAY);
+        // No overflow at any count, and none from a long base.
+        assert_eq!(signed_out_retry_delay(u32::MAX, BASE), DAY);
+        assert_eq!(signed_out_retry_delay(1, secs(200_000)), DAY);
+    }
+
+    // The 401 is itself the first try. The next one waits one interval, so the
+    // sign-in page does not open twice in one interval.
+    #[tokio::test]
+    async fn a_401_starts_the_schedule() {
+        let app = tauri::test::mock_app();
+        let (api, _seen) = api_answering("401 Unauthorized").await;
+        let state = quiet_state(&api);
+        state.adopt_session("stale-token".into(), None);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            nothing_stored,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(*lock_read(&state.auth_token), None);
+        assert_eq!(retry.attempts, 1);
+        assert_eq!(retry.next_at, Some(now + BASE));
+    }
+
+    // The point of the fix. A signed-out agent with a stored token asks the API
+    // again once the wait is over, and the stored token is the one it sends.
+    #[tokio::test]
+    async fn a_signed_out_agent_tries_again_when_the_wait_is_over() {
+        let app = tauri::test::mock_app();
+        let (api, seen) = api_answering("401 Unauthorized").await;
+        let state = quiet_state(&api);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+        retry.attempts = 1;
+        retry.next_at = Some(now);
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            stored_stale_token,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(requests(&seen), 1);
+        assert!(seen.lock().unwrap()[0].contains("stale-token"));
+        // The server said 401 again: signed out, and the wait doubles.
+        assert_eq!(*lock_read(&state.auth_token), None);
+        assert_eq!(retry.attempts, 2);
+        assert_eq!(retry.next_at, Some(now + secs(1800)));
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_agent_waits_until_the_wait_is_over() {
+        let app = tauri::test::mock_app();
+        let (api, seen) = api_answering("401 Unauthorized").await;
+        let state = quiet_state(&api);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+        retry.attempts = 1;
+        retry.next_at = Some(now + secs(1));
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            stored_stale_token,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(requests(&seen), 0);
+        assert_eq!(retry.attempts, 1);
+    }
+
+    // No stored token: the person signed out, or never signed in. There is
+    // nothing to send, so the agent asks nobody and opens no page.
+    #[tokio::test]
+    async fn no_stored_token_means_no_request() {
+        let app = tauri::test::mock_app();
+        let (api, seen) = api_answering("401 Unauthorized").await;
+        let state = quiet_state(&api);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+        retry.attempts = 1;
+        retry.next_at = Some(now);
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            nothing_stored,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(requests(&seen), 0);
+        assert_eq!(*lock_read(&state.auth_token), None);
+        // The wait still grows, so the store is not read at every tick.
+        assert_eq!(retry.attempts, 2);
+    }
+
+    // The retry is the stored token's one chance to work. When the server
+    // accepts it, the agent keeps it and the schedule starts over.
+    #[tokio::test]
+    async fn a_token_the_server_accepts_ends_the_schedule() {
+        let app = tauri::test::mock_app();
+        let (api, seen) = api_answering("200 OK").await;
+        let state = quiet_state(&api);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+        retry.attempts = 4;
+        retry.next_at = Some(now);
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            stored_stale_token,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(requests(&seen), 1);
+        assert_eq!(lock_read(&state.auth_token).as_deref(), Some("stale-token"));
+        assert_eq!(retry.attempts, 0);
+        assert_eq!(retry.next_at, None);
+    }
+
+    // A person who signs in from the tray puts a token in memory. The next
+    // tick collects as before and the schedule starts over.
+    #[tokio::test]
+    async fn a_new_sign_in_resets_the_schedule() {
+        let app = tauri::test::mock_app();
+        let (api, _seen) = api_answering("200 OK").await;
+        let state = quiet_state(&api);
+        state.adopt_session("fresh-token".into(), None);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+        retry.attempts = 5;
+        retry.next_at = Some(now + DAY);
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            nothing_stored,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(retry.attempts, 0);
+        assert_eq!(retry.next_at, None);
+    }
+
+    // The promise to Emil: whatever the count, the agent tries again within
+    // 24 hours.
+    #[tokio::test]
+    async fn the_gap_between_tries_never_passes_24_hours() {
+        let app = tauri::test::mock_app();
+        let (api, _seen) = api_answering("401 Unauthorized").await;
+        let state = quiet_state(&api);
+        let mut retry = SignedOutRetry::new(BASE);
+        let now = Instant::now();
+        retry.attempts = 40;
+        retry.next_at = Some(now);
+
+        collection_tick(
+            app.handle(),
+            &state,
+            &client(),
+            &mut retry,
+            stored_stale_token,
+            now,
+        )
+        .await
+        .expect("a tick");
+
+        assert_eq!(retry.next_at, Some(now + DAY));
     }
 }
 
