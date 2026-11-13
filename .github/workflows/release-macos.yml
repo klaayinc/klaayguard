@@ -141,12 +141,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The .pkg needs a "Developer ID Installer" identity, which is separate
-          # from the "Developer ID Application" cert used to sign the .app. If it
-          # isn't configured yet, skip the installer — the DMG still ships.
+          # The .pkg is the only macOS installer. It needs a "Developer ID
+          # Installer" identity, which is separate from the "Developer ID
+          # Application" cert used to sign the .app.
           if [ -z "${APPLE_INSTALLER_CERTIFICATE:-}" ]; then
-            echo "::notice::APPLE_INSTALLER_CERTIFICATE not set — skipping .pkg installer (DMG still shipped)."
-            exit 0
+            echo "::error::APPLE_INSTALLER_CERTIFICATE not set; the .pkg is the only macOS installer."
+            exit 1
           fi
 
           APP_PATH=$(find ${{ matrix.dmg_dir }} -path "*/bundle/macos/KlaayGuard.app" -type d | head -n1 || true)
@@ -180,48 +180,3 @@ jobs:
           gh release upload "$RELEASE_TAG" "$PKG" --repo "$GITHUB_REPOSITORY" --clobber
           echo "Uploaded $PKG"
 
-      - name: Rename and upload artifacts (macOS)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          uploaded=()
-
-          echo "Looking for macOS DMG first (deterministic paths)"
-          DMG_PATH=$(find ${{ matrix.dmg_dir }} -path "*/bundle/dmg/*" -name "*.dmg" -type f | head -n1 || true)
-          if [ -z "${DMG_PATH:-}" ]; then
-            echo "Fallback: search any DMG under ${{ matrix.dmg_dir }}"
-            DMG_PATH=$(find ${{ matrix.dmg_dir }} -name "*.dmg" -type f | head -n1 || true)
-          fi
-          if [ -n "${DMG_PATH:-}" ]; then
-            # Every updater from v0.1.13 to v0.1.69 asks for a .dmg whose name
-            # holds macOS_arm64 or macOS_x64. The one universal .dmg ships under
-            # both names, so each old updater finds its name.
-            for legacy in macOS_arm64 macOS_x64; do
-              RENAMED_DMG="KlaayGuard_${VERSION}_${legacy}_${{ matrix.build }}.dmg"
-              cp "$DMG_PATH" "$RENAMED_DMG"
-              uploaded+=("$RENAMED_DMG")
-              echo "Added to upload: $RENAMED_DMG"
-            done
-          else
-            echo "DMG not found; attempting .app.tar.gz fallback"
-            APP_TGZ_PATH=$(find ${{ matrix.dmg_dir }} -type f -name "KlaayGuard.app.tar.gz" | head -n1 || true)
-            if [ -n "${APP_TGZ_PATH:-}" ]; then
-              RENAMED_TGZ="KlaayGuard_${VERSION}_${{ matrix.artifact_suffix }}_${{ matrix.build }}.app.tar.gz"
-              cp "$APP_TGZ_PATH" "$RENAMED_TGZ"
-              uploaded+=("$RENAMED_TGZ")
-              echo "Added to upload: $RENAMED_TGZ"
-            else
-              echo "No macOS artifact found"
-            fi
-          fi
-
-          if [ ${#uploaded[@]} -gt 0 ]; then
-            echo "Uploading to release $RELEASE_TAG in $GITHUB_REPOSITORY: ${uploaded[*]}"
-            gh release upload "$RELEASE_TAG" "${uploaded[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            echo "No artifacts found to upload for macOS ${{ matrix.arch }} ${{ matrix.build }}"
-          fi
