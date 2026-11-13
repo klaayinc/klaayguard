@@ -56,6 +56,9 @@ running:
   Employee Hub. There is no other user interface and no window.
 - **Sign-in reminders.** If the agent is signed out, it opens the login page
   and shows one system notification. It repeats this at most once per minute.
+  A device that stays signed out tries again with its stored sign-in. The
+  first try comes after 15 minutes. Each wait doubles, up to 24 hours. A try
+  that the server rejects opens the login page again.
 - **Automatic updates.** Every 6 hours, the agent asks Klaay for a new
   version. Before it installs an update, it checks that the file hash
   matches the release record. On macOS it also checks that Apple notarized
