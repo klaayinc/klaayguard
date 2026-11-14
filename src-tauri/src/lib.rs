@@ -3960,7 +3960,9 @@ enum UpdateCheck {
     /// Nothing for the agent to do: up to date, or no build for this system.
     Nothing,
     /// A newer release exists, but this is a .deb/.rpm install, which the
-    /// package manager updates, not the agent (PROD-7007).
+    /// package manager updates, not the agent (PROD-7007). Linux only; the
+    /// caller's match arm stays on every platform, so allow it unbuilt there.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PackageManaged { available: String },
 }
 
