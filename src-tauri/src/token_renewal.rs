@@ -309,7 +309,7 @@ pub(crate) mod tests {
     fn scoped(exp: i64) -> Claims {
         Claims {
             exp: Some(exp),
-            account_id: Some("473".into()),
+            account_id: Some("42".into()),
         }
     }
 
@@ -318,12 +318,12 @@ pub(crate) mod tests {
     #[test]
     fn reads_exp_and_a_numeric_account() {
         let token =
-            jwt(json!({ "user_id": 7, "account_id": 473, "exp": NOW, "client": "klaayguard" }));
+            jwt(json!({ "user_id": 7, "account_id": 42, "exp": NOW, "client": "klaayguard" }));
         assert_eq!(
             claims(&token),
             Some(Claims {
                 exp: Some(NOW),
-                account_id: Some("473".into())
+                account_id: Some("42".into())
             })
         );
     }
@@ -342,12 +342,12 @@ pub(crate) mod tests {
 
     #[test]
     fn reads_a_string_account_and_a_padded_payload() {
-        let payload = json!({ "account_id": "473", "exp": NOW }).to_string();
+        let payload = json!({ "account_id": "42", "exp": NOW }).to_string();
         let padded = base64::engine::general_purpose::URL_SAFE.encode(payload.as_bytes());
         let token = format!("e30.{padded}.c2ln");
         assert_eq!(
             claims(&token).and_then(|c| c.account_id),
-            Some("473".to_string())
+            Some("42".to_string())
         );
     }
 
@@ -393,12 +393,12 @@ pub(crate) mod tests {
     #[test]
     fn the_body_names_the_tokens_account() {
         assert_eq!(
-            request_body(Some("473")),
+            request_body(Some("42")),
             json!({
                 "data": {
                     "type": "authentication",
                     "attributes": {},
-                    "relationships": { "account": { "data": { "type": "accounts", "id": "473" } } }
+                    "relationships": { "account": { "data": { "type": "accounts", "id": "42" } } }
                 }
             })
         );
@@ -415,9 +415,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_201_returns_the_new_token() {
-        let new = jwt(json!({ "exp": NOW + 90 * DAY, "account_id": 473 }));
+        let new = jwt(json!({ "exp": NOW + 90 * DAY, "account_id": 42 }));
         let (base, seen) = api("201 Created", issued(&new), nothing()).await;
-        let old = jwt(json!({ "exp": NOW + DAY, "account_id": 473 }));
+        let old = jwt(json!({ "exp": NOW + DAY, "account_id": 42 }));
 
         let got = request_renewal(&client(), &base, &old, &scoped(NOW + DAY)).await;
 
@@ -430,7 +430,7 @@ pub(crate) mod tests {
             format!("authorization: Bearer {old}")
         );
         let sent: Value = serde_json::from_str(&seen[0].body).unwrap();
-        assert_eq!(sent, request_body(Some("473")));
+        assert_eq!(sent, request_body(Some("42")));
     }
 
     #[tokio::test]

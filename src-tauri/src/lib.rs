@@ -9662,13 +9662,13 @@ mod token_renewal_tests {
 
     fn expiring_in(days: i64) -> String {
         jwt(
-            json!({ "user_id": 7, "account_id": 473, "client": "klaayguard", "exp": NOW + days * DAY }),
+            json!({ "user_id": 7, "account_id": 42, "client": "klaayguard", "exp": NOW + days * DAY }),
         )
     }
 
     fn renewed() -> String {
         jwt(
-            json!({ "user_id": 7, "account_id": 473, "client": "klaayguard", "exp": NOW + 92 * DAY }),
+            json!({ "user_id": 7, "account_id": 42, "client": "klaayguard", "exp": NOW + 92 * DAY }),
         )
     }
 
@@ -9948,8 +9948,8 @@ mod token_renewal_tests {
     /// `KLAAYGUARD_E2E_TOKENS` names a JSON file of `{"case": "<token>"}`;
     /// `KLAAYGUARD_E2E_API` defaults to staging. It refuses production. Each
     /// token is treated as due (the clock is set a day before its `exp`), and
-    /// `/me` is asked about the old and the new token afterwards. Tokens are
-    /// never printed.
+    /// `GET /klaayguard/config` is asked with the old and the new token
+    /// afterwards. Tokens are never printed.
     ///
     /// cargo test --lib staging_renewal -- --ignored --nocapture
     #[tokio::test]
@@ -9977,10 +9977,21 @@ mod token_renewal_tests {
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or(Value::Null)
         };
-        let me = |i: Identity| match i {
-            Identity::Rejected => "rejected",
-            Identity::Accepted(_) => "accepted",
-            Identity::Unknown => "unknown",
+        // `/me` answers 200 for some tokens the data endpoints refuse. The
+        // agent signs out on `GET /klaayguard/config`, so ask that instead.
+        let config_status = |token: String| {
+            let api = api.clone();
+            async move {
+                match client()
+                    .get(format!("{api}/klaayguard/config"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r.status().as_u16().to_string(),
+                    Err(_) => "network error".to_string(),
+                }
+            }
         };
 
         for (case, old) in tokens {
@@ -10002,16 +10013,16 @@ mod token_renewal_tests {
             let renewed = new != old;
             let (o, n) = (payload(&old), payload(&new));
             let stored = saved.lock().unwrap().len();
-            let me_old = me(fetch_identity(&api, &old).await);
-            let me_new = if renewed {
-                me(fetch_identity(&api, &new).await)
+            let config_old = config_status(old.clone()).await;
+            let config_new = if renewed {
+                config_status(new.clone()).await
             } else {
-                "-"
+                "-".to_string()
             };
             println!(
                 "{case}: step={step:?} stored={} | old account_id={} accounts={} \
                  | new account_id={} accounts={} client={} exp_days={} jti_changed={} \
-                 | /me old={} new={}",
+                 | GET /klaayguard/config old={} new={}",
                 stored,
                 o["account_id"],
                 o["accounts"],
@@ -10020,8 +10031,8 @@ mod token_renewal_tests {
                 n["client"],
                 (n["exp"].as_i64().unwrap_or(0) - chrono::Utc::now().timestamp()) / DAY,
                 o["jti"] != n["jti"],
-                me_old,
-                me_new,
+                config_old,
+                config_new,
             );
         }
     }
