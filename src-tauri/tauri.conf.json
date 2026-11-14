@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "KlaayGuard",
-  "version": "0.1.12",
   "identifier": "com.klaay.app",
   "build": {
     "frontendDist": "frontend"

@@ -77,7 +77,6 @@ jobs:
       - name: Set bundle version from release
         run: |
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
 
       - name: Build Tauri (Linux x86_64)

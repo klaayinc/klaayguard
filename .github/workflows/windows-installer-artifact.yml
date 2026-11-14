@@ -97,9 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
-          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
           grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
 
       - name: Build Windows installer (NSIS)
@@ -153,7 +151,7 @@ jobs:
           $exe = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "NSIS installer missing" }
           $v = "${{ inputs.version }}"
-          if ($v -eq "") { $v = (Get-Content VERSION -Raw).Trim() }
+          if ($v -eq "") { $v = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value }
           ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v.TrimStart("v")
 
       - name: Upload installer
@@ -228,9 +226,7 @@ jobs:
         run: |
           set -euo pipefail
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i '' -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
-          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
           grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
 
       - name: Import Apple Developer certificate
@@ -274,7 +270,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(cat VERSION)
+          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(awk -F'"' '/^version = /{print $2; exit}' src-tauri/Cargo.toml)
           mkdir -p out
           APP_PATH=$(find ${{ matrix.bundle_dir }} -path "*/bundle/macos/KlaayGuard.app" -type d | head -n1)
           test -n "$APP_PATH" || { echo "KlaayGuard.app missing" >&2; exit 1; }
@@ -359,9 +355,7 @@ jobs:
         run: |
           set -euo pipefail
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
-          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
           grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
 
       - name: Build Tauri (Linux x86_64)
@@ -376,7 +370,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(cat VERSION)
+          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(awk -F'"' '/^version = /{print $2; exit}' src-tauri/Cargo.toml)
           BASE_DIR="src-tauri/target/release/bundle"
           APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1); test -n "$APPIMAGE"
           DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1); test -n "$DEB"

@@ -141,6 +141,12 @@ jobs:
         working-directory: src-tauri
         run: bash scripts/test-pkg-structure.sh
 
+      # Proves the release tag is the only source of the version: no VERSION
+      # file, no version in tauri.conf.json, a placeholder in Cargo.toml, and
+      # no workflow that reads or stamps a second copy.
+      - name: single version source
+        run: bash .github/scripts/test-single-version-source.sh
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -355,7 +361,7 @@ jobs:
       # tick the moment it starts, and against the production API it finds the
       # current release and installs it — so every assertion below would read a
       # different binary than the one this job built. With no reachable API the
-      # check fails harmlessly and the installed 0.1.12 stays 0.1.12.
+      # check fails harmlessly and the installed version stays the built one.
       # The .msi is not shipped. Early releases shipped one, so the check
       # installs it first, as the earlier version a customer machine can hold,
       # and proves the NSIS installer removes it.
@@ -372,5 +378,5 @@ jobs:
           if (-not $exe) { throw "NSIS installer missing" }
           $msi = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -Filter *.msi | Select-Object -First 1
           if (-not $msi) { throw "MSI missing; the earlier-install check needs it" }
-          $v = (Get-Content VERSION -Raw).Trim()
+          $v = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v -Msi $msi.FullName

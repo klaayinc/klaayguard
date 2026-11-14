@@ -163,7 +163,7 @@ provided to CI as the `APPLE_INSTALLER_CERTIFICATE` /
 # after `cargo tauri build` has produced KlaayGuard.app
 INSTALLER_SIGNING_IDENTITY="Developer ID Installer: …" \
   src-tauri/scripts/build-macos-pkg.sh \
-  src-tauri/target/release/bundle/macos/KlaayGuard.app "$(cat VERSION)" KlaayGuard.pkg
+  src-tauri/target/release/bundle/macos/KlaayGuard.app 1.2.3 KlaayGuard.pkg
 ```
 
 ## Configuration
@@ -347,10 +347,13 @@ that.
 ## Version management and releases
 
 - CI computes the next version by bumping the patch of the latest published
-  release tag (`.github/workflows/_prepare-release.yml`). The `VERSION` file
-  is the baseline only when no release exists yet.
-- The release workflow writes the version into `src-tauri/tauri.conf.json`
-  and `src-tauri/Cargo.toml` before building.
+  release tag (`.github/workflows/_prepare-release.yml`). The release tag is
+  the only source of the version. The repository has no `VERSION` file, and
+  `src-tauri/tauri.conf.json` has no version.
+- The release workflow writes the version into `src-tauri/Cargo.toml` before
+  building. Tauri reads it from there. The checked-in value is the `0.0.0`
+  placeholder, so a build from the tree reports `0.0.0`.
+  `.github/scripts/test-single-version-source.sh` enforces this in CI.
 - Every push to `main` or `dev` builds all variants and uploads them to a
   draft release. On `main`, the draft is published and marked latest after
   all platform builds succeed. The update endpoint serves the latest release.
