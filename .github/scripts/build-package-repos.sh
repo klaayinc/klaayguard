@@ -8,6 +8,10 @@
 #   test fills it with whatever it built.
 #   <out-dir> receives the site: klaay.asc, klaay.gpg, apt/ and rpm/.
 #
+# PREVIOUS_SITE (optional, e.g. https://pkg.klaay.com) is the site this build
+# replaces. Its apt and rpm index files are kept alongside the new ones, so a
+# client caught mid-deploy with the old index still finds what it names.
+#
 # The signing key must already be in the default GnuPG home ($GNUPGHOME), and
 # PACKAGE_SIGNING_KEY_ID must name it. The script never sees a passphrase: the
 # key has none, and the only place it lives besides 1Password is the protected
@@ -79,9 +83,33 @@ done
 
 (
   cd "$APT"
-  apt-ftparchive packages "$POOL" > dists/stable/main/binary-amd64/Packages
-  gzip -9nk dists/stable/main/binary-amd64/Packages
+  BIN=dists/stable/main/binary-amd64
+  apt-ftparchive packages "$POOL" > "$BIN/Packages"
+  gzip -9nk "$BIN/Packages"
+  # Acquire-By-Hash: apt fetches the index by its hash, from by-hash/SHA256/,
+  # rather than by its fixed name. Pages replaces the site on every deploy and
+  # its CDN caches each file for up to 10 minutes, so by fixed name a client
+  # can get the new InRelease with a stale cached Packages ("Hash Sum
+  # mismatch"). Under its hash a file never changes. The previous deploy's
+  # indexes stay too (PREVIOUS_SITE below), for clients still holding the old
+  # InRelease.
+  mkdir -p "$BIN/by-hash/SHA256"
+  for f in "$BIN/Packages" "$BIN/Packages.gz"; do
+    cp "$f" "$BIN/by-hash/SHA256/$(sha256sum "$f" | cut -d' ' -f1)"
+  done
+  if [ -n "${PREVIOUS_SITE:-}" ]; then
+    for name in Packages Packages.gz; do
+      prev=$(mktemp)
+      if curl -fsS -o "$prev" "$PREVIOUS_SITE/apt/$BIN/$name"; then
+        cp "$prev" "$BIN/by-hash/SHA256/$(sha256sum "$prev" | cut -d' ' -f1)"
+      else
+        echo "note: no previous $name at $PREVIOUS_SITE (first deploy?)" >&2
+      fi
+      rm -f "$prev"
+    done
+  fi
   apt-ftparchive \
+    -o APT::FTPArchive::Release::Acquire-By-Hash=yes \
     -o APT::FTPArchive::Release::Origin="Klaay" \
     -o APT::FTPArchive::Release::Label="KlaayGuard" \
     -o APT::FTPArchive::Release::Suite="stable" \
@@ -108,6 +136,20 @@ done
 rpmsign --define "__gpg $(command -v gpg)" --define "_gpg_name $KEY_ID" \
   --define "_gpg_digest_algo sha512" --addsign "$RPMDIR"/*.rpm >/dev/null
 createrepo_c --quiet "$RPMDIR"
+# repodata files already carry their hash in the name, so they never go stale
+# under a cache. But a client holding the previous repomd.xml (cached, or
+# fetched just before this deploy) asks for the previous files, which this
+# rebuild would otherwise delete. Keep them for one more generation.
+if [ -n "${PREVIOUS_SITE:-}" ]; then
+  if prev_md=$(curl -fsS "$PREVIOUS_SITE/rpm/repodata/repomd.xml"); then
+    for href in $(grep -o 'href="repodata/[^"]*"' <<<"$prev_md" | sed 's/^href="//; s/"$//'); do
+      [ -e "$RPMDIR/$href" ] || curl -fsS -o "$RPMDIR/$href" "$PREVIOUS_SITE/rpm/$href" \
+        || echo "note: could not keep previous $href" >&2
+    done
+  else
+    echo "note: no previous repomd.xml at $PREVIOUS_SITE (first deploy?)" >&2
+  fi
+fi
 gpg --batch --yes --local-user "$KEY_ID" --armor --detach-sign \
   -o "$RPMDIR/repodata/repomd.xml.asc" "$RPMDIR/repodata/repomd.xml"
 

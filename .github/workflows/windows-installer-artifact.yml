@@ -342,7 +342,7 @@ jobs:
 
       - name: Install Tauri system dependencies
         timeout-minutes: 15
-        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
       - name: Fetch osquery sidecar
         env:
@@ -381,7 +381,11 @@ jobs:
           APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1); test -n "$APPIMAGE"
           DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1); test -n "$DEB"
           RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1); test -n "$RPM"
-          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          # Same rule as release-linux.yml: production carries the package
+          # repository and nothing else does, in both formats.
+          if [ "${{ matrix.build }}" = production ]; then expect=1; else expect=0; fi
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-deb.sh "$DEB"
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-rpm.sh "$RPM"
           mkdir -p out
           cp "$APPIMAGE" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.AppImage"
           cp "$DEB" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.deb"

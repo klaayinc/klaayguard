@@ -3953,6 +3953,17 @@ struct SelectedUpdate {
     sha256: Option<String>,
 }
 
+/// What one update check found.
+enum UpdateCheck {
+    /// A newer build the agent can install itself.
+    Install(SelectedUpdate),
+    /// Nothing for the agent to do: up to date, or no build for this system.
+    Nothing,
+    /// A newer release exists, but this is a .deb/.rpm install, which the
+    /// package manager updates, not the agent (PROD-7007).
+    PackageManaged { available: String },
+}
+
 /// Pick the AppImage asset for this architecture. `original_name` is the
 /// contract; the human label carries no architecture.
 #[cfg(any(target_os = "linux", test))]
@@ -4579,7 +4590,7 @@ fn spawn_tray_clock(app: tauri::AppHandle, state: Arc<AppState>) {
     });
 }
 
-async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpdate>, String> {
+async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, String> {
     let current_version = env!("CARGO_PKG_VERSION");
     log::info!(
         "🔍 Starting update check - current version: {}",
@@ -4677,15 +4688,9 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             // The file to replace on self-update is our own AppImage; deb and
             // rpm installs update through the package manager.
             if own_appimage().is_none() {
-                // Say which version is waiting. Before PROD-7007 this line said
-                // only "not an AppImage" and the caller then logged "up to
-                // date", so a package install 15 releases behind read as
-                // current in its own log.
-                log::warn!(
-                    "⚠️  {} is available. This is a package install (.deb/.rpm), which the agent does not update: the package manager does (apt upgrade / dnf upgrade, from https://pkg.klaay.com where the package added it), or install the new package from app.klaay.com",
-                    release.version
-                );
-                return Ok(None);
+                return Ok(UpdateCheck::PackageManaged {
+                    available: release.version.clone(),
+                });
             }
             return match select_appimage_asset(&release.assets, std::env::consts::ARCH) {
                 Some(asset) => {
@@ -4694,7 +4699,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                         asset.original_name.as_deref().unwrap_or(&asset.name),
                         asset.id
                     );
-                    Ok(Some(SelectedUpdate {
+                    Ok(UpdateCheck::Install(SelectedUpdate {
                         asset_id: asset.id.to_string(),
                         sha256: asset.sha256.clone(),
                     }))
@@ -4704,7 +4709,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                         "⚠️  No Linux {} AppImage asset in the release",
                         std::env::consts::ARCH
                     );
-                    Ok(None)
+                    Ok(UpdateCheck::Nothing)
                 }
             };
         }
@@ -4718,7 +4723,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                     "ℹ️  Auto-update on Windows has no artifact tag for this architecture ({})",
                     std::env::consts::ARCH
                 );
-                return Ok(None);
+                return Ok(UpdateCheck::Nothing);
             };
             return match select_windows_installer_asset(&release.assets, arch_tag) {
                 Some(asset) => {
@@ -4728,14 +4733,14 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                         asset.original_name.as_deref().unwrap_or(&asset.name),
                         asset.id
                     );
-                    Ok(Some(SelectedUpdate {
+                    Ok(UpdateCheck::Install(SelectedUpdate {
                         asset_id: asset.id.to_string(),
                         sha256: asset.sha256.clone(),
                     }))
                 }
                 None => {
                     log::warn!("⚠️  No Windows {} installer asset in the release", arch_tag);
-                    Ok(None)
+                    Ok(UpdateCheck::Nothing)
                 }
             };
         }
@@ -4750,7 +4755,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 "ℹ️  Auto-update has no macOS artifact for this architecture ({})",
                 std::env::consts::ARCH
             );
-            return Ok(None);
+            return Ok(UpdateCheck::Nothing);
         };
 
         #[cfg(target_os = "macos")]
@@ -4769,7 +4774,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 current_version,
                 release.version
             );
-            return Ok(Some(SelectedUpdate {
+            return Ok(UpdateCheck::Install(SelectedUpdate {
                 asset_id: update_asset.id.to_string(),
                 sha256: update_asset.sha256.clone(),
             }));
@@ -4792,7 +4797,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         );
     }
 
-    Ok(None)
+    Ok(UpdateCheck::Nothing)
 }
 
 #[allow(clippy::needless_return)] // the cfg-gated platform blocks need explicit returns
@@ -5600,7 +5605,7 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
         }
     }
     match check_for_updates_internal(api_base).await {
-        Ok(Some(update)) => {
+        Ok(UpdateCheck::Install(update)) => {
             log::info!("🔄 Update available, starting download and install process...");
             if let Err(e) = download_and_install_update_internal(
                 api_base,
@@ -5614,10 +5619,16 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
                 report_update_failure_once(&e);
             }
         }
-        // `None` also covers a package install with a newer release waiting
-        // (`check_for_updates` logs that case itself), so do not claim the
-        // agent is up to date: say only that there is nothing for it to install.
-        Ok(None) => log::info!("✅ No update for the agent to install itself"),
+        Ok(UpdateCheck::Nothing) => log::info!("✅ No updates available - app is up to date"),
+        // Before PROD-7007 a package install logged "not an AppImage" and then
+        // "up to date", so one 15 releases behind read as current in its own
+        // log. Name the waiting version, and only what is true on every package
+        // install: whether this machine is on pkg.klaay.com depends on the
+        // build and on /etc/klaay/no-repo, so do not promise it.
+        Ok(UpdateCheck::PackageManaged { available }) => log::info!(
+            "📦 {} is available. This is a .deb/.rpm install: the package manager updates it, not the agent",
+            available
+        ),
         Err(e) => log::warn!("update check failed: {}", e),
     }
 }

@@ -8,10 +8,10 @@ and Azure code-signing credentials.
 | | |
 |---|---|
 | Fingerprint | `13D8 0297 A1F6 85A7 F895  2CF6 5FD4 764C DBDF 659E` |
-| Created / expires | 2026-11-14 / 2028-11-13 |
+| Created / expires | 2026-11-14 / never |
 | User ID | `Klaay Packages <support@klaay.com>` |
 | Algorithm | RSA 4096. Ed25519 would be smaller, but RHEL 8's rpm cannot verify it. |
-| Expiry | 2 years from creation. Extend the date before then; the key stays the same, so no customer action is needed. |
+| Expiry | None, on purpose. dnf and rpm import the key once and never re-import a key ID they already hold, so a later package shipping an extended key would not reach them: at the original expiry every rpm machine would silently stop updating. Revocation, not expiry, is how this key ends (below). |
 | Passphrase | None. CI signs unattended. The protection is where the key lives. |
 | Private key | One 1Password item, "KlaayGuard package signing key" in the Klaay account's Development vault, and the `PACKAGE_SIGNING_KEY` secret of the `release` environment in `klaayinc/klaayguard`. Nowhere else. |
 | Revocation certificate | Same 1Password item. |
@@ -23,7 +23,7 @@ On a trusted machine, in a throwaway GnuPG home that is deleted afterwards:
 
 ```sh
 export GNUPGHOME="$(mktemp -d)"
-gpg --batch --passphrase '' --quick-gen-key 'Klaay Packages <support@klaay.com>' rsa4096 sign 2y
+gpg --batch --passphrase '' --quick-gen-key 'Klaay Packages <support@klaay.com>' rsa4096 sign never
 FPR=$(gpg --batch --with-colons --list-keys | awk -F: '/^fpr:/ {print $10; exit}')
 
 gpg --armor --export "$FPR"             > src-tauri/linux/package-repo/klaay.asc
@@ -44,21 +44,6 @@ Then:
    to `main`, and the secret `PACKAGE_SIGNING_KEY` holding the armoured private
    key.
 3. Commit `klaay.asc` and `klaay.gpg`.
-
-## Extend the expiry
-
-```sh
-export GNUPGHOME="$(mktemp -d)"
-gpg --import klaay-packages-private.asc        # from 1Password
-gpg --quick-set-expire <FPR> 2y
-gpg --armor --export <FPR> > src-tauri/linux/package-repo/klaay.asc
-gpg --export <FPR>         > src-tauri/linux/package-repo/klaay.gpg
-gpg --armor --export-secret-keys <FPR>         # → 1Password and the release environment secret
-rm -rf "$GNUPGHOME"
-```
-
-Commit the two public files and release. Machines pick up the new expiry with
-the next package, which ships the refreshed key.
 
 ## If the key leaks
 

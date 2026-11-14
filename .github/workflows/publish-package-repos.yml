@@ -1,12 +1,20 @@
 name: "publish-package-repos"
 
 # Rebuilds the signed apt and rpm repositories at https://pkg.klaay.com and
-# deploys them to GitHub Pages (PROD-7007). release.yml calls this after it has
-# published a release on main; it never runs for dev or for a draft.
+# deploys them to GitHub Pages (PROD-7007).
 #
-# Two jobs, so the signing key and the Pages deployment each sit behind their
-# own environment:
+# It runs after every `publish` run on main finishes, as a run of its own. It
+# is not a job inside release.yml, whose `cancel-in-progress` would cancel a
+# repository publish waiting for its reviewer whenever the next push to main
+# starts a new release run. workflow_dispatch republishes by hand (after a key
+# change, say).
 #
+# Three jobs:
+#
+# * check needs no secret and no approval. It asks whether the latest
+#   published release is already on pkg.klaay.com, so a publish run that
+#   released nothing (cancelled, failed, already served) does not page a
+#   reviewer.
 # * build-sign runs in `release`, the only environment that holds
 #   PACKAGE_SIGNING_KEY, and needs a reviewer's approval. It uploads the signed
 #   site as a Pages artifact and nothing else.
@@ -17,7 +25,10 @@ name: "publish-package-repos"
 # replaces the site on each deploy, and nothing is committed to a branch.
 
 on:
-  workflow_call:
+  workflow_run:
+    workflows: ["publish"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -28,8 +39,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  check:
+    name: Is the latest release on pkg.klaay.com?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.check.outputs.needed }}
+    steps:
+      - id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"; echo "run by hand: republish"; exit 0
+          fi
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          if curl -fsS https://pkg.klaay.com/apt/dists/stable/main/binary-amd64/Packages \
+               | grep -qx "Version: ${latest#v}"; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"; echo "$latest is already on pkg.klaay.com"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"; echo "$latest is not on pkg.klaay.com yet"
+          fi
+
   build-sign:
     name: Build and sign the package repositories
+    needs: check
+    if: needs.check.outputs.needed == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     environment: release
@@ -99,7 +137,7 @@ jobs:
           printf '%s\n' "$PACKAGE_SIGNING_KEY" | gpg --batch --quiet --import
           PACKAGE_SIGNING_KEY_ID=$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ {print $10; exit}')
           export PACKAGE_SIGNING_KEY_ID
-          ./.github/scripts/build-package-repos.sh site packages
+          PREVIOUS_SITE=https://pkg.klaay.com ./.github/scripts/build-package-repos.sh site packages
           rm -rf "$GNUPGHOME"
 
       # What the deploy job must then see served, so it can tell this site from
@@ -133,7 +171,8 @@ jobs:
 
       # The site is what every customer's package manager reads. Check that
       # pkg.klaay.com serves *this* build's signed indexes, not the previous
-      # deploy's, before calling the job done. The CDN may take a few minutes.
+      # deploy's, before calling the job done. The Pages CDN caches for up to 10
+      # minutes, so allow 20.
       - name: Check the published repository
         env:
           WANT_INRELEASE: ${{ needs.build-sign.outputs.inrelease_sha256 }}
@@ -141,7 +180,7 @@ jobs:
         run: |
           set -euo pipefail
           served() { curl -fsS -H 'Cache-Control: no-cache' "https://pkg.klaay.com/$1" | sha256sum | cut -d' ' -f1; }
-          for _ in $(seq 1 30); do
+          for _ in $(seq 1 60); do
             got_in=$(served apt/dists/stable/InRelease || true)
             got_md=$(served rpm/repodata/repomd.xml || true)
             if [ "$got_in" = "$WANT_INRELEASE" ] && [ "$got_md" = "$WANT_REPOMD" ]; then
@@ -152,5 +191,5 @@ jobs:
             fi
             sleep 20
           done
-          echo "after 10 minutes pkg.klaay.com still serves InRelease $got_in and repomd.xml $got_md, not $WANT_INRELEASE and $WANT_REPOMD" >&2
+          echo "after 20 minutes pkg.klaay.com still serves InRelease $got_in and repomd.xml $got_md, not $WANT_INRELEASE and $WANT_REPOMD" >&2
           exit 1
