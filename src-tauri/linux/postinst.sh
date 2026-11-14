@@ -280,6 +280,80 @@ restart_running_agents() {
   return 1
 }
 
+# Point the package manager at Klaay's package repository, so the next
+# `apt upgrade` or `dnf upgrade` installs the next release (PROD-7007).
+#
+# The agent's own updater serves AppImage installs only. Before this step a
+# .deb or .rpm install stayed on the version it was installed with, and its log
+# said "up to date" every six hours.
+#
+# Three cases leave the machine without the repository, and in each one this
+# step also removes what an earlier install wrote, so the state always follows
+# the package that is installed now:
+#
+# * The build carries no repository. Only the production build ships
+#   /usr/share/klaay-guard/package-repo: the release passes
+#   linux/package-repo.conf.json to that build alone. A development or staging
+#   build pointed at the production repository would be "upgraded" to the
+#   production build of the same package on the next `apt upgrade`.
+# * /etc/klaay/no-repo exists. Some companies forbid extra repositories; this
+#   is their switch, documented in docs/PRIVACY_DATASHEET.md.
+# * The system has no apt or yum/dnf directory to write to (zypper, for one).
+#
+# The key is scoped with `signed-by` (apt) and named in the .repo file (rpm). It
+# never goes into a system-wide trusted keyring, so it can vouch for Klaay's
+# repository and nothing else.
+#
+# `$1` says which package manager runs this script: dpkg passes `configure`, rpm
+# passes the count of installed copies (1 or 2).
+PACKAGE_REPO_SRC=/usr/share/klaay-guard/package-repo
+PACKAGE_REPO_OPT_OUT=/etc/klaay/no-repo
+APT_REPO_KEY=/usr/share/keyrings/klaay.gpg
+APT_REPO_LIST=/etc/apt/sources.list.d/klaay.list
+RPM_REPO_KEY=/etc/pki/rpm-gpg/RPM-GPG-KEY-klaay
+RPM_REPO_FILE=/etc/yum.repos.d/klaay.repo
+
+remove_package_repo() {
+  for f in "$APT_REPO_LIST" "$APT_REPO_KEY" "$RPM_REPO_FILE" "$RPM_REPO_KEY"; do
+    [ -e "$f" ] || continue
+    rm -f "$f" && log "postinst: removed $f"
+  done
+}
+
+register_package_repo() {
+  if [ ! -f "$PACKAGE_REPO_SRC/klaay.gpg" ]; then
+    log "postinst: this build carries no package repository; leaving the machine off it"
+    remove_package_repo
+    return 0
+  fi
+  if [ -e "$PACKAGE_REPO_OPT_OUT" ]; then
+    log "postinst: $PACKAGE_REPO_OPT_OUT exists; leaving the machine off the package repository"
+    remove_package_repo
+    return 0
+  fi
+
+  case "$1" in
+    configure)
+      if [ ! -d /etc/apt/sources.list.d ]; then
+        log "postinst: no /etc/apt/sources.list.d; cannot add the package repository"
+        return 0
+      fi
+      install -D -m 0644 "$PACKAGE_REPO_SRC/klaay.gpg" "$APT_REPO_KEY" &&
+        install -m 0644 "$PACKAGE_REPO_SRC/klaay.list" "$APT_REPO_LIST" &&
+        log "postinst: added the package repository ($APT_REPO_LIST)"
+      ;;
+    1 | 2)
+      if [ ! -d /etc/yum.repos.d ]; then
+        log "postinst: no /etc/yum.repos.d; cannot add the package repository"
+        return 0
+      fi
+      install -D -m 0644 "$PACKAGE_REPO_SRC/klaay.asc" "$RPM_REPO_KEY" &&
+        install -m 0644 "$PACKAGE_REPO_SRC/klaay.repo" "$RPM_REPO_FILE" &&
+        log "postinst: added the package repository ($RPM_REPO_FILE)"
+      ;;
+  esac
+}
+
 main() {
   # Refresh the desktop databases so the app icon and menu entry are known at
   # once, without a logout. Distros without file triggers need this.
@@ -293,6 +367,7 @@ main() {
   case "${1:-configure}" in
     configure | 1 | 2)
       remove_legacy_autostart || true
+      register_package_repo "${1:-configure}" || true
       restart_running_agents "$AGENT_BIN" || true
       ;;
     *)

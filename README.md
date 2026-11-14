@@ -193,7 +193,7 @@ All variables are optional.
 | `VITE_FRONTEND_URL` | per environment | Klaay Frontend URL for sign-in and Employee Hub |
 | `VITE_SENTRY_DSN` | empty (Sentry off) | Sentry DSN; CI injects it for releases |
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `900` | Collection loop interval |
-| `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS, Windows, Linux AppImage) |
+| `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS, Windows, Linux AppImage; `.deb` and `.rpm` update through the package repository) |
 | `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` | `60` | Minimum gap between sign-in nudges |
 
 ### API endpoints
@@ -340,6 +340,34 @@ If any check fails, the running agent stays untouched. On success:
 - Linux replaces the AppImage file and restarts the agent.
 - Windows runs the new installer with `/S /R`. The installer stops the old
   agent, installs over it, and starts the new one.
+
+### Linux `.deb` and `.rpm`
+
+The agent does not update a package install itself; the package manager does.
+The production `.deb` and `.rpm` add Klaay's package repository at install, so
+the next `apt upgrade`, `dnf upgrade` or desktop software updater installs each
+new release.
+
+- Repository: `https://pkg.klaay.com` (GitHub Pages on this repository). apt:
+  `deb [arch=amd64 signed-by=/usr/share/keyrings/klaay.gpg] https://pkg.klaay.com/apt stable main`.
+  rpm: `https://pkg.klaay.com/rpm/` with `gpgcheck=1` and `repo_gpgcheck=1`.
+- `linux/postinst.sh` (`register_package_repo`) writes the source and the key;
+  `linux/postrm.sh` removes them on uninstall. `/etc/klaay/no-repo` opts a
+  machine out.
+- Only the production build carries the repository files
+  (`linux/package-repo/`, added by `linux/package-repo.conf.json` in
+  `release-linux.yml`). Development and staging packages stay off the
+  repository, because the production build of the same package name would
+  replace them.
+- After each release on `main`, `publish-package-repos.yml` rebuilds both
+  repositories from the newest five published releases, signs them with the
+  package key and deploys them. The key lives only in the `release`
+  environment, which needs a reviewer's approval, and in 1Password.
+- `src-tauri/scripts/test-package-repo.sh` proves install, upgrade, a
+  tampered index, uninstall and the opt-out on Ubuntu, Debian, Fedora and Rocky
+  Linux in containers; CI runs it on every pull request.
+- A `.deb` or `.rpm` installed before the repository existed (v0.1.72 and
+  earlier) never joins it on its own: install the current package once by hand.
 
 Updates never change the data-collection scope; the server config governs
 that.

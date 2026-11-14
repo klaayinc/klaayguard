@@ -4677,8 +4677,13 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             // The file to replace on self-update is our own AppImage; deb and
             // rpm installs update through the package manager.
             if own_appimage().is_none() {
-                log::info!(
-                    "ℹ️  Auto-update on Linux serves AppImage installs only; this is not one"
+                // Say which version is waiting. Before PROD-7007 this line said
+                // only "not an AppImage" and the caller then logged "up to
+                // date", so a package install 15 releases behind read as
+                // current in its own log.
+                log::warn!(
+                    "⚠️  {} is available, but this is a package install (.deb/.rpm): the package manager installs it from https://pkg.klaay.com (apt upgrade / dnf upgrade), not the agent",
+                    release.version
                 );
                 return Ok(None);
             }

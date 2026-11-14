@@ -75,6 +75,18 @@ stop_running_agents() {
   log "postrm: stopped the agent this removal deleted"
 }
 
+# Take the machine off Klaay's package repository (PROD-7007). The postinstall
+# added it; an uninstalled agent has no business in the package manager's
+# sources. Only a real removal reaches this: an upgrade passes `upgrade` (dpkg)
+# or 1 (rpm), and there the new package's postinstall has just rewritten them.
+remove_package_repo() {
+  for f in /etc/apt/sources.list.d/klaay.list /usr/share/keyrings/klaay.gpg \
+    /etc/yum.repos.d/klaay.repo /etc/pki/rpm-gpg/RPM-GPG-KEY-klaay; do
+    [ -e "$f" ] || continue
+    rm -f "$f" && log "postrm: removed $f"
+  done
+}
+
 main() {
   # Refresh the desktop databases after removal so the menu entry stops being
   # advertised once the package is gone.
@@ -86,6 +98,17 @@ main() {
   case "${1:-}" in
     remove | purge | 0)
       stop_running_agents "$AGENT_BIN" || true
+      remove_package_repo || true
+      ;;
+    1)
+      # An rpm upgrade runs the new package's postinstall *before* it deletes
+      # the old package's files, so a build without the repository (staging,
+      # development) installed over a production one still finds the old repo
+      # files at that point and keeps the registration. This script runs last,
+      # after those files are gone: drop the registration if the package now
+      # installed does not carry the repository. dpkg replaces the files before
+      # its postinstall runs, so it needs no such step.
+      [ -f /usr/share/klaay-guard/package-repo/klaay.gpg ] || remove_package_repo || true
       ;;
   esac
 }

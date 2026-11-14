@@ -1,0 +1,10 @@
+# KlaayGuard updates. Written by the klaay-guard package and removed when it is
+# uninstalled. To keep this machine off the repository, create /etc/klaay/no-repo
+# and reinstall the package.
+[klaay]
+name=Klaay (KlaayGuard)
+baseurl=https://pkg.klaay.com/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-klaay

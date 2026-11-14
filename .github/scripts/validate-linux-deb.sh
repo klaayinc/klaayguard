@@ -140,6 +140,50 @@ else
   pass "no OpenSSL link"
 fi
 
+# Package repository (PROD-7007). The maintainer scripts always carry the
+# steps; only the production build carries the files they install, which is
+# what decides whether a machine joins https://pkg.klaay.com.
+# EXPECT_PACKAGE_REPO=1 for the production build, 0 for every other; unset
+# skips the file checks.
+grep -q register_package_repo control/postinst \
+  && pass "postinst registers the package repository" \
+  || fail "postinst has no register_package_repo step; .deb installs never update"
+grep -q remove_package_repo control/postrm \
+  && pass "postrm removes the package repository" \
+  || fail "postrm has no remove_package_repo step; an uninstall leaves Klaay's repository behind"
+
+REPO_FILES="data/usr/share/klaay-guard/package-repo"
+case "${EXPECT_PACKAGE_REPO:-}" in
+  1)
+    for f in klaay.asc klaay.gpg klaay.list klaay.repo; do
+      test -s "$REPO_FILES/$f" && pass "ships package-repo/$f" \
+        || fail "production build is missing package-repo/$f"
+    done
+    grep -qx 'deb \[arch=amd64 signed-by=/usr/share/keyrings/klaay.gpg\] https://pkg.klaay.com/apt stable main' \
+      "$REPO_FILES/klaay.list" && pass "apt source points at pkg.klaay.com with signed-by" \
+      || fail "klaay.list is not the production apt source line"
+    grep -qx 'baseurl=https://pkg.klaay.com/rpm/' "$REPO_FILES/klaay.repo" \
+      && grep -qx 'gpgcheck=1' "$REPO_FILES/klaay.repo" \
+      && grep -qx 'repo_gpgcheck=1' "$REPO_FILES/klaay.repo" \
+      && pass "rpm repo points at pkg.klaay.com and checks signatures" \
+      || fail "klaay.repo is not the production rpm repository with both signature checks"
+    # The binary key apt reads and the armoured one rpm reads must be the same
+    # key, or one family of machines rejects every update.
+    if command -v gpg >/dev/null; then
+      asc_fpr=$(gpg --batch --with-colons --show-keys "$REPO_FILES/klaay.asc" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+      gpg_fpr=$(gpg --batch --with-colons --show-keys "$REPO_FILES/klaay.gpg" 2>/dev/null | awk -F: '/^fpr:/ {print $10; exit}')
+      [ -n "$asc_fpr" ] && [ "$asc_fpr" = "$gpg_fpr" ] && pass "klaay.asc and klaay.gpg are the same key ($asc_fpr)" \
+        || fail "klaay.asc (${asc_fpr:-none}) and klaay.gpg (${gpg_fpr:-none}) are not the same key"
+    else
+      fail "gpg is missing; cannot check the shipped keys"
+    fi
+    ;;
+  0)
+    test -e "$REPO_FILES" && fail "a non-production build ships $REPO_FILES; it would join the production repository" \
+      || pass "non-production build ships no package repository"
+    ;;
+esac
+
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2
   exit 1

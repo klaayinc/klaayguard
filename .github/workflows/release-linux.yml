@@ -85,8 +85,16 @@ jobs:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
           VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
           VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+        # Only the production build ships the package-repository files, so only
+        # it points apt and dnf at https://pkg.klaay.com. A staging or
+        # development package pointed there would be replaced by the production
+        # build of the same name on the next upgrade (PROD-7007).
         run: |
-          cargo tauri build --bundles deb rpm appimage
+          if [ "${{ matrix.build }}" = production ]; then
+            cargo tauri build --bundles deb rpm appimage --config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json"
+          else
+            cargo tauri build --bundles deb rpm appimage
+          fi
 
       - name: Rename and upload artifacts (Linux x86_64)
         env:
@@ -115,7 +123,11 @@ jobs:
           RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1)
           test -n "$RPM" || { echo "rpm missing" >&2; exit 1; }
 
-          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          if [ "${{ matrix.build }}" = production ]; then
+            EXPECT_PACKAGE_REPO=1 ./.github/scripts/validate-linux-deb.sh "$DEB"
+          else
+            EXPECT_PACKAGE_REPO=0 ./.github/scripts/validate-linux-deb.sh "$DEB"
+          fi
 
           RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
           cp "$APPIMAGE" "$RENAMED_APPIMAGE"

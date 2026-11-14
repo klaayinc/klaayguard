@@ -72,6 +72,7 @@ What it does install:
 
 - **macOS:** a user-level LaunchAgent at `~/Library/LaunchAgents/com.klaay.klaayguard.plist` so the agent runs in the user's session at login. This is per-user, not system-wide. The application bundle includes its own copy of osquery; no separate osquery installation is performed and operation does not require admin.
 - **Linux:** the app writes a per-user autostart entry at `~/.config/autostart/klaayguard.desktop` on its first start. It honours a user who disables that entry.
+- **Linux `.deb` and `.rpm`:** the package adds Klaay's package repository, so the system's own updater keeps the agent current. On Debian, Ubuntu and their derivatives it writes `/etc/apt/sources.list.d/klaay.list` and the signing key `/usr/share/keyrings/klaay.gpg`. On Fedora, RHEL and their derivatives it writes `/etc/yum.repos.d/klaay.repo` and `/etc/pki/rpm-gpg/RPM-GPG-KEY-klaay`. The key is trusted for `https://pkg.klaay.com` only (apt `signed-by`; rpm `gpgcheck` and `repo_gpgcheck`), never system-wide. Uninstalling the package removes all four files. To install the package without the repository, create the file `/etc/klaay/no-repo` before installing.
 - **Windows:** the installer writes one `Run` value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, so the agent starts at logon. The value is per-user. The installer needs no administrator rights and installs no service and no driver.
 
 The agent runs as the logged-in user, not as root/Administrator, and therefore can only see what that user can see.
@@ -93,7 +94,7 @@ The agent runs as the logged-in user, not as root/Administrator, and therefore c
 
 ## 7. Updates
 
-Klaay signs and notarizes the macOS installers. Klaay does not sign the Linux packages or the Windows installer yet; on those platforms the agent accepts an update only when its SHA-256 hash matches the release record. Updates do not change the data-collection scope on their own. The server-side configuration in §2 governs the data scope.
+Klaay signs and notarizes the macOS installers. On Linux, the `.deb` and `.rpm` update through Klaay's package repository at `https://pkg.klaay.com`, whose indexes and rpm packages Klaay signs with its package key; the package manager refuses anything that key did not sign. Klaay does not sign the Linux AppImage or the Windows installer yet; there the agent accepts an update only when its SHA-256 hash matches the release record. Updates do not change the data-collection scope on their own. The server-side configuration in §2 governs the data scope.
 
 ## 8. BYOD Considerations
 

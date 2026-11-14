@@ -1,0 +1,119 @@
+name: "publish-package-repos"
+
+# Rebuilds the signed apt and rpm repositories at https://pkg.klaay.com and
+# deploys them to GitHub Pages (PROD-7007). release.yml calls this after it has
+# published a release on main; it never runs for dev or for a draft.
+#
+# Two jobs, so the signing key and the Pages deployment each sit behind their
+# own environment:
+#
+# * build-sign runs in `release`, the only environment that holds
+#   PACKAGE_SIGNING_KEY, and needs a reviewer's approval. It uploads the signed
+#   site as a Pages artifact and nothing else.
+# * deploy runs in `github-pages`, which GitHub limits to the default branch.
+#   It never sees the key.
+#
+# Every run rebuilds the whole site from the GitHub release files: Pages
+# replaces the site on each deploy, and nothing is committed to a branch.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-package-repos
+  cancel-in-progress: false
+
+jobs:
+  build-sign:
+    name: Build and sign the package repositories
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install repository tools
+        timeout-minutes: 15
+        run: ./.github/scripts/apt-install.sh apt-utils createrepo-c rpm gnupg dpkg-dev
+
+      # Published releases only: no drafts, no prereleases. The newest five keep
+      # the site well under the Pages size limit and leave room to roll back.
+      - name: Download the newest production packages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p packages
+          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+            --limit 30 --json tagName --jq '.[].tagName')
+          kept=0
+          for tag in $tags; do
+            [ "$kept" -lt 5 ] || break
+            dir=$(mktemp -d)
+            if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$dir" \
+                 --pattern '*_Linux_x86_64_production.deb' --pattern '*_Linux_x86_64_production.rpm' 2>/dev/null \
+               && ls "$dir"/*.deb >/dev/null 2>&1 && ls "$dir"/*.rpm >/dev/null 2>&1; then
+              mv "$dir"/* packages/
+              kept=$((kept + 1))
+              echo "using $tag"
+            else
+              echo "skipping $tag: no production .deb and .rpm"
+            fi
+            rm -rf "$dir"
+          done
+          [ "$kept" -gt 0 ] || { echo "no release carries production Linux packages" >&2; exit 1; }
+
+      - name: Build and sign
+        env:
+          PACKAGE_SIGNING_KEY: ${{ secrets.PACKAGE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$PACKAGE_SIGNING_KEY" || { echo "PACKAGE_SIGNING_KEY is not set in the release environment" >&2; exit 1; }
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          printf '%s\n' "$PACKAGE_SIGNING_KEY" | gpg --batch --quiet --import
+          PACKAGE_SIGNING_KEY_ID=$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr:/ {print $10; exit}')
+          export PACKAGE_SIGNING_KEY_ID
+          ./.github/scripts/build-package-repos.sh site packages
+          rm -rf "$GNUPGHOME"
+
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to pkg.klaay.com
+    needs: build-sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      # The site is what every customer's package manager reads. Check it is
+      # really there and signed before calling the job done.
+      - name: Check the published repository
+        run: |
+          set -euo pipefail
+          for path in klaay.asc apt/dists/stable/InRelease rpm/repodata/repomd.xml rpm/repodata/repomd.xml.asc; do
+            ok=0
+            for _ in 1 2 3 4 5 6; do
+              if curl -fsS -o /dev/null "https://pkg.klaay.com/$path"; then ok=1; break; fi
+              sleep 10
+            done
+            [ "$ok" = 1 ] || { echo "https://pkg.klaay.com/$path is not served" >&2; exit 1; }
+            echo "served: $path"
+          done

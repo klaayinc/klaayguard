@@ -257,7 +257,38 @@ jobs:
         run: |
           DEB=$(find src-tauri/target/release/bundle/deb -name "*.deb" | head -n1)
           test -n "$DEB"
-          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          EXPECT_PACKAGE_REPO=0 ./.github/scripts/validate-linux-deb.sh "$DEB"
+
+      # The production release adds the package-repository files through this
+      # overlay. Bundle it the same way and check the files land where the
+      # postinstall reads them. Only the bundling step reruns: the overlay
+      # changes no Rust input, so cargo reuses the build above.
+      - name: Build deb with the package repository (production overlay)
+        working-directory: src-tauri
+        run: |
+          rm -rf target/release/bundle/deb
+          cargo tauri build --bundles deb --config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json"
+
+      - name: Validate the production package-repository files
+        run: |
+          DEB=$(find src-tauri/target/release/bundle/deb -name "*.deb" | head -n1)
+          test -n "$DEB"
+          EXPECT_PACKAGE_REPO=1 ./.github/scripts/validate-linux-deb.sh "$DEB"
+
+  # Proves the package repositories work on real package managers: a manual
+  # install joins the repository, an upgrade comes through it, a tampered index
+  # is refused, and an uninstall or /etc/klaay/no-repo leaves nothing behind
+  # (PROD-7007). Containers, a throwaway key, stand-in packages carrying the
+  # real maintainer scripts.
+  package-repo-linux:
+    name: Package repositories (apt + rpm, containers)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install, upgrade and remove through the repositories
+        run: src-tauri/scripts/test-package-repo.sh
 
   # Proves the postinstall restarts the agent it replaces. Without that
   # step a package upgrade leaves the old process running the old binary,

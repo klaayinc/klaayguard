@@ -1,0 +1,4 @@
+# KlaayGuard updates. Written by the klaay-guard package and removed when it is
+# uninstalled. To keep this machine off the repository, create /etc/klaay/no-repo
+# and reinstall the package.
+deb [arch=amd64 signed-by=/usr/share/keyrings/klaay.gpg] https://pkg.klaay.com/apt stable main
