@@ -70,10 +70,14 @@ Key properties:
   cycle. It names the token's own account when the token names one, then
   holds and stores the new token. It takes any token a `201` carries, because
   the server may already have revoked the old one; anything odd about it goes to
-  the log and Sentry. A renewal that fails for any reason (network, `401`, `403`,
-  `429`, `5xx`) keeps the current token. After a network error the agent asks
-  again next cycle; after a refusal, 6 hours later by the wall clock, sleep
-  included. Only the collection cycle signs the agent out.
+  the log and Sentry. A renewal that fails (network, `401`, `403`, `429`, `5xx`)
+  keeps the current token. After a network error the agent asks again next
+  cycle; after a refusal, 6 hours later by the wall clock, sleep included. Only
+  the collection cycle signs the agent out. One case the agent cannot tell from
+  a network error: the server renewed and revoked the old token, but its reply
+  never arrived. The next cycle then gets a `401` and opens sign-in. The new
+  token is saved beside the loop, so a keychain waiting on an unlock prompt does
+  not hold up collection.
 - **osquery is bundled.** It ships as a Tauri sidecar named
   `klaayguard-osqueryi`, so it never collides with a system osquery install.
   The agent needs no admin rights to run.

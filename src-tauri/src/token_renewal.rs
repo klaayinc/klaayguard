@@ -45,9 +45,9 @@ pub struct Claims {
     pub account_id: Option<String>,
 }
 
-/// Read the claims from a JWT's payload. `None` when the token is not a JWT
-/// this code can read.
-pub fn claims(token: &str) -> Option<Claims> {
+/// A JWT's payload as JSON. `None` when the token is not a JWT this code can
+/// read.
+pub fn payload(token: &str) -> Option<Value> {
     let mut parts = token.split('.');
     let (_header, payload, _signature) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() {
@@ -57,7 +57,13 @@ pub fn claims(token: &str) -> Option<Claims> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload.trim_end_matches('='))
         .ok()?;
-    let body: Value = serde_json::from_slice(&bytes).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Read the claims from a JWT's payload. `None` when the token is not a JWT
+/// this code can read.
+pub fn claims(token: &str) -> Option<Claims> {
+    let body = payload(token)?;
     let body = body.as_object()?;
     let account_id = match body.get("account_id") {
         Some(Value::Number(n)) => Some(n.to_string()),
@@ -173,6 +179,13 @@ pub async fn request_renewal(
     })
 }
 
+/// How the background save of a renewed token went.
+#[derive(Debug)]
+pub struct SaveResult {
+    pub token: String,
+    pub outcome: Result<crate::keychain::CredentialStore, String>,
+}
+
 /// When the next renewal request may go out, and a renewed token the
 /// credential store has not yet accepted.
 ///
@@ -188,6 +201,12 @@ pub struct Schedule {
     /// the old one in the store may already be revoked, so the save is tried
     /// again on every tick until it lands.
     pub unsaved: Option<String>,
+    /// The save of a renewed token, while it runs beside the loop.
+    pub pending_save: Option<tokio::task::JoinHandle<SaveResult>>,
+    /// The unsaved token whose refusal was already reported.
+    pub reported_unsaved: Option<String>,
+    /// How many refused saves were reported. Read by the tests.
+    pub save_failure_reports: u32,
 }
 
 impl Schedule {
@@ -197,6 +216,9 @@ impl Schedule {
             retry_after_secs,
             next_try_at: None,
             unsaved: None,
+            pending_save: None,
+            reported_unsaved: None,
+            save_failure_reports: 0,
         }
     }
 
@@ -263,10 +285,7 @@ pub(crate) mod tests {
     }
 
     fn client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap()
+        crate::http_client(Some(Duration::from_secs(10)))
     }
 
     fn scoped(exp: i64) -> Claims {
