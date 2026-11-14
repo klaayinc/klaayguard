@@ -68,9 +68,12 @@ Key properties:
 - **Token renewal:** a token lasts three months. Once fewer than 14 days are
   left, the agent asks `POST /authenticate` for a new one before the next
   cycle. It names the token's own account when the token names one, then
-  holds and stores the new token. A renewal that fails for any reason (network,
-  `401`, `403`, `429`, `5xx`) keeps the current token, and the agent asks again
-  6 hours later. Only the collection cycle signs the agent out.
+  holds and stores the new token. It takes any token a `201` carries, because
+  the server may already have revoked the old one; anything odd about it goes to
+  the log and Sentry. A renewal that fails for any reason (network, `401`, `403`,
+  `429`, `5xx`) keeps the current token. After a network error the agent asks
+  again next cycle; after a refusal, 6 hours later by the wall clock, sleep
+  included. Only the collection cycle signs the agent out.
 - **osquery is bundled.** It ships as a Tauri sidecar named
   `klaayguard-osqueryi`, so it never collides with a system osquery install.
   The agent needs no admin rights to run.
@@ -207,7 +210,7 @@ All variables are optional.
 | `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS, Windows, Linux AppImage) |
 | `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` | `60` | Minimum gap between sign-in nudges |
 | `KLAAYGUARD_TOKEN_RENEW_WITHIN_SECONDS` | `1209600` | Renew the token once it has less than this left (14 days) |
-| `KLAAYGUARD_TOKEN_RENEW_RETRY_SECONDS` | `21600` | Least time between two renewal requests |
+| `KLAAYGUARD_TOKEN_RENEW_RETRY_SECONDS` | `21600` | Least wall-clock time between two renewal requests the server answered |
 
 ### API endpoints
 

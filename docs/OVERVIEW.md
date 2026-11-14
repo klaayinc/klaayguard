@@ -52,8 +52,9 @@ running:
   secret service.
 - **Staying signed in.** A sign-in lasts three months. In its last 14 days the
   agent asks Klaay for a new one and stores it, so a device in use never needs
-  a new sign-in. If Klaay does not answer, the agent keeps its current sign-in
-  and asks again 6 hours later.
+  a new sign-in. If the network is down, the agent keeps its current sign-in
+  and asks again at the next report. If Klaay refuses, it asks again 6 hours
+  later.
 - **Menu bar icon.** The agent shows a small icon in the menu bar. A green dot
   means signed in. A red dot means signed out. The menu names the signed-in
   person, and shows the time until the next report and a link to the Klaay
