@@ -19,6 +19,10 @@ name: "publish-package-repos"
 on:
   workflow_call:
   workflow_dispatch:
+  # TEMPORARY rehearsal trigger (PROD-7007): one run from this branch against
+  # the already-published releases, before anything ships. Removed before merge.
+  push:
+    branches: [prod-7007-linux-package-repos]
 
 permissions:
   contents: read
