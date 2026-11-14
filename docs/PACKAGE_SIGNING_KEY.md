@@ -7,11 +7,13 @@ and Azure code-signing credentials.
 
 | | |
 |---|---|
+| Fingerprint | `13D8 0297 A1F6 85A7 F895  2CF6 5FD4 764C DBDF 659E` |
+| Created / expires | 2026-11-14 / 2028-11-13 |
 | User ID | `Klaay Packages <support@klaay.com>` |
 | Algorithm | RSA 4096. Ed25519 would be smaller, but RHEL 8's rpm cannot verify it. |
 | Expiry | 2 years from creation. Extend the date before then; the key stays the same, so no customer action is needed. |
 | Passphrase | None. CI signs unattended. The protection is where the key lives. |
-| Private key | One 1Password item, "KlaayGuard package signing key", and the `PACKAGE_SIGNING_KEY` secret of the `release` environment in `klaayinc/klaayguard`. Nowhere else. |
+| Private key | One 1Password item, "KlaayGuard package signing key" in the Klaay account's Development vault, and the `PACKAGE_SIGNING_KEY` secret of the `release` environment in `klaayinc/klaayguard`. Nowhere else. |
 | Revocation certificate | Same 1Password item. |
 | Public key in the repo | `src-tauri/linux/package-repo/klaay.asc` (armoured) and `klaay.gpg` (binary, for apt's `signed-by`). |
 
