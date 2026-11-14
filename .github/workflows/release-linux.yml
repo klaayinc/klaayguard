@@ -59,7 +59,8 @@ jobs:
 
       - name: (Ubuntu) install dependencies
         timeout-minutes: 15
-        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+        # rpm: validate-linux-rpm.sh reads the built rpm's files and scriptlets.
+        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
       - name: Setup osquery binaries (Linux)
         env:
@@ -123,11 +124,13 @@ jobs:
           RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1)
           test -n "$RPM" || { echo "rpm missing" >&2; exit 1; }
 
-          if [ "${{ matrix.build }}" = production ]; then
-            EXPECT_PACKAGE_REPO=1 ./.github/scripts/validate-linux-deb.sh "$DEB"
-          else
-            EXPECT_PACKAGE_REPO=0 ./.github/scripts/validate-linux-deb.sh "$DEB"
-          fi
+          # Production must carry the package-repository files and every other
+          # build must not: the postinstall reads their absence as "take this
+          # machine off the repository". Both formats, because a production
+          # rpm without them would strand every rpm install.
+          if [ "${{ matrix.build }}" = production ]; then expect=1; else expect=0; fi
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-deb.sh "$DEB"
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-rpm.sh "$RPM"
 
           RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
           cp "$APPIMAGE" "$RENAMED_APPIMAGE"

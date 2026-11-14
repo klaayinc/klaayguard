@@ -364,7 +364,15 @@ jobs:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
           VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
           VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
-        run: cargo tauri build --bundles deb rpm appimage
+        # As in release-linux.yml: only production carries the package
+        # repository, so a test install of this artifact behaves like the
+        # release it stands in for (PROD-7007).
+        run: |
+          if [ "${{ matrix.build }}" = production ]; then
+            cargo tauri build --bundles deb rpm appimage --config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json"
+          else
+            cargo tauri build --bundles deb rpm appimage
+          fi
 
       - name: Validate and collect
         shell: bash

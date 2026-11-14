@@ -53,6 +53,32 @@ grep -qx '/usr/bin/klaayguard-osqueryi' <<<"$FILES" \
   && pass "sidecar /usr/bin/klaayguard-osqueryi" \
   || fail "sidecar /usr/bin/klaayguard-osqueryi is missing"
 
+# Package repository (PROD-7007). The postinstall treats missing repository
+# files as "this build is not production" and removes the machine from the
+# repository, so a production rpm built without them would take every rpm
+# install off it at the next upgrade. EXPECT_PACKAGE_REPO=1 for the production
+# build, 0 for every other; unset skips the file checks.
+grep -q register_package_repo <<<"$SCRIPTS" \
+  && pass "postinstall registers the package repository" \
+  || fail "postinstall has no register_package_repo step; .rpm installs never update"
+grep -q remove_package_repo <<<"$SCRIPTS" \
+  && pass "postuninstall removes the package repository" \
+  || fail "postuninstall has no remove_package_repo step; an erase leaves Klaay's repository behind"
+case "${EXPECT_PACKAGE_REPO:-}" in
+  1)
+    for f in klaay.asc klaay.gpg klaay.list klaay.repo; do
+      grep -qx "/usr/share/klaay-guard/package-repo/$f" <<<"$FILES" \
+        && pass "ships package-repo/$f" \
+        || fail "production build is missing package-repo/$f"
+    done
+    ;;
+  0)
+    grep -q '^/usr/share/klaay-guard/package-repo' <<<"$FILES" \
+      && fail "a non-production build ships the package repository; it would join the production repository" \
+      || pass "non-production build ships no package repository"
+    ;;
+esac
+
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2
   exit 1
