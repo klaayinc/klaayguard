@@ -91,11 +91,9 @@ jobs:
         # development package pointed there would be replaced by the production
         # build of the same name on the next upgrade (PROD-7007).
         run: |
-          if [ "${{ matrix.build }}" = production ]; then
-            cargo tauri build --bundles deb rpm appimage --config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json"
-          else
-            cargo tauri build --bundles deb rpm appimage
-          fi
+          extra=()
+          [ "${{ matrix.build }}" = production ] && extra=(--config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json")
+          cargo tauri build --bundles deb rpm appimage "${extra[@]}"
 
       - name: Rename and upload artifacts (Linux x86_64)
         env:

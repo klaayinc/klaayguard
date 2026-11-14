@@ -261,8 +261,9 @@ jobs:
 
       # The production release adds the package-repository files through this
       # overlay. Bundle it the same way and check the files land where the
-      # postinstall reads them. Only the bundling step reruns: the overlay
-      # changes no Rust input, so cargo reuses the build above.
+      # postinstall reads them. The app crate recompiles here (tauri-build
+      # reruns when the merged config in TAURI_CONFIG changes); dependencies
+      # come from the build above.
       - name: Build deb with the package repository (production overlay)
         working-directory: src-tauri
         run: |
@@ -364,7 +365,7 @@ jobs:
 
       # Same as the deb job: bundle with the production overlay and check the
       # package-repository files are in the rpm the way the postinstall reads
-      # them (PROD-7007).
+      # them (PROD-7007). The app crate recompiles for the changed config.
       - name: Build rpm with the package repository (production overlay)
         working-directory: src-tauri
         run: |

@@ -295,14 +295,22 @@ restart_running_agents() {
 #   /usr/share/klaay-guard/package-repo: the release passes
 #   linux/package-repo.conf.json to that build alone. A development or staging
 #   build pointed at the production repository would be "upgraded" to the
-#   production build of the same package on the next `apt upgrade`.
+#   production build of the same package on the next `apt upgrade`. On rpm this
+#   holds for a fresh install only: rpm runs this script before it deletes the
+#   old package's files, so a staging rpm installed over a production one still
+#   finds them and keeps the registration. postrm.sh says why it leaves that.
 # * /etc/klaay/no-repo exists. Some companies forbid extra repositories; this
 #   is their switch, documented in docs/PRIVACY_DATASHEET.md.
 # * The system has no apt or yum/dnf directory to write to (zypper, for one).
 #
-# The key is scoped with `signed-by` (apt) and named in the .repo file (rpm). It
-# never goes into a system-wide trusted keyring, so it can vouch for Klaay's
-# repository and nothing else.
+# On apt the key is scoped with `signed-by`: it never enters a system-wide
+# keyring and vouches for Klaay's repository only. rpm has no such scoping. The
+# .repo file names the key, and dnf imports it into rpm's own keyring the first
+# time it reads the repository (`rpm -q gpg-pubkey`, as for any third-party rpm
+# repository). From then on rpm trusts packages that key signed wherever they
+# come from, and an uninstall does not remove the import: a nested rpm call
+# inside this script would deadlock on the rpm database lock. The privacy
+# datasheet says so and gives the command.
 #
 # `$1` says which package manager runs this script: dpkg passes `configure`, rpm
 # passes the count of installed copies (1 or 2).

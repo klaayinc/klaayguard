@@ -10,6 +10,7 @@
 set -euo pipefail
 
 RPM="$(realpath "$1")"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 failures=0
 fail() {
   echo "FAIL: $1" >&2
@@ -66,11 +67,15 @@ grep -q remove_package_repo <<<"$SCRIPTS" \
   || fail "postuninstall has no remove_package_repo step; an erase leaves Klaay's repository behind"
 case "${EXPECT_PACKAGE_REPO:-}" in
   1)
-    for f in klaay.asc klaay.gpg klaay.list klaay.repo; do
-      grep -qx "/usr/share/klaay-guard/package-repo/$f" <<<"$FILES" \
-        && pass "ships package-repo/$f" \
-        || fail "production build is missing package-repo/$f"
-    done
+    # Unpack the payload and hold its files to the same rules as the deb's.
+    PAYLOAD="$(mktemp -d)"
+    if command -v rpm2archive >/dev/null && rpm2archive - <"$RPM" | tar xz -C "$PAYLOAD"; then
+      "$HERE/check-package-repo-files.sh" "$PAYLOAD/usr/share/klaay-guard/package-repo" \
+        || fail "the production package-repository files are wrong (see above)"
+    else
+      fail "could not unpack the rpm payload (rpm2archive)"
+    fi
+    rm -rf "$PAYLOAD"
     ;;
   0)
     grep -q '^/usr/share/klaay-guard/package-repo' <<<"$FILES" \

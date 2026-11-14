@@ -142,9 +142,16 @@ listed=$(grep -c '^Package: klaay-guard$' "$APT/dists/stable/main/binary-amd64/P
 rpmdb=$(mktemp -d)
 rpm --dbpath "$rpmdb" --initdb
 rpm --dbpath "$rpmdb" --import "$PUBLIC_KEY"
+# rpm -K exits non-zero when a digest or signature fails, but exits 0 for an
+# unsigned package whose digests are fine. So require both: success, and the
+# "signatures OK" that only a verified signature prints.
 for rpmfile in "$RPMDIR"/*.rpm; do
-  rpm --dbpath "$rpmdb" -K "$rpmfile" | grep -qiE 'signatures? ok|pgp.*ok|digests signatures OK' \
-    || { echo "$rpmfile: rpm signature does not verify" >&2; rpm --dbpath "$rpmdb" -Kv "$rpmfile" >&2; rm -rf "$rpmdb"; exit 1; }
+  if ! out=$(rpm --dbpath "$rpmdb" -K "$rpmfile") || ! grep -q 'signatures OK' <<<"$out"; then
+    echo "$rpmfile: rpm signature does not verify: $out" >&2
+    rpm --dbpath "$rpmdb" -Kv "$rpmfile" >&2
+    rm -rf "$rpmdb"
+    exit 1
+  fi
 done
 rm -rf "$rpmdb"
 

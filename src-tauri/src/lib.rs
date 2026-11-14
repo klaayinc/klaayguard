@@ -4682,7 +4682,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 // date", so a package install 15 releases behind read as
                 // current in its own log.
                 log::warn!(
-                    "⚠️  {} is available, but this is a package install (.deb/.rpm): the package manager installs it from https://pkg.klaay.com (apt upgrade / dnf upgrade), not the agent",
+                    "⚠️  {} is available. This is a package install (.deb/.rpm), which the agent does not update: the package manager does (apt upgrade / dnf upgrade, from https://pkg.klaay.com where the package added it), or install the new package from app.klaay.com",
                     release.version
                 );
                 return Ok(None);
@@ -5614,7 +5614,10 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
                 report_update_failure_once(&e);
             }
         }
-        Ok(None) => log::info!("✅ No updates available - app is up to date"),
+        // `None` also covers a package install with a newer release waiting
+        // (`check_for_updates` logs that case itself), so do not claim the
+        // agent is up to date: say only that there is nothing for it to install.
+        Ok(None) => log::info!("✅ No update for the agent to install itself"),
         Err(e) => log::warn!("update check failed: {}", e),
     }
 }

@@ -100,17 +100,13 @@ main() {
       stop_running_agents "$AGENT_BIN" || true
       remove_package_repo || true
       ;;
-    1)
-      # An rpm upgrade runs the new package's postinstall *before* it deletes
-      # the old package's files, so a build without the repository (staging,
-      # development) installed over a production one still finds the old repo
-      # files at that point and keeps the registration. This script runs last,
-      # after those files are gone: drop the registration if the package now
-      # installed does not carry the repository. dpkg replaces the files before
-      # its postinstall runs, so it needs no such step.
-      [ -f /usr/share/klaay-guard/package-repo/klaay.gpg ] || remove_package_repo || true
-      ;;
   esac
+  # Nothing on an rpm upgrade or downgrade ($1 = 1). This script belongs to the
+  # package being replaced, and it cannot tell a staging build from a rollback
+  # to a release older than the repository (v0.1.72 and earlier, which the
+  # repository serves for rolling back): neither carries the repository files.
+  # Dropping the registration there would take a rolled-back customer off the
+  # repository for good, so keep it, as dpkg does on a downgrade.
 }
 
 # The shipped script carries no way to switch this off. The test sources a copy

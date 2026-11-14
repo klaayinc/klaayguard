@@ -33,6 +33,9 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     environment: release
+    outputs:
+      inrelease_sha256: ${{ steps.hashes.outputs.inrelease }}
+      repomd_sha256: ${{ steps.hashes.outputs.repomd }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -46,27 +49,44 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+        # A release is skipped only when its asset list has no production .deb
+        # and .rpm. A download that fails for any other reason (rate limit,
+        # network) fails the job: a green run built without the newest release
+        # would leave customers without it until the next release.
         run: |
           set -euo pipefail
           mkdir -p packages
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
           tags=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
             --limit 30 --json tagName --jq '.[].tagName')
-          kept=0
+          kept=0; used=""
           for tag in $tags; do
             [ "$kept" -lt 5 ] || break
-            dir=$(mktemp -d)
-            if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$dir" \
-                 --pattern '*_Linux_x86_64_production.deb' --pattern '*_Linux_x86_64_production.rpm' 2>/dev/null \
-               && ls "$dir"/*.deb >/dev/null 2>&1 && ls "$dir"/*.rpm >/dev/null 2>&1; then
-              mv "$dir"/* packages/
-              kept=$((kept + 1))
-              echo "using $tag"
-            else
+            assets=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            if ! grep -q '_Linux_x86_64_production\.deb$' <<<"$assets" \
+               || ! grep -q '_Linux_x86_64_production\.rpm$' <<<"$assets"; then
               echo "skipping $tag: no production .deb and .rpm"
+              continue
             fi
+            dir=$(mktemp -d)
+            for attempt in 1 2 3; do
+              if gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir "$dir" --clobber \
+                   --pattern '*_Linux_x86_64_production.deb' --pattern '*_Linux_x86_64_production.rpm'; then
+                break
+              fi
+              [ "$attempt" -lt 3 ] || { echo "download of $tag failed three times" >&2; exit 1; }
+              sleep 15
+            done
+            mv "$dir"/* packages/
             rm -rf "$dir"
+            kept=$((kept + 1)); used="$used $tag"
+            echo "using $tag"
           done
           [ "$kept" -gt 0 ] || { echo "no release carries production Linux packages" >&2; exit 1; }
+          case " $used " in
+            *" $latest "*) echo "includes the latest release, $latest" ;;
+            *) echo "the latest release $latest is not in the repository build ($used)" >&2; exit 1 ;;
+          esac
 
       - name: Build and sign
         env:
@@ -81,6 +101,14 @@ jobs:
           export PACKAGE_SIGNING_KEY_ID
           ./.github/scripts/build-package-repos.sh site packages
           rm -rf "$GNUPGHOME"
+
+      # What the deploy job must then see served, so it can tell this site from
+      # the previous one.
+      - name: Record the signed index hashes
+        id: hashes
+        run: |
+          echo "inrelease=$(sha256sum site/apt/dists/stable/InRelease | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "repomd=$(sha256sum site/rpm/repodata/repomd.xml | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Upload the site
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
@@ -103,17 +131,26 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
 
-      # The site is what every customer's package manager reads. Check it is
-      # really there and signed before calling the job done.
+      # The site is what every customer's package manager reads. Check that
+      # pkg.klaay.com serves *this* build's signed indexes, not the previous
+      # deploy's, before calling the job done. The CDN may take a few minutes.
       - name: Check the published repository
+        env:
+          WANT_INRELEASE: ${{ needs.build-sign.outputs.inrelease_sha256 }}
+          WANT_REPOMD: ${{ needs.build-sign.outputs.repomd_sha256 }}
         run: |
           set -euo pipefail
-          for path in klaay.asc apt/dists/stable/InRelease rpm/repodata/repomd.xml rpm/repodata/repomd.xml.asc; do
-            ok=0
-            for _ in 1 2 3 4 5 6; do
-              if curl -fsS -o /dev/null "https://pkg.klaay.com/$path"; then ok=1; break; fi
-              sleep 10
-            done
-            [ "$ok" = 1 ] || { echo "https://pkg.klaay.com/$path is not served" >&2; exit 1; }
-            echo "served: $path"
+          served() { curl -fsS -H 'Cache-Control: no-cache' "https://pkg.klaay.com/$1" | sha256sum | cut -d' ' -f1; }
+          for _ in $(seq 1 30); do
+            got_in=$(served apt/dists/stable/InRelease || true)
+            got_md=$(served rpm/repodata/repomd.xml || true)
+            if [ "$got_in" = "$WANT_INRELEASE" ] && [ "$got_md" = "$WANT_REPOMD" ]; then
+              echo "pkg.klaay.com serves this build (InRelease $got_in, repomd.xml $got_md)"
+              curl -fsS -o /dev/null https://pkg.klaay.com/klaay.asc
+              curl -fsS -o /dev/null https://pkg.klaay.com/rpm/repodata/repomd.xml.asc
+              exit 0
+            fi
+            sleep 20
           done
+          echo "after 10 minutes pkg.klaay.com still serves InRelease $got_in and repomd.xml $got_md, not $WANT_INRELEASE and $WANT_REPOMD" >&2
+          exit 1

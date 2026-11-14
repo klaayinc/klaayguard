@@ -59,7 +59,8 @@ pass() { echo "  ok: $1"; }
 
 mkdir -p "$WORK/src"
 cp -r "$REPO_ROOT/.github/scripts/build-package-repos.sh" "$SRC_TAURI/linux/postinst.sh" \
-  "$SRC_TAURI/linux/postrm.sh" "$WORK/src/"
+  "$SRC_TAURI/linux/postrm.sh" "$SRC_TAURI/linux/package-repo/klaay.list" \
+  "$SRC_TAURI/linux/package-repo/klaay.repo" "$WORK/src/"
 
 echo "==> build the stand-in packages and two repository snapshots"
 docker run --rm -v "$WORK:/w" "$BUILDER" bash -euo pipefail -c '
@@ -75,12 +76,13 @@ docker run --rm -v "$WORK:/w" "$BUILDER" bash -euo pipefail -c '
   gpg --batch --export "$KEY_ID" > /w/klaay.gpg
   echo "$KEY_ID" > /w/key-id
 
-  # The repo files the stand-in ships. Same shape as the real ones; only the
-  # URL differs.
+  # The repo files the stand-in ships: the real ones, with only the URL
+  # pointed at the test server, so every other setting is what customers get.
   mkdir -p /w/repo-files
   cp /w/klaay.asc /w/klaay.gpg /w/repo-files/
-  printf "deb [arch=amd64 signed-by=/usr/share/keyrings/klaay.gpg] http://pkgrepo:8080/apt stable main\n" > /w/repo-files/klaay.list
-  printf "[klaay]\nname=Klaay TEST\nbaseurl=http://pkgrepo:8080/rpm/\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-klaay\n" > /w/repo-files/klaay.repo
+  sed "s#https://pkg.klaay.com/#http://pkgrepo:8080/#" /w/src/klaay.list > /w/repo-files/klaay.list
+  sed "s#https://pkg.klaay.com/#http://pkgrepo:8080/#" /w/src/klaay.repo > /w/repo-files/klaay.repo
+  grep -q pkgrepo:8080 /w/repo-files/klaay.list && grep -q pkgrepo:8080 /w/repo-files/klaay.repo
 
   # with_repo=1 ships the repo files (the production build); 0 does not.
   build_deb() {
@@ -248,15 +250,16 @@ for image in "${CLIENTS[@]}"; do
       "$pm install -y -q /w/local/klaay-guard-0.0.1-1.x86_64.rpm >/dev/null && test -f /etc/yum.repos.d/klaay.repo && test -f /etc/pki/rpm-gpg/RPM-GPG-KEY-klaay"
     check "dnf trusts the repository (gpgcheck + repo_gpgcheck)" \
       "$pm -y -q --disablerepo='*' --enablerepo=klaay makecache"
-    # dnf skips a repository whose repomd.xml signature fails (Fedora and RHEL
-    # default skip_if_unavailable=1) instead of failing every dnf command on the
-    # machine. What matters is that it installs nothing from it.
+    # klaay.repo sets skip_if_unavailable=1, so dnf refuses the bad metadata,
+    # skips the repository and still succeeds: a broken pkg.klaay.com must never
+    # block the machine's other updates. dnf has to exit 0, say why it skipped,
+    # and install nothing.
     publish site-tampered
-    check "changed repository metadata is refused and nothing upgrades" \
-      "$pm -y --refresh upgrade klaay-guard >/tmp/u 2>&1; cat /tmp/u; grep -qiE 'signature' /tmp/u && [ \"\$(rpm -q --qf %{VERSION} klaay-guard)\" = 0.0.1 ]"
+    check "changed repository metadata is refused, nothing upgrades, dnf still works" \
+      "$pm -y --refresh upgrade klaay-guard >/tmp/u 2>&1; rc=\$?; cat /tmp/u; [ \$rc -eq 0 ] && grep -qiE 'signature' /tmp/u && [ \"\$(rpm -q --qf %{VERSION} klaay-guard)\" = 0.0.1 ]"
     publish site-otherkey
-    check "metadata signed by another key is refused and nothing upgrades" \
-      "$pm -y --refresh upgrade klaay-guard >/tmp/u 2>&1; cat /tmp/u; grep -qiE 'signature|key' /tmp/u && [ \"\$(rpm -q --qf %{VERSION} klaay-guard)\" = 0.0.1 ]"
+    check "metadata signed by another key is refused, nothing upgrades, dnf still works" \
+      "$pm -y --refresh upgrade klaay-guard >/tmp/u 2>&1; rc=\$?; cat /tmp/u; [ \$rc -eq 0 ] && grep -qiE 'signature|key' /tmp/u && [ \"\$(rpm -q --qf %{VERSION} klaay-guard)\" = 0.0.1 ]"
     publish site-v2
     check "dnf upgrade takes 0.0.2 from the repository" \
       "$pm -y -q --disablerepo='*' --enablerepo=klaay --refresh upgrade klaay-guard >/dev/null && [ \"\$(rpm -q --qf %{VERSION} klaay-guard)\" = 0.0.2 ]"
@@ -264,8 +267,11 @@ for image in "${CLIENTS[@]}"; do
       "$pm remove -y -q klaay-guard >/dev/null && ! test -e /etc/yum.repos.d/klaay.repo && ! test -e /etc/pki/rpm-gpg/RPM-GPG-KEY-klaay"
     check "/etc/klaay/no-repo keeps the machine off the repository" \
       "mkdir -p /etc/klaay && touch /etc/klaay/no-repo && $pm install -y -q /w/local/klaay-guard-0.0.1-1.x86_64.rpm >/dev/null && ! test -e /etc/yum.repos.d/klaay.repo && rm /etc/klaay/no-repo && $pm remove -y -q klaay-guard >/dev/null"
-    check "a build without repository files removes an earlier registration" \
-      "$pm install -y -q /w/local/klaay-guard-0.0.1-1.x86_64.rpm >/dev/null && test -e /etc/yum.repos.d/klaay.repo && $pm install -y -q /w/norepo/klaay-guard-0.0.3-1.x86_64.rpm >/dev/null && ! test -e /etc/yum.repos.d/klaay.repo && ! test -e /etc/pki/rpm-gpg/RPM-GPG-KEY-klaay"
+    # rpm runs the new package's postinstall before it deletes the old files, so
+    # an upgrade onto a build without the repository keeps the registration
+    # (see postinst.sh). A fresh install of such a build must add none.
+    check "a build without repository files adds no repository" \
+      "$pm install -y -q /w/norepo/klaay-guard-0.0.3-1.x86_64.rpm >/dev/null && ! test -e /etc/yum.repos.d/klaay.repo && ! test -e /etc/pki/rpm-gpg/RPM-GPG-KEY-klaay"
   fi
   docker rm -f "$name" >/dev/null
 done
