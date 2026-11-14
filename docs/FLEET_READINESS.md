@@ -42,9 +42,10 @@ It could be a Mac, so it counts against readiness until it reports.
   "No version" column. Install the `.pkg` by hand.
 - **Broken self-update.** An agent can report a version below `V` for weeks
   while its updater fails. The page shows only the state now, so it cannot show
-  this alone. Open the page on two dates a week apart. An agent that stays below
-  `V` while its last seen time stays fresh has a broken updater. Install the
-  `.pkg` by hand.
+  this alone. Open the page on two dates a week apart and write down the count
+  below `V` each time. When the count does not fall and the last seen times stay
+  fresh, read the list and check those agents. Install the `.pkg` by hand on
+  each agent with a broken updater.
 
 ## Ready rule
 
