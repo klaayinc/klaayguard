@@ -77,7 +77,8 @@ Key properties:
   a network error: the server renewed and revoked the old token, but its reply
   never arrived. The next cycle then gets a `401` and opens sign-in. The new
   token is saved beside the loop, so a keychain waiting on an unlock prompt does
-  not hold up collection.
+  not hold up collection. A save the keychain refuses is tried again 6 hours
+  later, not every cycle.
 - **osquery is bundled.** It ships as a Tauri sidecar named
   `klaayguard-osqueryi`, so it never collides with a system osquery install.
   The agent needs no admin rights to run.

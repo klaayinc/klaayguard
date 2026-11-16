@@ -3643,7 +3643,11 @@ async fn collection_tick<R: tauri::Runtime>(
     }
     retry.record_attempt(now);
 
-    let token = match off_the_workers(load_stored_token).await {
+    // The credential store blocks (D-Bus, Keychain): keep it off the workers.
+    let stored = tauri::async_runtime::spawn_blocking(load_stored_token)
+        .await
+        .map_err(|e| e.to_string())?;
+    let token = match stored {
         Ok(Some(token)) => token,
         Ok(None) => return Ok(()),
         Err(e) => {
@@ -3670,25 +3674,9 @@ async fn collection_tick<R: tauri::Runtime>(
     result
 }
 
-/// The credential store, as the renewal uses it: the keychain in production,
-/// a fake in tests.
-#[derive(Clone)]
-struct TokenStore {
-    save: SaveToken,
-    delete: DeleteToken,
-}
-
+/// Saves a token to the credential store: the keychain in production, a fake
+/// in tests.
 type SaveToken = Arc<dyn Fn(&str) -> Result<keychain::CredentialStore, String> + Send + Sync>;
-type DeleteToken = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
-
-impl TokenStore {
-    fn keychain() -> Self {
-        Self {
-            save: Arc::new(keychain::save_token),
-            delete: Arc::new(keychain::delete_token),
-        }
-    }
-}
 
 /// Run a credential-store call off the async workers: it blocks on D-Bus or
 /// the Keychain.
@@ -3727,7 +3715,8 @@ fn report_token_save(outcome: &Result<keychain::CredentialStore, String>, tell_t
     }
 }
 
-/// What one renewal check did. Logged, and read by the tests.
+/// What one renewal check did. Read by the tests; the steps worth knowing
+/// about are logged where they happen.
 #[derive(Debug, PartialEq)]
 enum RenewalStep {
     /// No token is held: nothing to renew.
@@ -3757,37 +3746,31 @@ async fn renew_token_if_due(
     state: &Arc<AppState>,
     client: &reqwest::Client,
     schedule: &mut token_renewal::Schedule,
-    store: &TokenStore,
+    save: &SaveToken,
     now_unix: i64,
 ) -> RenewalStep {
+    take_in_finished_save(schedule, now_unix).await;
+
     let Some(token) = lock_read(&state.auth_token).clone() else {
         return RenewalStep::SignedOut;
     };
 
-    // Take in a background save that has finished since the last tick.
-    if schedule
-        .pending_save
-        .as_ref()
-        .is_some_and(|save| save.is_finished())
-    {
-        if let Some(save) = schedule.pending_save.take() {
-            match save.await {
-                Ok(result) => take_in_save(schedule, result),
-                Err(e) => log::error!("keychain: renewed token save task failed: {}", e),
-            }
+    // A renewed token the store refused: store it now. The old one may be
+    // revoked, and a restart would load it.
+    if schedule.unsaved.as_deref() == Some(token.as_str()) && schedule.may_save(now_unix) {
+        start_saving(schedule, save, &token);
+    }
+
+    let Some((current, exp)) =
+        token_renewal::claims(&token).and_then(|c| c.exp.map(|exp| (c, exp)))
+    else {
+        // Such a token is never renewed and signs out when it expires. Say so
+        // once, so the expiry has a trail.
+        if !schedule.warned_unreadable {
+            schedule.warned_unreadable = true;
+            log::warn!("token_renewal_unreadable: the held token has no readable exp");
+            sentry::capture_message("token_renewal_unreadable", Level::Warning);
         }
-    }
-
-    // A renewed token the store refused last time: store it now. The old one
-    // may be revoked, and a restart would load it.
-    if schedule.pending_save.is_none() && schedule.unsaved.as_deref() == Some(token.as_str()) {
-        start_saving(state, schedule, store, &token);
-    }
-
-    let Some(current) = token_renewal::claims(&token) else {
-        return RenewalStep::Unreadable;
-    };
-    let Some(exp) = current.exp else {
         return RenewalStep::Unreadable;
     };
     if !token_renewal::renewal_due(exp, now_unix, schedule.within_secs) {
@@ -3848,102 +3831,69 @@ async fn renew_token_if_due(
         sentry::capture_message(&format!("token_renewal_anomaly: {what}"), Level::Warning);
     }
 
-    start_saving(state, schedule, store, &new);
+    // One save at a time. With one still running (stuck on a prompt), the new
+    // token waits as unsaved and is saved as soon as that one is taken in.
+    schedule.unsaved = Some(new.clone());
+    schedule.next_save_at = None;
+    if schedule.pending_save.is_none() {
+        start_saving(schedule, save, &new);
+    }
     RenewalStep::Renewed
 }
 
-/// Save a renewed token beside the collection loop, not in it. A keychain
-/// that waits on an unlock prompt would otherwise stop collection until
-/// somebody answers. The next tick takes in the result (`take_in_save`).
-fn start_saving(
-    state: &Arc<AppState>,
-    schedule: &mut token_renewal::Schedule,
-    store: &TokenStore,
-    token: &str,
-) {
-    schedule.pending_save = Some(tokio::spawn(save_and_resync(
-        state.clone(),
-        store.clone(),
-        token.to_string(),
-    )));
+/// Save a token beside the collection loop, not in it. A keychain that waits
+/// on an unlock prompt would otherwise stop collection until somebody answers.
+/// A later tick takes in the result (`take_in_finished_save`).
+fn start_saving(schedule: &mut token_renewal::Schedule, save: &SaveToken, token: &str) {
+    let save = save.clone();
+    let token = token.to_string();
+    schedule.pending_save = Some(tauri::async_runtime::spawn(async move {
+        let owned = token.clone();
+        let outcome = off_the_workers(move || save(&owned)).await;
+        token_renewal::SaveResult { token, outcome }
+    }));
 }
 
-/// Store a renewed token, then make sure the store still matches the session.
-///
-/// The save blocks, and a sign-out or a sign-in can land while it runs. Either
-/// one writes the store itself, and this save could land on top: a sign-out
-/// would come back at the next start, or a new sign-in would lose its token to
-/// the old person's. So after the save, the store is set to whatever is held
-/// now: the held token, or nothing.
-async fn save_and_resync(
-    state: Arc<AppState>,
-    store: TokenStore,
-    token: String,
-) -> token_renewal::SaveResult {
-    let save = store.save.clone();
-    let owned = token.clone();
-    let outcome = off_the_workers(move || save(&owned)).await;
-    if outcome.is_ok() {
-        resync_store(&state, &store, &token).await;
+/// Take in a save that has finished. A refused save keeps the token in
+/// `schedule.unsaved` and is tried again `retry_after_secs` later, so a person
+/// who clicked Deny on a keychain prompt is not asked every cycle. It is
+/// reported once per token, not once per try.
+async fn take_in_finished_save(schedule: &mut token_renewal::Schedule, now_unix: i64) {
+    let finished = schedule
+        .pending_save
+        .as_ref()
+        .is_some_and(|save| save.inner().is_finished());
+    if !finished {
+        return;
     }
-    token_renewal::SaveResult { token, outcome }
-}
-
-async fn resync_store(state: &Arc<AppState>, store: &TokenStore, token: &str) {
-    // Three rounds settle any one sign-in or sign-out racing this save. A
-    // fourth would mean the session is changing faster than the store can be
-    // written, and the next sign-in writes the store again anyway.
-    let mut written = Some(token.to_string());
-    for _ in 0..3 {
-        let held = lock_read(&state.auth_token).clone();
-        if held == written {
+    let Some(save) = schedule.pending_save.take() else {
+        return;
+    };
+    let result = match save.await {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!("keychain: renewed token save task failed: {}", e);
             return;
         }
-        log::info!("token_renewal_store_resync");
-        let synced = match held.clone() {
-            Some(t) => {
-                let save = store.save.clone();
-                off_the_workers(move || save(&t)).await.map(|_| ())
-            }
-            None => {
-                let delete = store.delete.clone();
-                off_the_workers(move || delete()).await
-            }
-        };
-        if let Err(e) = synced {
-            log::error!("keychain: resync after renewal failed: {}", e);
-            sentry::capture_message(
-                &format!("keychain_renewal_resync_failed: {}", e),
-                Level::Error,
-            );
-            return;
-        }
-        written = held;
+    };
+    // A save of a token the agent has since moved on from settles nothing.
+    if schedule.unsaved.as_deref() != Some(result.token.as_str()) {
+        return;
     }
-    log::warn!("token_renewal_store_resync_gave_up: the session kept changing");
-    add_breadcrumb("auth", "token_renewal_store_resync_gave_up", Level::Warning);
-}
-
-/// Take in a finished background save. A refused save keeps the token in
-/// `schedule.unsaved`, and the next tick tries again; the token in memory is
-/// already the new one. A store that keeps refusing is reported once per
-/// token, not once per try: the tries run every cycle.
-fn take_in_save(schedule: &mut token_renewal::Schedule, result: token_renewal::SaveResult) {
-    match &result.outcome {
+    match result.outcome {
         Ok(_) => {
             report_token_save(&result.outcome, false);
             schedule.unsaved = None;
-            schedule.reported_unsaved = None;
+            schedule.next_save_at = None;
         }
-        Err(e) => {
-            if schedule.reported_unsaved.as_deref() == Some(result.token.as_str()) {
-                log::warn!("keychain: renewed token save failed again: {}", e);
-            } else {
+        Err(ref e) => {
+            if schedule.next_save_at.is_none() {
                 report_token_save(&result.outcome, false);
-                schedule.reported_unsaved = Some(result.token.clone());
-                schedule.save_failure_reports += 1;
+                schedule.save_failures_reported += 1;
+            } else {
+                log::warn!("keychain: renewed token save failed again: {}", e);
             }
-            schedule.unsaved = Some(result.token);
+            schedule.record_refused_save(now_unix);
         }
     }
 }
@@ -3982,7 +3932,7 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                 token_renewal::RETRY_AFTER_SECS,
             ),
         );
-        let token_store = TokenStore::keychain();
+        let save_token: SaveToken = Arc::new(keychain::save_token);
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -3997,7 +3947,7 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                 &state,
                 &client,
                 &mut renewal,
-                &token_store,
+                &save_token,
                 chrono::Utc::now().timestamp(),
             )
             .await;
@@ -9687,15 +9637,7 @@ mod token_renewal_tests {
     const RETRY: i64 = 6 * 60 * 60;
     const CYCLE: i64 = 15 * 60;
 
-    /// One write the fake credential store received.
-    #[derive(Debug, Clone, PartialEq)]
-    enum Op {
-        Save(String),
-        Delete,
-    }
-
-    type Ops = Arc<Mutex<Vec<Op>>>;
-    type Hook = Arc<dyn Fn() + Send + Sync>;
+    type Saved = Arc<Mutex<Vec<String>>>;
 
     fn client() -> reqwest::Client {
         http_client(Some(Duration::from_secs(10)))
@@ -9705,38 +9647,26 @@ mod token_renewal_tests {
         Schedule::new(token_renewal::RENEW_WITHIN_SECS, RETRY as u64)
     }
 
-    /// A credential store that records each write. `during_first_save` runs
-    /// inside the first save, the moment a sign-in or sign-out could land.
-    fn store_with(during_first_save: Hook) -> (TokenStore, Ops) {
-        let ops: Ops = Arc::default();
-        let (saves, deletes) = (ops.clone(), ops.clone());
-        let store = TokenStore {
-            save: Arc::new(move |t: &str| {
-                let first = saves.lock().unwrap().is_empty();
-                if first {
-                    during_first_save();
-                }
-                saves.lock().unwrap().push(Op::Save(t.to_string()));
-                Ok(keychain::CredentialStore::Keyring)
-            }),
-            delete: Arc::new(move || {
-                deletes.lock().unwrap().push(Op::Delete);
-                Ok(())
-            }),
-        };
-        (store, ops)
+    /// A credential store that records each token it is given.
+    fn store() -> (SaveToken, Saved) {
+        let saved: Saved = Arc::default();
+        let recorded = saved.clone();
+        let save: SaveToken = Arc::new(move |t: &str| {
+            recorded.lock().unwrap().push(t.to_string());
+            Ok(keychain::CredentialStore::Keyring)
+        });
+        (save, saved)
     }
 
-    fn store() -> (TokenStore, Ops) {
-        store_with(nothing())
-    }
-
-    /// A credential store that refuses every write.
-    fn broken_store() -> TokenStore {
-        TokenStore {
-            save: Arc::new(|_: &str| Err("the keychain is locked".to_string())),
-            delete: Arc::new(|| Err("the keychain is locked".to_string())),
-        }
+    /// A credential store that refuses every write, and counts the tries.
+    fn refusing_store() -> (SaveToken, Arc<Mutex<u32>>) {
+        let tries: Arc<Mutex<u32>> = Arc::default();
+        let counted = tries.clone();
+        let save: SaveToken = Arc::new(move |_: &str| {
+            *counted.lock().unwrap() += 1;
+            Err("the keychain is locked".to_string())
+        });
+        (save, tries)
     }
 
     fn expiring_in(days: i64) -> String {
@@ -9765,21 +9695,33 @@ mod token_renewal_tests {
         seen.lock().unwrap().len()
     }
 
-    fn written(ops: &Ops) -> Vec<Op> {
-        ops.lock().unwrap().clone()
+    fn saved(saved: &Saved) -> Vec<String> {
+        saved.lock().unwrap().clone()
     }
 
-    /// Wait for the background save, if one runs, and take in its result: what
-    /// the next tick would do once the save has finished.
-    async fn settle(schedule: &mut Schedule) {
-        if let Some(save) = schedule.pending_save.take() {
-            take_in_save(schedule, save.await.expect("the save task"));
+    /// Wait for a background save to finish, then take it in through the same
+    /// call the next tick makes.
+    async fn settle(schedule: &mut Schedule, now_unix: i64) {
+        // A save that never finishes fails the test rather than hanging it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while schedule
+            .pending_save
+            .as_ref()
+            .is_some_and(|save| !save.inner().is_finished())
+        {
+            assert!(Instant::now() < deadline, "the save never finished");
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        take_in_finished_save(schedule, now_unix).await;
+        assert!(schedule.pending_save.is_none(), "the save was taken in");
     }
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+    type Slot = Arc<Mutex<Option<Arc<AppState>>>>;
 
     /// A hook that acts on a state the test fills in once it exists.
-    fn on_state(act: fn(&Arc<AppState>)) -> (Hook, Arc<Mutex<Option<Arc<AppState>>>>) {
-        let slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::default();
+    fn on_state(act: fn(&Arc<AppState>)) -> (Hook, Slot) {
+        let slot: Slot = Arc::default();
         let held = slot.clone();
         let hook: Hook = Arc::new(move || {
             if let Some(state) = held.lock().unwrap().as_ref() {
@@ -9789,27 +9731,19 @@ mod token_renewal_tests {
         (hook, slot)
     }
 
-    fn sign_in_bob(state: &Arc<AppState>) {
-        state.adopt_session("fresh-sign-in".into(), Some("Bob".into()));
-    }
-
-    fn sign_out(state: &Arc<AppState>) {
-        state.clear_session();
-    }
-
     #[tokio::test]
     async fn a_token_with_weeks_left_is_left_alone() {
         let (base, seen) = api("201 Created", issued(&renewed()), nothing()).await;
         let old = expiring_in(30);
         let state = signed_in(&base, &old);
-        let (store, ops) = store();
+        let (save, stored) = store();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule(), &store, NOW).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule(), &save, NOW).await;
 
         assert_eq!(step, RenewalStep::NotDue);
         assert_eq!(requests(&seen), 0);
         assert_eq!(held(&state), Some(old));
-        assert!(written(&ops).is_empty());
+        assert!(saved(&stored).is_empty());
     }
 
     #[tokio::test]
@@ -9818,11 +9752,11 @@ mod token_renewal_tests {
         let (base, seen) = api("201 Created", issued(&new), nothing()).await;
         let old = expiring_in(13);
         let state = signed_in(&base, &old);
-        let (store, ops) = store();
+        let (save, stored) = store();
         let mut schedule = schedule();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW).await;
-        settle(&mut schedule).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+        settle(&mut schedule, NOW).await;
 
         assert_eq!(step, RenewalStep::Renewed);
         assert_eq!(requests(&seen), 1);
@@ -9831,27 +9765,28 @@ mod token_renewal_tests {
             format!("authorization: Bearer {old}")
         );
         assert_eq!(held(&state), Some(new.clone()));
-        assert_eq!(written(&ops), vec![Op::Save(new)]);
+        assert_eq!(saved(&stored), vec![new]);
+        assert_eq!(schedule.unsaved, None);
         // Same person, same session: the tray keeps its name.
         assert_eq!(lock_read(&state.user_label).as_deref(), Some("Alice"));
     }
 
-    // Review finding 1. The server revokes the old token when it renews, so a
-    // 201 whose token the agent cannot read must still be taken: dropping it
-    // would leave only a revoked token, and the next cycle would sign out.
+    // The server revokes the old token when it renews, so a 201 whose token
+    // the agent cannot read must still be taken: dropping it would leave only
+    // a revoked token, and the next cycle would sign out.
     #[tokio::test]
     async fn a_201_with_a_token_the_agent_cannot_read_is_still_taken() {
         let (base, _) = api("201 Created", issued("opaque-token"), nothing()).await;
         let state = signed_in(&base, &expiring_in(3));
-        let (store, ops) = store();
+        let (save, stored) = store();
         let mut schedule = schedule();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW).await;
-        settle(&mut schedule).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+        settle(&mut schedule, NOW).await;
 
         assert_eq!(step, RenewalStep::Renewed);
         assert_eq!(held(&state).as_deref(), Some("opaque-token"));
-        assert_eq!(written(&ops), vec![Op::Save("opaque-token".into())]);
+        assert_eq!(saved(&stored), vec!["opaque-token".to_string()]);
     }
 
     // The SSO accounts answer 403 `sso_required` until kiln exempts their
@@ -9862,22 +9797,22 @@ mod token_renewal_tests {
         let (base, seen) = api("403 Forbidden", r#"{"errors":[]}"#.into(), nothing()).await;
         let old = expiring_in(10);
         let state = signed_in(&base, &old);
-        let (store, ops) = store();
+        let (save, stored) = store();
         let mut schedule = schedule();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
         assert_eq!(step, RenewalStep::Failed(Failure::Status(403)));
         assert_eq!(held(&state), Some(old.clone()));
         assert_eq!(lock_read(&state.user_label).as_deref(), Some("Alice"));
-        assert!(written(&ops).is_empty());
+        assert!(saved(&stored).is_empty());
 
         // The next 15-minute cycle sends nothing.
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW + CYCLE).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + CYCLE).await;
         assert_eq!(step, RenewalStep::Waiting);
         assert_eq!(requests(&seen), 1);
 
         // Six hours of wall clock on, asleep or not, it asks again.
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW + RETRY).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + RETRY).await;
         assert_eq!(step, RenewalStep::Failed(Failure::Status(403)));
         assert_eq!(requests(&seen), 2);
         assert_eq!(held(&state), Some(old));
@@ -9890,31 +9825,31 @@ mod token_renewal_tests {
         let (base, _) = api("401 Unauthorized", "{}".into(), nothing()).await;
         let old = expiring_in(5);
         let state = signed_in(&base, &old);
-        let (store, _) = store();
+        let (save, _) = store();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule(), &store, NOW).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule(), &save, NOW).await;
 
         assert_eq!(step, RenewalStep::Failed(Failure::Status(401)));
         assert_eq!(held(&state), Some(old));
     }
 
-    // Review finding 3. A laptop that wakes before its network is up gets a
-    // network error. That must not cost it six hours: the next cycle asks again.
+    // A laptop that wakes before its network is up gets a network error. That
+    // must not cost it six hours: the next cycle asks again.
     #[tokio::test]
     async fn an_unreachable_server_keeps_the_token_and_asks_again_next_cycle() {
         let old = expiring_in(5);
         let state = signed_in(&api_that_is_down().await, &old);
-        let (store, _) = store();
+        let (save, _) = store();
         let mut schedule = schedule();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
         assert!(
             matches!(step, RenewalStep::Failed(Failure::Network(_))),
             "{step:?}"
         );
         assert_eq!(held(&state), Some(old));
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW + CYCLE).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + CYCLE).await;
         assert!(
             matches!(step, RenewalStep::Failed(Failure::Network(_))),
             "the next cycle asks again: {step:?}"
@@ -9925,129 +9860,43 @@ mod token_renewal_tests {
     // session. The renewed token must not overwrite it, in memory or in store.
     #[tokio::test]
     async fn a_sign_in_during_the_request_wins() {
-        let (hook, slot) = on_state(sign_in_bob);
+        let (hook, slot) = on_state(|state| {
+            state.adopt_session("fresh-sign-in".into(), Some("Bob".into()));
+        });
         let (base, _) = api("201 Created", issued(&renewed()), hook).await;
         let state = signed_in(&base, &expiring_in(3));
         *slot.lock().unwrap() = Some(state.clone());
-        let (store, ops) = store();
+        let (save, stored) = store();
+        let mut schedule = schedule();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule(), &store, NOW).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
 
         assert_eq!(step, RenewalStep::Superseded);
         assert_eq!(held(&state).as_deref(), Some("fresh-sign-in"));
         assert_eq!(lock_read(&state.user_label).as_deref(), Some("Bob"));
-        assert!(written(&ops).is_empty());
+        assert!(schedule.pending_save.is_none());
+        assert!(saved(&stored).is_empty());
     }
 
     #[tokio::test]
     async fn a_sign_out_during_the_request_wins() {
-        let (hook, slot) = on_state(sign_out);
+        let (hook, slot) = on_state(|state| state.clear_session());
         let (base, _) = api("201 Created", issued(&renewed()), hook).await;
         let state = signed_in(&base, &expiring_in(3));
         *slot.lock().unwrap() = Some(state.clone());
-        let (store, ops) = store();
+        let (save, stored) = store();
+        let mut schedule = schedule();
 
-        let step = renew_token_if_due(&state, &client(), &mut schedule(), &store, NOW).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
 
         assert_eq!(step, RenewalStep::Superseded);
         assert_eq!(held(&state), None);
-        assert!(written(&ops).is_empty());
+        assert!(schedule.pending_save.is_none());
+        assert!(saved(&stored).is_empty());
     }
 
-    // Review finding 2. A sign-out that lands while the renewed token is being
-    // saved deletes the store, then the save writes the token back. Without the
-    // resync, the agent signs in again at the next start.
-    #[tokio::test]
-    async fn a_sign_out_during_the_save_leaves_the_store_empty() {
-        let new = renewed();
-        let (base, _) = api("201 Created", issued(&new), nothing()).await;
-        let state = signed_in(&base, &expiring_in(3));
-        let (hook, slot) = on_state(sign_out);
-        *slot.lock().unwrap() = Some(state.clone());
-        let (store, ops) = store_with(hook);
-        let mut schedule = schedule();
-
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW).await;
-        settle(&mut schedule).await;
-
-        assert_eq!(step, RenewalStep::Renewed);
-        assert_eq!(held(&state), None);
-        assert_eq!(written(&ops), vec![Op::Save(new), Op::Delete]);
-    }
-
-    // Review finding 2, the other way round. A sign-in that lands during the
-    // save must end up in the store, not the previous person's renewed token.
-    #[tokio::test]
-    async fn a_sign_in_during_the_save_ends_in_the_store() {
-        let new = renewed();
-        let (base, _) = api("201 Created", issued(&new), nothing()).await;
-        let state = signed_in(&base, &expiring_in(3));
-        let (hook, slot) = on_state(sign_in_bob);
-        *slot.lock().unwrap() = Some(state.clone());
-        let (store, ops) = store_with(hook);
-        let mut schedule = schedule();
-
-        renew_token_if_due(&state, &client(), &mut schedule, &store, NOW).await;
-        settle(&mut schedule).await;
-
-        assert_eq!(held(&state).as_deref(), Some("fresh-sign-in"));
-        assert_eq!(
-            written(&ops),
-            vec![Op::Save(new), Op::Save("fresh-sign-in".into())]
-        );
-    }
-
-    // The server has revoked the old token by the time the save runs, so a
-    // store that refuses the new one must not cost the session. The agent
-    // keeps using the new token and tries the save again on the next tick,
-    // without asking the server again.
-    #[tokio::test]
-    async fn a_refused_save_keeps_the_new_token_and_retries_the_save() {
-        let new = renewed();
-        let (base, seen) = api("201 Created", issued(&new), nothing()).await;
-        let state = signed_in(&base, &expiring_in(3));
-        let mut schedule = schedule();
-
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &broken_store(), NOW).await;
-        settle(&mut schedule).await;
-        assert_eq!(step, RenewalStep::Renewed);
-        assert_eq!(held(&state), Some(new.clone()));
-        assert_eq!(schedule.unsaved, Some(new.clone()));
-
-        let (store, ops) = store();
-        let step = renew_token_if_due(&state, &client(), &mut schedule, &store, NOW + CYCLE).await;
-        settle(&mut schedule).await;
-        assert_eq!(step, RenewalStep::NotDue);
-        assert_eq!(written(&ops), vec![Op::Save(new)]);
-        assert_eq!(schedule.unsaved, None);
-        assert_eq!(requests(&seen), 1);
-    }
-
-    // Review finding 2, on the retry path: a sign-out during the retried save
-    // must not be undone either.
-    #[tokio::test]
-    async fn a_sign_out_during_a_retried_save_leaves_the_store_empty() {
-        let new = renewed();
-        let (base, _) = api("201 Created", issued(&new), nothing()).await;
-        let state = signed_in(&base, &expiring_in(3));
-        let mut schedule = schedule();
-        renew_token_if_due(&state, &client(), &mut schedule, &broken_store(), NOW).await;
-        settle(&mut schedule).await;
-
-        let (hook, slot) = on_state(sign_out);
-        *slot.lock().unwrap() = Some(state.clone());
-        let (store, ops) = store_with(hook);
-        renew_token_if_due(&state, &client(), &mut schedule, &store, NOW + CYCLE).await;
-        settle(&mut schedule).await;
-
-        assert_eq!(held(&state), None);
-        assert_eq!(written(&ops), vec![Op::Save(new), Op::Delete]);
-        assert_eq!(schedule.unsaved, None);
-    }
-
-    // Second review, finding 1. A keychain that waits on an unlock prompt
-    // must not stop collection: the save runs beside the loop, and the
-    // renewal returns while the save is still blocked.
+    // A keychain that waits on an unlock prompt must not stop collection: the
+    // save runs beside the loop, and the renewal returns while it waits.
     #[tokio::test]
     async fn a_save_stuck_on_a_prompt_does_not_hold_up_the_loop() {
         let new = renewed();
@@ -10055,74 +9904,104 @@ mod token_renewal_tests {
         let state = signed_in(&base, &expiring_in(3));
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = Arc::new(Mutex::new(released));
-        let ops: Ops = Arc::default();
-        let saves = ops.clone();
-        let store = TokenStore {
-            save: Arc::new(move |t: &str| {
-                // The unlock prompt: wait until somebody answers it.
-                let _ = released.lock().unwrap().recv();
-                saves.lock().unwrap().push(Op::Save(t.to_string()));
-                Ok(keychain::CredentialStore::Keyring)
-            }),
-            delete: Arc::new(|| Ok(())),
-        };
+        let stored: Saved = Arc::default();
+        let recorded = stored.clone();
+        let save: SaveToken = Arc::new(move |t: &str| {
+            // The unlock prompt: wait until somebody answers it.
+            let _ = released.lock().unwrap().recv();
+            recorded.lock().unwrap().push(t.to_string());
+            Ok(keychain::CredentialStore::Keyring)
+        });
         let mut schedule = schedule();
 
         let step = tokio::time::timeout(
             Duration::from_secs(5),
-            renew_token_if_due(&state, &client(), &mut schedule, &store, NOW),
+            renew_token_if_due(&state, &client(), &mut schedule, &save, NOW),
         )
         .await
         .expect("the renewal returns while the save waits");
 
         assert_eq!(step, RenewalStep::Renewed);
         assert_eq!(held(&state), Some(new.clone()));
-        assert!(written(&ops).is_empty(), "the save is still waiting");
+        assert!(saved(&stored).is_empty(), "the save is still waiting");
+
+        // The next cycle does not start a second save beside the stuck one.
+        renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + CYCLE).await;
+        assert!(schedule.pending_save.is_some());
 
         release.send(()).unwrap();
-        settle(&mut schedule).await;
-        assert_eq!(written(&ops), vec![Op::Save(new)]);
+        settle(&mut schedule, NOW + CYCLE).await;
+        assert_eq!(saved(&stored), vec![new]);
+        assert_eq!(schedule.unsaved, None);
     }
 
-    // Second review, finding 2. A store that keeps refusing the renewed token
-    // is retried every cycle, but reported once, not 96 times a day.
+    // The server has revoked the old token by the time the save runs, so a
+    // store that refuses the new one must not cost the session. The agent
+    // keeps using the new token and tries the save again later, without
+    // asking the server again.
     #[tokio::test]
-    async fn a_store_that_keeps_refusing_is_reported_once() {
+    async fn a_refused_save_keeps_the_new_token_and_saves_it_later() {
+        let new = renewed();
+        let (base, seen) = api("201 Created", issued(&new), nothing()).await;
+        let state = signed_in(&base, &expiring_in(3));
+        let mut schedule = schedule();
+        let (refusing, _) = refusing_store();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &refusing, NOW).await;
+        settle(&mut schedule, NOW).await;
+        assert_eq!(step, RenewalStep::Renewed);
+        assert_eq!(held(&state), Some(new.clone()));
+        assert_eq!(schedule.unsaved, Some(new.clone()));
+
+        let (save, stored) = store();
+        let later = NOW + RETRY;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, later).await;
+        settle(&mut schedule, later).await;
+        assert_eq!(step, RenewalStep::NotDue);
+        assert_eq!(saved(&stored), vec![new]);
+        assert_eq!(schedule.unsaved, None);
+        assert_eq!(requests(&seen), 1);
+    }
+
+    // A person who clicks Deny on the keychain prompt is not asked again every
+    // cycle, and Sentry hears about it once, not on every try.
+    #[tokio::test]
+    async fn a_refused_save_is_tried_every_six_hours_and_reported_once() {
         let new = renewed();
         let (base, _) = api("201 Created", issued(&new), nothing()).await;
         let state = signed_in(&base, &expiring_in(3));
         let mut schedule = schedule();
+        let (refusing, tries) = refusing_store();
 
-        renew_token_if_due(&state, &client(), &mut schedule, &broken_store(), NOW).await;
-        settle(&mut schedule).await;
-        for cycle in 1..=4 {
-            renew_token_if_due(
-                &state,
-                &client(),
-                &mut schedule,
-                &broken_store(),
-                NOW + cycle * CYCLE,
-            )
-            .await;
-            settle(&mut schedule).await;
+        renew_token_if_due(&state, &client(), &mut schedule, &refusing, NOW).await;
+        settle(&mut schedule, NOW).await;
+        // A day of 15-minute cycles.
+        for cycle in 1..=96 {
+            let now = NOW + cycle * CYCLE;
+            renew_token_if_due(&state, &client(), &mut schedule, &refusing, now).await;
+            settle(&mut schedule, now).await;
         }
 
+        // The first try, then one every six hours.
+        assert_eq!(*tries.lock().unwrap(), 5);
+        assert_eq!(schedule.save_failures_reported, 1);
         assert_eq!(schedule.unsaved, Some(new));
-        assert_eq!(schedule.save_failure_reports, 1);
     }
 
     #[tokio::test]
     async fn no_token_or_an_unreadable_one_sends_nothing() {
         let (base, seen) = api("201 Created", issued(&renewed()), nothing()).await;
-        let (store, _) = store();
+        let (save, _) = store();
 
         let state = state_at(&base);
-        let step = renew_token_if_due(&state, &client(), &mut schedule(), &store, NOW).await;
+        let step = renew_token_if_due(&state, &client(), &mut schedule(), &save, NOW).await;
         assert_eq!(step, RenewalStep::SignedOut);
 
         let state = signed_in(&base, "opaque-token");
-        let step = renew_token_if_due(&state, &client(), &mut schedule(), &store, NOW).await;
+        let mut schedule = schedule();
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
         assert_eq!(step, RenewalStep::Unreadable);
+        assert!(schedule.warned_unreadable, "reported once");
         assert_eq!(held(&state).as_deref(), Some("opaque-token"));
 
         assert_eq!(requests(&seen), 0);
@@ -10170,18 +10049,17 @@ mod token_renewal_tests {
 
         for (case, old) in tokens {
             let state = signed_in(&api, &old);
-            let (store, ops) = store();
+            let (save, stored) = store();
             let exp = token_renewal::claims(&old)
                 .and_then(|c| c.exp)
                 .expect("exp");
             let mut schedule = schedule();
-            let step =
-                renew_token_if_due(&state, &client(), &mut schedule, &store, exp - DAY).await;
-            settle(&mut schedule).await;
+            let step = renew_token_if_due(&state, &client(), &mut schedule, &save, exp - DAY).await;
+            settle(&mut schedule, exp - DAY).await;
             let new = held(&state).unwrap_or_default();
             let renewed = new != old;
             let (o, n) = (payload(&old), payload(&new));
-            let stored = written(&ops).len();
+            let stored = saved(&stored).len();
             let config_old = config_status(old.clone()).await;
             let config_new = if renewed {
                 config_status(new.clone()).await

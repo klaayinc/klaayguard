@@ -87,9 +87,9 @@ pub fn renewal_due(exp: i64, now_unix: i64, within_secs: u64) -> bool {
 pub enum Failure {
     /// The request did not complete: no connection, a timeout, a reset.
     Network(String),
-    /// The server answered with something other than 201.
+    /// The server answered with something other than a 2xx.
     Status(u16),
-    /// A 201 whose body carries no token at all.
+    /// A 2xx whose body carries no token at all.
     Malformed(&'static str),
 }
 
@@ -161,7 +161,9 @@ pub async fn request_renewal(
         .send()
         .await
         .map_err(|e| Failure::Network(e.without_url().to_string()))?;
-    if response.status() != reqwest::StatusCode::CREATED {
+    // Kiln answers 201. Any 2xx is taken: one that carries a token may have
+    // revoked the old one, whatever its exact code.
+    if !response.status().is_success() {
         return Err(Failure::Status(response.status().as_u16()));
     }
     let body: Value = response
@@ -186,27 +188,28 @@ pub struct SaveResult {
     pub outcome: Result<crate::keychain::CredentialStore, String>,
 }
 
-/// When the next renewal request may go out, and a renewed token the
-/// credential store has not yet accepted.
+/// When the next renewal request may go out, and the save of a renewed token.
 ///
 /// Times are wall-clock seconds, the clock `exp` is read against. A monotonic
 /// clock stops while the machine sleeps, so "6 hours" would mean 6 hours awake:
 /// days, on a laptop that is open two hours a day.
-#[derive(Debug)]
 pub struct Schedule {
     pub within_secs: u64,
     pub retry_after_secs: u64,
     pub next_try_at: Option<i64>,
-    /// A renewed token the store refused. The agent holds it in memory, and
-    /// the old one in the store may already be revoked, so the save is tried
-    /// again on every tick until it lands.
+    /// A renewed token the store has not yet accepted. The agent holds it in
+    /// memory, and the old one in the store may already be revoked, so the
+    /// save is tried until it lands.
     pub unsaved: Option<String>,
+    /// When a refused save may be tried again. `None` until a save is refused.
+    pub next_save_at: Option<i64>,
     /// The save of a renewed token, while it runs beside the loop.
-    pub pending_save: Option<tokio::task::JoinHandle<SaveResult>>,
-    /// The unsaved token whose refusal was already reported.
-    pub reported_unsaved: Option<String>,
-    /// How many refused saves were reported. Read by the tests.
-    pub save_failure_reports: u32,
+    pub pending_save: Option<tauri::async_runtime::JoinHandle<SaveResult>>,
+    /// Refused saves reported to Sentry: one per token, however many tries.
+    pub save_failures_reported: u32,
+    /// Whether a held token without a readable `exp` was reported. Once is
+    /// enough: the next sign-in brings a new token.
+    pub warned_unreadable: bool,
 }
 
 impl Schedule {
@@ -216,9 +219,10 @@ impl Schedule {
             retry_after_secs,
             next_try_at: None,
             unsaved: None,
+            next_save_at: None,
             pending_save: None,
-            reported_unsaved: None,
-            save_failure_reports: 0,
+            save_failures_reported: 0,
+            warned_unreadable: false,
         }
     }
 
@@ -226,14 +230,19 @@ impl Schedule {
         i64::try_from(self.retry_after_secs).unwrap_or(i64::MAX)
     }
 
-    /// Whether a request may go out at `now_unix`. A wait longer than a whole
-    /// retry period means the clock was set back since: try now rather than
-    /// wait out the jump.
-    pub fn may_try(&self, now_unix: i64) -> bool {
-        match self.next_try_at {
+    /// Whether a wait that ends at `at` is over at `now_unix`. A wait longer
+    /// than a whole retry period means the clock was set back since: go now
+    /// rather than wait out the jump.
+    fn over(&self, at: Option<i64>, now_unix: i64) -> bool {
+        match at {
             None => true,
             Some(at) => now_unix >= at || at.saturating_sub(now_unix) > self.retry_after(),
         }
+    }
+
+    /// Whether a request may go out at `now_unix`.
+    pub fn may_try(&self, now_unix: i64) -> bool {
+        self.over(self.next_try_at, now_unix)
     }
 
     /// Record a request the server answered, whatever the answer. The next one
@@ -247,6 +256,19 @@ impl Schedule {
     /// before its network is up must not spend six hours on that.
     pub fn record_unanswered(&mut self) {
         self.next_try_at = None;
+    }
+
+    /// Whether the unsaved token may be saved at `now_unix`: always before a
+    /// refusal, and `retry_after_secs` after one.
+    pub fn may_save(&self, now_unix: i64) -> bool {
+        self.pending_save.is_none() && self.over(self.next_save_at, now_unix)
+    }
+
+    /// Record a refused save. A keychain refuses when the person clicks Deny
+    /// on its prompt; asking again every cycle would put the prompt back on
+    /// the screen 96 times a day.
+    pub fn record_refused_save(&mut self, now_unix: i64) {
+        self.next_save_at = Some(now_unix.saturating_add(self.retry_after()));
     }
 }
 
@@ -379,6 +401,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_refused_save_waits_six_hours() {
+        let mut schedule = Schedule::new(RENEW_WITHIN_SECS, RETRY);
+        assert!(schedule.may_save(NOW));
+        schedule.record_refused_save(NOW);
+        assert!(!schedule.may_save(NOW + 15 * 60));
+        assert!(schedule.may_save(NOW + RETRY as i64));
+    }
+
+    #[test]
     fn a_clock_set_back_does_not_park_the_schedule() {
         let mut schedule = Schedule::new(RENEW_WITHIN_SECS, RETRY);
         schedule.record_answered(NOW);
@@ -495,6 +526,14 @@ pub(crate) mod tests {
                 anomalies: vec!["the new token is unreadable"]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_200_with_a_token_is_a_renewal_too() {
+        let new = jwt(json!({ "exp": NOW + 90 * DAY, "account_id": 42 }));
+        let (base, _) = api("200 OK", issued(&new), nothing()).await;
+        let got = request_renewal(&client(), &base, "old", &scoped(NOW + DAY)).await;
+        assert_eq!(got.map(|i| i.token), Ok(new));
     }
 
     #[tokio::test]
