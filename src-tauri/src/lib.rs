@@ -5258,7 +5258,6 @@ fn stage_verify_and_swap(
     let backup = target_app.with_file_name(format!(".{}.old-{}", base, pid));
 
     sweep_stale_update_copies(target_app, pid);
-    let _ = std::fs::remove_dir_all(&backup);
 
     // 1) Copy the new bundle next to the target. `ditto` is Apple's tool for
     //    copying an `.app`: it preserves symlinks, extended attributes, and the
