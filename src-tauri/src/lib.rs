@@ -2816,13 +2816,76 @@ struct JsonApiPayload {
     jsonapi: Option<serde_json::Value>,
 }
 
+/// How much of a failed update's text one check-in carries. Kiln stores 500
+/// characters and drops a longer report whole.
+const UPDATE_ERROR_MAX_CHARS: usize = 500;
+
+/// The text and time of the agent's last failed update. The next good update
+/// check clears it, so a device that recovered stops reporting an error.
+#[derive(Default)]
+struct UpdateStatus {
+    last_failure: std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>,
+}
+
+static UPDATE_STATUS: UpdateStatus = UpdateStatus {
+    last_failure: std::sync::Mutex::new(None),
+};
+
+impl UpdateStatus {
+    fn record_failure(&self, text: &str, home: Option<&str>, at: chrono::DateTime<chrono::Utc>) {
+        let text: String = redact_home(text, home)
+            .chars()
+            .take(UPDATE_ERROR_MAX_CHARS)
+            .collect();
+        *self
+            .last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((text, at));
+    }
+
+    fn clear(&self) {
+        *self
+            .last_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// `text` with the user's home folder written as `~`, because an error path can
+/// name the user. A home of `/` or an empty one would rewrite every path, so it
+/// changes nothing.
+fn redact_home(text: &str, home: Option<&str>) -> String {
+    match home
+        .map(|h| h.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+    {
+        Some(home) => text.replace(home, "~"),
+        None => text.to_string(),
+    }
+}
+
 /// The check-in `meta`: the device identity plus the agent version, so the
 /// backend can record which build sent each check-in.
 fn checkin_meta(device_uuid: &str) -> serde_json::Value {
-    json!({
+    checkin_meta_with(device_uuid, &UPDATE_STATUS)
+}
+
+/// The check-in `meta` with the last failed update, when there is one, so the
+/// backend can show why a device stays on an old build.
+fn checkin_meta_with(device_uuid: &str, status: &UpdateStatus) -> serde_json::Value {
+    let mut meta = json!({
         "device_uuid": device_uuid,
         "app_version": env!("CARGO_PKG_VERSION"),
-    })
+    });
+    let failure = status
+        .last_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((text, at)) = failure.as_ref() {
+        meta["update_error"] = json!(text);
+        meta["update_error_at"] = json!(at.to_rfc3339());
+    }
+    meta
 }
 
 /// Pull the hardware serial from osquery `system_info` rows. Do not fall back
@@ -5845,9 +5908,13 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
             {
                 log::error!("💥 Auto-update failed: {}", e);
                 report_update_failure_once(&e);
+                record_update_failure(&e);
             }
         }
-        Ok(UpdateCheck::Nothing) => log::info!("✅ No updates available - app is up to date"),
+        Ok(UpdateCheck::Nothing) => {
+            log::info!("✅ No updates available - app is up to date");
+            UPDATE_STATUS.clear();
+        }
         // Before PROD-7007 a package install logged "not an AppImage" and then
         // "up to date", so one 15 releases behind read as current in its own
         // log. Name the waiting version, and only what is true on every package
@@ -5857,8 +5924,17 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
             "📦 {} is available. This is a .deb/.rpm install: the package manager updates it, not the agent",
             available
         ),
-        Err(e) => log::warn!("update check failed: {}", e),
+        Err(e) => {
+            log::warn!("update check failed: {}", e);
+            record_update_failure(&e);
+        }
     }
+}
+
+/// Keep a failed update for the next check-in, with the home folder hidden.
+fn record_update_failure(text: &str) {
+    let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+    UPDATE_STATUS.record_failure(text, home.as_deref(), chrono::Utc::now());
 }
 
 /// How often the update loop wakes to ask whether a check is due. Far shorter
@@ -9496,6 +9572,93 @@ listener {
         assert_eq!(m["device_uuid"], "device-abc");
         assert_eq!(m["app_version"], env!("CARGO_PKG_VERSION"));
         assert!(!m["app_version"].as_str().unwrap().is_empty());
+    }
+
+    fn at(hour: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(2026, 11, 17, hour, 0, 0)
+            .unwrap()
+    }
+
+    // A check-in after a failed update must tell the backend what failed and when,
+    // so the fleet page can show why a Mac stays on an old build.
+    #[test]
+    fn checkin_meta_carries_the_last_update_error_and_its_time() {
+        let status = UpdateStatus::default();
+        status.record_failure(
+            "Failed to move old app aside: Permission denied (os error 13)",
+            None,
+            at(9),
+        );
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(
+            m["update_error"],
+            "Failed to move old app aside: Permission denied (os error 13)"
+        );
+        assert_eq!(m["update_error_at"], "2026-11-17T09:00:00+00:00");
+        assert_eq!(m["device_uuid"], "device-abc");
+    }
+
+    // A device that never failed sends neither key, so the backend keeps no stale row.
+    #[test]
+    fn checkin_meta_has_no_update_error_before_a_failure() {
+        let m = checkin_meta_with("device-abc", &UpdateStatus::default());
+        assert!(m.get("update_error").is_none());
+        assert!(m.get("update_error_at").is_none());
+    }
+
+    // The next good check clears the status, so a fixed Mac stops showing an error.
+    #[test]
+    fn a_good_update_check_clears_the_update_error() {
+        let status = UpdateStatus::default();
+        status.record_failure("boom", None, at(9));
+        status.clear();
+        let m = checkin_meta_with("device-abc", &status);
+        assert!(m.get("update_error").is_none());
+        assert!(m.get("update_error_at").is_none());
+    }
+
+    // A second failure replaces the first: the report names the latest one.
+    #[test]
+    fn the_latest_failure_replaces_the_earlier_one() {
+        let status = UpdateStatus::default();
+        status.record_failure("first", None, at(9));
+        status.record_failure("second", None, at(15));
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_error"], "second");
+        assert_eq!(m["update_error_at"], "2026-11-17T15:00:00+00:00");
+    }
+
+    // Kiln stores 500 characters and refuses more, so the agent cuts the text itself.
+    // The text holds two-byte characters to show the cut counts characters, not bytes.
+    #[test]
+    fn the_update_error_is_cut_to_500_characters() {
+        let status = UpdateStatus::default();
+        status.record_failure(&"é".repeat(600), None, at(9));
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_error"].as_str().unwrap().chars().count(), 500);
+    }
+
+    // The error text can hold a path in the user's home folder, which names the user.
+    #[test]
+    fn the_update_error_hides_the_home_folder() {
+        let status = UpdateStatus::default();
+        status.record_failure(
+            "Failed to read /Users/alex/Library/Logs/x: denied",
+            Some("/Users/alex"),
+            at(9),
+        );
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_error"], "Failed to read ~/Library/Logs/x: denied");
+    }
+
+    // A home folder of "/" or "" would rewrite every path in the text.
+    #[test]
+    fn a_root_or_empty_home_folder_changes_nothing() {
+        assert_eq!(redact_home("a /b/c", Some("/")), "a /b/c");
+        assert_eq!(redact_home("a /b/c", Some("")), "a /b/c");
+        assert_eq!(redact_home("a /b/c", None), "a /b/c");
     }
 }
 
