@@ -160,7 +160,7 @@ make_bundle_updatable() {
   [ -d "$app" ] || return 1
   /usr/bin/chgrp -hR admin "$app" || return 1
   /bin/chmod -R g+w "$app" || return 1
-  if [ -n "$user" ] && [ "$user" != "root" ]; then
+  if [ -n "$user" ] && [ "$user" != "root" ] && [ "$user" != "loginwindow" ]; then
     /usr/sbin/chown -hR "$user" "$app" || return 1
   fi
 }
