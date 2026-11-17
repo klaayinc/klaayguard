@@ -2837,17 +2837,17 @@ impl UpdateStatus {
             .chars()
             .take(UPDATE_ERROR_MAX_CHARS)
             .collect();
-        *self
-            .last_failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((text, at));
+        *self.lock() = Some((text, at));
     }
 
     fn clear(&self) {
-        *self
-            .last_failure
+        *self.lock() = None;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(String, chrono::DateTime<chrono::Utc>)>> {
+        self.last_failure
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -2877,11 +2877,7 @@ fn checkin_meta_with(device_uuid: &str, status: &UpdateStatus) -> serde_json::Va
         "device_uuid": device_uuid,
         "app_version": env!("CARGO_PKG_VERSION"),
     });
-    let failure = status
-        .last_failure
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((text, at)) = failure.as_ref() {
+    if let Some((text, at)) = status.lock().as_ref() {
         meta["update_error"] = json!(text);
         meta["update_error_at"] = json!(at.to_rfc3339());
     }
