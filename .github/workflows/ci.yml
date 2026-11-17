@@ -127,6 +127,12 @@ jobs:
         working-directory: src-tauri
         run: bash scripts/test-postinstall-stops-agent.sh
 
+      # Proves the .pkg leaves the bundle replaceable by the admin who runs the
+      # agent. A root-only bundle made the self-update fail on the swap.
+      - name: postinstall opens the bundle to the admin group
+        working-directory: src-tauri
+        run: bash scripts/test-postinstall-bundle-updatable.sh
+
       # Proves the .pkg preinstall removes every earlier install before the
       # payload lands: a copy in ~/Applications, a bundle under another name,
       # and the login job tauri-plugin-autostart left behind in v0.1.0 to v0.1.5.
