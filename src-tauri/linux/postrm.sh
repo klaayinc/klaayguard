@@ -75,6 +75,18 @@ stop_running_agents() {
   log "postrm: stopped the agent this removal deleted"
 }
 
+# Take the machine off Klaay's package repository (PROD-7007). The postinstall
+# added it; an uninstalled agent has no business in the package manager's
+# sources. Only a real removal reaches this: an upgrade passes `upgrade` (dpkg)
+# or 1 (rpm), and there the new package's postinstall has just rewritten them.
+remove_package_repo() {
+  for f in /etc/apt/sources.list.d/klaay.list /usr/share/keyrings/klaay.gpg \
+    /etc/yum.repos.d/klaay.repo /etc/pki/rpm-gpg/RPM-GPG-KEY-klaay; do
+    [ -e "$f" ] || continue
+    rm -f "$f" && log "postrm: removed $f"
+  done
+}
+
 main() {
   # Refresh the desktop databases after removal so the menu entry stops being
   # advertised once the package is gone.
@@ -86,8 +98,15 @@ main() {
   case "${1:-}" in
     remove | purge | 0)
       stop_running_agents "$AGENT_BIN" || true
+      remove_package_repo || true
       ;;
   esac
+  # Nothing on an rpm upgrade or downgrade ($1 = 1). This script belongs to the
+  # package being replaced, and it cannot tell a staging build from a rollback
+  # to a release older than the repository (v0.1.72 and earlier, which the
+  # repository serves for rolling back): neither carries the repository files.
+  # Dropping the registration there would take a rolled-back customer off the
+  # repository for good, so keep it, as dpkg does on a downgrade.
 }
 
 # The shipped script carries no way to switch this off. The test sources a copy
