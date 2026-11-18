@@ -1,6 +1,8 @@
 [package]
 name = "KlaayGuard"
-version = "0.1.12"
+# Placeholder. The release workflows stamp the release tag's version here
+# before they build. Never edit it by hand.
+version = "0.0.0"
 description = "KlaayGuard security agent. Reports device posture to Klaay."
 authors = ["Klaay <support@klaay.com>"]
 edition = "2021"

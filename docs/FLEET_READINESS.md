@@ -2,78 +2,67 @@
 
 The `.dmg` can leave the release only when every active macOS agent runs the
 updater that installs from the `.pkg`. Old updaters read only a `.dmg`. This
-page says how to count them.
+page says how to check.
 
 Let `V` be the first release that holds the `.pkg` updater. It is the version
-the release workflow publishes after the updater PR merges.
+the release workflow publishes after the updater PR merges. The first such
+release is v0.1.70.
 
-## Data source
+## Where to look
 
-Kiln stores the agent version on the `devices` table:
+Open the kiln back office page `/admin/fleet_readiness`. The menu name is
+"KlaayGuard Fleet". Enter `V` in the target version field and press Check.
+The page reads the `devices` table live. It needs no database restore.
 
-- `agent_version` (string). The agent sends `app_version` in each report, and
-  `Klaayguard::CollectDeviceDataJob#record_agent_report` writes it.
-- `agent_last_seen_at` (datetime). The same job sets it on each report.
-- `source` is `klaayguard` for a device that an agent reports.
+The page shows:
 
-Agents older than v0.1.26 send no version. Their `agent_version` is `NULL`.
+- A verdict. "Ready" or "Not ready: N agents need a manual .pkg install".
+- A count per platform (Mac, Windows, Linux, Unknown): active agents, agents at
+  or above `V`, agents below `V`, and agents with no version.
+- A list of every active agent below `V` or with no version, with its account,
+  operating system, agent version and last seen time.
+
+An agent is active when `source` is `klaayguard` and `agent_last_seen_at` is
+within the last 7 days. This matches the `has_klaayguard` rule in kiln. The page
+compares versions with `Gem::Version`, never as strings.
+
+An agent that has not reported its operating system shows in the Unknown row.
+It could be a Mac, so it counts against readiness until it reports.
 
 ## Rules
 
-- Run the query on a local restore only: `composefork exec web bin/rails db:restore_production`.
-  Never run a command on a production dyno.
-- Write down counts only. Never copy a row, a serial number, a name or an
+- Use the page. Never run a command on a production dyno.
+- Write down counts only. Never copy a row, a serial number, a device name or an
   account into a message, a PR or a commit.
-
-## Active macOS agent
-
-A device is an active macOS agent when all of these hold:
-
-- `source = 'klaayguard'`
-- `agent_last_seen_at` is within the last 7 days. This matches the `has_klaayguard` rule in kiln.
-- The device is a Mac. Use the device type or operating system field that the
-  report fills. If no such field is set, count by the report items.
-
-## Counts to take
-
-Run each count in `bin/rails runner` in the local stack.
-
-1. **Active agents.** Count the active devices above. This is the total `N`.
-2. **At or above V.** Count active devices with `agent_version` at or above `V`.
-   Compare with `Gem::Version`, never as strings, because `0.1.9` sorts after `0.1.71` as text.
-3. **Below V with a version.** `N` minus group 2 minus group 4. These agents
-   self-update through the `.dmg`. They need the `.dmg` until they update.
-4. **No version.** Count active devices with `agent_version IS NULL`. These run
-   v0.1.25 or older.
-
-```ruby
-active = Device.where(source: :klaayguard).where(agent_last_seen_at: 7.days.ago..)
-v = Gem::Version.new("V")
-versions = active.where.not(agent_version: nil).pluck(:agent_version).map { Gem::Version.new(it) }
-puts({ active: active.count,
-       at_or_above_v: versions.count { it >= v },
-       below_v: versions.count { it < v },
-       no_version: active.where(agent_version: nil).count })
-```
-
-Skip the Mac filter in this snippet only if the table holds no Windows or Linux
-agents. Otherwise add the filter first, or the counts mix platforms.
 
 ## The two groups that need a manual .pkg install
 
 - **No version (older than v0.1.26).** These agents do not report a version, so
-  kiln cannot tell their updater from a broken one. Install the `.pkg` by hand.
+  kiln cannot tell their updater from a broken one. The page shows them in the
+  "No version" column. Install the `.pkg` by hand.
 - **Broken self-update.** An agent can report a version below `V` for weeks
-  while its updater fails. Find them: the version has not moved across two
-  releases while `agent_last_seen_at` stays fresh. Compare two restores a week
-  apart, or compare the version with the latest release date. Install the
-  `.pkg` by hand.
+  while its updater fails. The page shows only the state now, so it cannot show
+  this alone. Open the page on two dates a week apart and write down the count
+  below `V` each time. When the count does not fall and the last seen times stay
+  fresh, read the list and check those agents. Install the `.pkg` by hand on
+  each agent with a broken updater.
 
 ## Ready rule
 
 The `.dmg` can leave the release when both hold:
 
-- Group 3 (below `V`, with a version) is zero, or each remaining agent has a named owner and a manual `.pkg` install date.
-- Group 4 (no version) is zero, or each remaining agent has the same.
+- The Mac and Unknown rows show zero agents below `V` with a version, or each
+  remaining agent has a named owner and a manual `.pkg` install date.
+- The Mac and Unknown rows show zero agents with no version, or each remaining
+  agent has the same.
 
-Record the counts and the restore date in the step-5 PR (the PR that removes the `.dmg`).
+Windows and Linux agents do not block the `.dmg`. Their counts show for
+information.
+
+Record the counts and the date you checked in the step-5 PR (the PR that removes
+the `.dmg`).
+
+## Limit
+
+The `devices` table holds no installer type. The page cannot tell a `.dmg`
+install from a `.pkg` install. The agent version is the only proxy.

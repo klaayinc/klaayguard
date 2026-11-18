@@ -141,6 +141,12 @@ jobs:
         working-directory: src-tauri
         run: bash scripts/test-pkg-structure.sh
 
+      # Proves the release tag is the only source of the version: no VERSION
+      # file, no version in tauri.conf.json, a placeholder in Cargo.toml, and
+      # no workflow that reads or stamps a second copy.
+      - name: single version source
+        run: bash .github/scripts/test-single-version-source.sh
+
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -243,15 +249,42 @@ jobs:
         with:
           tool: tauri-cli@2.11.4
 
-      - name: Build deb
+      # Bundle the way the production release does, package-repository files
+      # included (linux/package-repo.conf.json), so one build checks both the
+      # package and those files. That the development and staging builds carry
+      # no repository is checked on every release build (release-linux.yml).
+      - name: Build deb (production overlay)
         working-directory: src-tauri
-        run: cargo tauri build --bundles deb
+        run: cargo tauri build --bundles deb --config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json"
 
-      - name: Validate deb contents
+      - name: Validate deb contents and its package-repository files
         run: |
           DEB=$(find src-tauri/target/release/bundle/deb -name "*.deb" | head -n1)
           test -n "$DEB"
-          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          EXPECT_PACKAGE_REPO=1 ./.github/scripts/validate-linux-deb.sh "$DEB"
+
+      - name: Upload the production-overlay deb
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: klaayguard-deb-package-repo
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  # Proves the package repositories work on real package managers: a manual
+  # install joins the repository, an upgrade comes through it, a tampered index
+  # is refused, and an uninstall or /etc/klaay/no-repo leaves nothing behind
+  # (PROD-7007). Containers, a throwaway key, stand-in packages carrying the
+  # real maintainer scripts.
+  package-repo-linux:
+    name: Package repositories (apt + rpm, containers)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install, upgrade and remove through the repositories
+        run: src-tauri/scripts/test-package-repo.sh
 
   # Proves the postinstall restarts the agent it replaces. Without that
   # step a package upgrade leaves the old process running the old binary,
@@ -307,15 +340,27 @@ jobs:
         with:
           tool: tauri-cli@2.11.4
 
-      - name: Build rpm
+      # As in the deb job: one production-overlay build checks the package and
+      # its package-repository files.
+      - name: Build rpm (production overlay)
         working-directory: src-tauri
-        run: cargo tauri build --bundles rpm
+        run: cargo tauri build --bundles rpm --config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json"
 
-      - name: Validate rpm contents
+      - name: Validate rpm contents and its package-repository files
         run: |
           RPM=$(find src-tauri/target/release/bundle/rpm -name "*.rpm" | head -n1)
           test -n "$RPM"
-          ./.github/scripts/validate-linux-rpm.sh "$RPM"
+          EXPECT_PACKAGE_REPO=1 ./.github/scripts/validate-linux-rpm.sh "$RPM"
+
+      # Kept for a manual end-to-end check on real package managers (install,
+      # then upgrade through pkg.klaay.com); no job reads it.
+      - name: Upload the production-overlay rpm
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: klaayguard-rpm-package-repo
+          path: src-tauri/target/release/bundle/rpm/*.rpm
+          if-no-files-found: error
+          retention-days: 7
 
   # Build the Windows NSIS installer the way release does, then install it
   # silently on the runner and assert on the result: the Run key, the sidecar,
@@ -355,7 +400,7 @@ jobs:
       # tick the moment it starts, and against the production API it finds the
       # current release and installs it — so every assertion below would read a
       # different binary than the one this job built. With no reachable API the
-      # check fails harmlessly and the installed 0.1.12 stays 0.1.12.
+      # check fails harmlessly and the installed version stays the built one.
       # The .msi is not shipped. Early releases shipped one, so the check
       # installs it first, as the earlier version a customer machine can hold,
       # and proves the NSIS installer removes it.
@@ -372,5 +417,5 @@ jobs:
           if (-not $exe) { throw "NSIS installer missing" }
           $msi = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi -Filter *.msi | Select-Object -First 1
           if (-not $msi) { throw "MSI missing; the earlier-install check needs it" }
-          $v = (Get-Content VERSION -Raw).Trim()
+          $v = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
           ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v -Msi $msi.FullName

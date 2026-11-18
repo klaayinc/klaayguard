@@ -97,9 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
-          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
           grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
 
       - name: Build Windows installer (NSIS)
@@ -153,7 +151,7 @@ jobs:
           $exe = Get-ChildItem -Path src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "NSIS installer missing" }
           $v = "${{ inputs.version }}"
-          if ($v -eq "") { $v = (Get-Content VERSION -Raw).Trim() }
+          if ($v -eq "") { $v = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value }
           ./.github/scripts/validate-windows-nsis.ps1 -Installer $exe.FullName -Version $v.TrimStart("v")
 
       - name: Upload installer
@@ -228,9 +226,7 @@ jobs:
         run: |
           set -euo pipefail
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i '' -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i '' -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
-          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
           grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
 
       - name: Import Apple Developer certificate
@@ -274,7 +270,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(cat VERSION)
+          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(awk -F'"' '/^version = /{print $2; exit}' src-tauri/Cargo.toml)
           mkdir -p out
           APP_PATH=$(find ${{ matrix.bundle_dir }} -path "*/bundle/macos/KlaayGuard.app" -type d | head -n1)
           test -n "$APP_PATH" || { echo "KlaayGuard.app missing" >&2; exit 1; }
@@ -346,7 +342,7 @@ jobs:
 
       - name: Install Tauri system dependencies
         timeout-minutes: 15
-        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
       - name: Fetch osquery sidecar
         env:
@@ -359,9 +355,7 @@ jobs:
         run: |
           set -euo pipefail
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
-          grep -q "\"version\": \"$V\"" src-tauri/tauri.conf.json || { echo "tauri.conf.json version sync failed" >&2; exit 1; }
           grep -q "^version = \"$V\"" src-tauri/Cargo.toml || { echo "Cargo.toml version sync failed" >&2; exit 1; }
 
       - name: Build Tauri (Linux x86_64)
@@ -370,18 +364,28 @@ jobs:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
           VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
           VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
-        run: cargo tauri build --bundles deb rpm appimage
+        # As in release-linux.yml: only production carries the package
+        # repository, so a test install of this artifact behaves like the
+        # release it stands in for (PROD-7007).
+        run: |
+          extra=()
+          [ "${{ matrix.build }}" = production ] && extra=(--config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json")
+          cargo tauri build --bundles deb rpm appimage "${extra[@]}"
 
       - name: Validate and collect
         shell: bash
         run: |
           set -euo pipefail
-          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(cat VERSION)
+          V="${{ inputs.version }}"; V="${V#v}"; [ -n "$V" ] || V=$(awk -F'"' '/^version = /{print $2; exit}' src-tauri/Cargo.toml)
           BASE_DIR="src-tauri/target/release/bundle"
           APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1); test -n "$APPIMAGE"
           DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1); test -n "$DEB"
           RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1); test -n "$RPM"
-          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          # Same rule as release-linux.yml: production carries the package
+          # repository and nothing else does, in both formats.
+          if [ "${{ matrix.build }}" = production ]; then expect=1; else expect=0; fi
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-deb.sh "$DEB"
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-rpm.sh "$RPM"
           mkdir -p out
           cp "$APPIMAGE" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.AppImage"
           cp "$DEB" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.deb"

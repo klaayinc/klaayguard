@@ -1321,7 +1321,7 @@ insights.
 ## GNU General Public License v3.0 or later
 
 Used by:
-- KlaayGuard 0.1.12
+- KlaayGuard 0.0.0
 
 ```
 GNU GENERAL PUBLIC LICENSE
