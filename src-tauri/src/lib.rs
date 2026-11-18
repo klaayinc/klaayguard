@@ -342,6 +342,50 @@ fn auto_update_row_apt(
     auto_update_row("yes", "apt", "unattended-upgrades installs updates")
 }
 
+/// Linux Mint does not use unattended-upgrades. Its Update Manager
+/// (mintupdate), under Preferences → Automation, enables
+/// mintupdate-automation-upgrade.timer and creates this file together; the
+/// daily upgrade script does nothing without the file. So Mint installs updates
+/// by itself only when the timer is enabled and the file exists.
+#[cfg(any(target_os = "linux", test))]
+const MINT_AUTOMATION_FLAG: &str = "/var/lib/linuxmint/mintupdate-automatic-upgrades-enabled";
+
+/// The apt verdict, or Mint's own automation when that says on. `mint_timer` is
+/// `systemctl is-enabled mintupdate-automation-upgrade.timer`; a machine
+/// without mintupdate answers not-found or nothing and keeps the apt verdict.
+#[cfg(any(target_os = "linux", test))]
+fn auto_update_row_apt_or_mint(apt: Value, mint_timer: Option<&str>, mint_flag: bool) -> Value {
+    if apt[0]["enabled"] == "yes" {
+        return apt;
+    }
+    let mint_present = mint_flag
+        || matches!(
+            mint_timer,
+            Some("enabled") | Some("disabled") | Some("masked")
+        );
+    if !mint_present {
+        return apt;
+    }
+    match (mint_timer == Some("enabled"), mint_flag) {
+        (true, true) => auto_update_row(
+            "yes",
+            "mintupdate",
+            "mintupdate automation installs updates",
+        ),
+        (true, false) => auto_update_row(
+            "no",
+            "mintupdate",
+            "mintupdate-automation-upgrade.timer is enabled but automatic upgrades are off",
+        ),
+        (false, true) => auto_update_row(
+            "no",
+            "mintupdate",
+            "mintupdate-automation-upgrade.timer is not enabled",
+        ),
+        (false, false) => auto_update_row("no", "mintupdate", "mintupdate automation is off"),
+    }
+}
+
 /// `apply_updates` in the `[commands]` section of a dnf automatic.conf.
 #[cfg(any(target_os = "linux", test))]
 fn parse_dnf_apply_updates(text: &str) -> Option<bool> {
@@ -420,11 +464,16 @@ fn collect_auto_update() -> Value {
             return auto_update_row("unknown", "apt", "apt-config did not answer");
         };
         let vars = parse_apt_config_shell(&out);
-        return auto_update_row_apt(
+        let apt = auto_update_row_apt(
             vars.get("E").map(String::as_str),
             vars.get("U").map(String::as_str),
             std::path::Path::new("/usr/bin/unattended-upgrade").exists(),
             systemctl_is_enabled("apt-daily-upgrade.timer").as_deref(),
+        );
+        return auto_update_row_apt_or_mint(
+            apt,
+            systemctl_is_enabled("mintupdate-automation-upgrade.timer").as_deref(),
+            std::path::Path::new(MINT_AUTOMATION_FLAG).exists(),
         );
     }
     if binary_on_path("dnf5") || binary_on_path("dnf") {
@@ -7817,6 +7866,65 @@ mod happy_path_tests {
     fn apt_auto_update_yes_when_systemctl_gives_no_answer() {
         let rows = auto_update_row_apt(None, Some("1"), true, None);
         assert_eq!(auto_update_enabled(&rows), "yes");
+    }
+
+    // Linux Mint (PROD-7268): mintupdate's "Apply updates automatically"
+    // enables mintupdate-automation-upgrade.timer and creates the flag file;
+    // the upgrade script does nothing without the file.
+
+    #[test]
+    fn apt_auto_update_yes_when_mint_automation_is_on() {
+        let apt = auto_update_row_apt(None, None, false, None);
+        let rows = auto_update_row_apt_or_mint(apt, Some("enabled"), true);
+        assert_eq!(auto_update_enabled(&rows), "yes");
+        assert_eq!(rows[0]["source"], "mintupdate");
+    }
+
+    #[test]
+    fn apt_auto_update_no_when_mint_timer_is_on_without_the_flag_file() {
+        let apt = auto_update_row_apt(None, None, false, None);
+        let rows = auto_update_row_apt_or_mint(apt, Some("enabled"), false);
+        assert_eq!(auto_update_enabled(&rows), "no");
+        assert_eq!(rows[0]["source"], "mintupdate");
+    }
+
+    #[test]
+    fn apt_auto_update_no_when_mint_flag_file_exists_but_timer_is_off() {
+        let apt = auto_update_row_apt(None, None, false, None);
+        for timer in [Some("disabled"), Some("masked"), None] {
+            let rows = auto_update_row_apt_or_mint(apt.clone(), timer, true);
+            assert_eq!(auto_update_enabled(&rows), "no", "timer {timer:?}");
+        }
+    }
+
+    #[test]
+    fn apt_auto_update_no_on_mint_with_automation_off_names_mintupdate() {
+        // Mint ships the timer unit disabled; the detail should point at
+        // Mint's own setting, not at unattended-upgrades.
+        let apt = auto_update_row_apt(None, None, false, Some("enabled"));
+        let rows = auto_update_row_apt_or_mint(apt, Some("disabled"), false);
+        assert_eq!(auto_update_enabled(&rows), "no");
+        assert_eq!(rows[0]["source"], "mintupdate");
+        assert_eq!(rows[0]["detail"], "mintupdate automation is off");
+    }
+
+    #[test]
+    fn apt_auto_update_unattended_upgrades_wins_whatever_mint_says() {
+        let apt = auto_update_row_apt(None, Some("1"), true, Some("enabled"));
+        let rows = auto_update_row_apt_or_mint(apt, Some("disabled"), false);
+        assert_eq!(auto_update_enabled(&rows), "yes");
+        assert_eq!(rows[0]["source"], "apt");
+    }
+
+    #[test]
+    fn apt_auto_update_unchanged_without_mintupdate() {
+        // Ubuntu or Debian: no Mint timer unit, so systemctl says not-found
+        // (or nothing) and the unattended-upgrades verdict stands.
+        for timer in [Some("not-found"), None] {
+            let apt = auto_update_row_apt(None, None, false, None);
+            let rows = auto_update_row_apt_or_mint(apt.clone(), timer, false);
+            assert_eq!(rows, apt, "timer {timer:?}");
+        }
     }
 
     #[test]
