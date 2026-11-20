@@ -3508,6 +3508,14 @@ async fn run_cycle<R: tauri::Runtime>(
     name_unnamed_holder(state);
 
     let cfg_json: Value = cfg_resp.json().await.map_err(|e| e.to_string())?;
+    nudge_from_config(
+        &cfg_json,
+        env!("CARGO_PKG_VERSION"),
+        &mut NUDGE_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        &UPDATE_NOW,
+    );
     let items = parse_config_items(&cfg_json, std::env::consts::OS);
 
     if items.is_empty() {
@@ -5957,9 +5965,48 @@ fn check_due(last: SystemTime, now: SystemTime, period: Duration) -> bool {
     }
 }
 
+/// Whether the update loop runs a check now: a nudge from the config call forces
+/// one inside the period, and the period alone decides otherwise.
+fn update_check_due(forced: bool, last: SystemTime, now: SystemTime, period: Duration) -> bool {
+    forced || check_due(last, now, period)
+}
+
+/// Wakes the update loop when the config call names a newer release.
+static UPDATE_NOW: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// The newest release the config call already woke the update loop for.
+#[derive(Default)]
+struct NudgeGate {
+    last: Option<semver::Version>,
+}
+
+static NUDGE_GATE: std::sync::Mutex<NudgeGate> = std::sync::Mutex::new(NudgeGate { last: None });
+
+/// Wake the update loop when `cfg.meta.latest_version` is newer than `current`.
+/// The config call repeats every 15 minutes, so a release wakes the loop once.
+/// A missing or unreadable version wakes nothing: an older Kiln names none.
+fn nudge_from_config(cfg: &Value, current: &str, gate: &mut NudgeGate, wake: &tokio::sync::Notify) {
+    let named = cfg["meta"]["latest_version"]
+        .as_str()
+        .and_then(|v| semver::Version::parse(v.trim_start_matches('v')).ok());
+    let current = semver::Version::parse(current.trim_start_matches('v')).ok();
+    let (Some(named), Some(current)) = (named, current) else {
+        return;
+    };
+    if named > current && gate.last.as_ref().is_none_or(|last| named > *last) {
+        log::info!(
+            "🔔 Kiln names release {}; checking for an update now",
+            named
+        );
+        gate.last = Some(named);
+        wake.notify_one();
+    }
+}
+
 /// Check for updates immediately, then every `period` of wall-clock time
 /// (default 6h), so the always-on agent self-updates in place rather than only
-/// at restart — and a laptop that sleeps still updates on schedule.
+/// at restart — and a laptop that sleeps still updates on schedule. A config
+/// call that names a newer release checks at once.
 fn spawn_update_loop(app: tauri::AppHandle, api_base: String) {
     tauri::async_runtime::spawn(async move {
         let period = Duration::from_secs(update_check_interval_seconds());
@@ -5968,9 +6015,12 @@ fn spawn_update_loop(app: tauri::AppHandle, api_base: String) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last: Option<SystemTime> = None;
         loop {
-            interval.tick().await; // first tick is immediate (startup check)
+            let forced = tokio::select! {
+                _ = interval.tick() => false, // first tick is immediate (startup check)
+                _ = UPDATE_NOW.notified() => true,
+            };
             let now = SystemTime::now();
-            if last.is_some_and(|prev| !check_due(prev, now, period)) {
+            if last.is_some_and(|prev| !update_check_due(forced, prev, now, period)) {
                 continue;
             }
             last = Some(now);
@@ -9655,6 +9705,114 @@ listener {
         assert_eq!(redact_home("a /b/c", Some("/")), "a /b/c");
         assert_eq!(redact_home("a /b/c", Some("")), "a /b/c");
         assert_eq!(redact_home("a /b/c", None), "a /b/c");
+    }
+}
+
+#[cfg(test)]
+mod update_nudge_tests {
+    use super::*;
+
+    fn config_naming(version: Value) -> Value {
+        json!({ "data": [], "meta": { "latest_version": version } })
+    }
+
+    async fn woken(wake: &tokio::sync::Notify) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), wake.notified())
+            .await
+            .is_ok()
+    }
+
+    // A config that names a newer release makes the agent check at once, not up
+    // to 6 hours later.
+    #[tokio::test]
+    async fn a_config_naming_a_newer_release_wakes_the_update_loop() {
+        let wake = tokio::sync::Notify::new();
+        nudge_from_config(
+            &config_naming(json!("0.1.72")),
+            "0.1.70",
+            &mut NudgeGate::default(),
+            &wake,
+        );
+        assert!(woken(&wake).await);
+    }
+
+    #[tokio::test]
+    async fn a_leading_v_on_either_version_changes_nothing() {
+        let wake = tokio::sync::Notify::new();
+        nudge_from_config(
+            &config_naming(json!("v0.1.72")),
+            "v0.1.70",
+            &mut NudgeGate::default(),
+            &wake,
+        );
+        assert!(woken(&wake).await);
+    }
+
+    // An agent on the latest build, or a newer one, has nothing to update to.
+    #[tokio::test]
+    async fn an_equal_or_older_release_wakes_nothing() {
+        for named in ["0.1.72", "0.1.71"] {
+            let wake = tokio::sync::Notify::new();
+            nudge_from_config(
+                &config_naming(json!(named)),
+                "0.1.72",
+                &mut NudgeGate::default(),
+                &wake,
+            );
+            assert!(!woken(&wake).await, "{named} woke the loop");
+        }
+    }
+
+    // An old Kiln names no version, and a junk value is no verdict: neither wakes.
+    #[tokio::test]
+    async fn a_missing_or_unreadable_version_wakes_nothing() {
+        let absent = json!({ "data": [], "meta": {} });
+        let no_meta = json!({ "data": [] });
+        for cfg in [
+            absent,
+            no_meta,
+            config_naming(json!(null)),
+            config_naming(json!(72)),
+            config_naming(json!("latest")),
+            config_naming(json!("")),
+        ] {
+            let wake = tokio::sync::Notify::new();
+            nudge_from_config(&cfg, "0.1.70", &mut NudgeGate::default(), &wake);
+            assert!(!woken(&wake).await, "{cfg} woke the loop");
+        }
+    }
+
+    // Config comes every 15 minutes. One release must cause one early check, not one per cycle.
+    #[tokio::test]
+    async fn the_same_release_wakes_the_loop_once() {
+        let wake = tokio::sync::Notify::new();
+        let mut gate = NudgeGate::default();
+        let cfg = config_naming(json!("0.1.72"));
+        nudge_from_config(&cfg, "0.1.70", &mut gate, &wake);
+        assert!(woken(&wake).await);
+        nudge_from_config(&cfg, "0.1.70", &mut gate, &wake);
+        assert!(!woken(&wake).await);
+    }
+
+    #[tokio::test]
+    async fn a_newer_release_than_the_last_one_wakes_the_loop_again() {
+        let wake = tokio::sync::Notify::new();
+        let mut gate = NudgeGate::default();
+        nudge_from_config(&config_naming(json!("0.1.72")), "0.1.70", &mut gate, &wake);
+        assert!(woken(&wake).await);
+        nudge_from_config(&config_naming(json!("0.1.73")), "0.1.70", &mut gate, &wake);
+        assert!(woken(&wake).await);
+    }
+
+    // The 6-hour period still holds for a normal tick; only a nudge skips it.
+    #[test]
+    fn a_nudged_check_is_due_inside_the_period() {
+        let last = SystemTime::UNIX_EPOCH;
+        let now = last + Duration::from_secs(60);
+        let period = Duration::from_secs(6 * 60 * 60);
+        assert!(!update_check_due(false, last, now, period));
+        assert!(update_check_due(true, last, now, period));
+        assert!(update_check_due(false, last, last + period, period));
     }
 }
 
