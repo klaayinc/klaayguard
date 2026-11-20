@@ -67,6 +67,19 @@ make_bundle_updatable "$app" "$me" || { echo "FAIL: make_bundle_updatable failed
 [ "$(owner_of "$app")" = "$me" ] || { echo "FAIL: the bundle owner is $(owner_of "$app"), not $me"; exit 1; }
 [ "$(owner_of "$app/Contents/MacOS/KlaayGuard")" = "$me" ] || { echo "FAIL: a nested file kept another owner"; exit 1; }
 
+echo "==> a standard (non-admin) user gets no owner change: /Applications stops their rename anyway, and ownership would only open the agent files to them"
+app="$workdir/four/KlaayGuard.app"
+new_bundle "$app"
+before=$(owner_of "$app")
+standard_user="nobody"
+if /usr/sbin/dseditgroup -o checkmember -m "$standard_user" admin >/dev/null 2>&1; then
+  echo "FAIL: $standard_user is an admin on this Mac; the test needs a standard user"
+  exit 1
+fi
+make_bundle_updatable "$app" "$standard_user" || { echo "FAIL: make_bundle_updatable failed for a standard user"; exit 1; }
+[ "$(owner_of "$app")" = "$before" ] || { echo "FAIL: the owner changed to $(owner_of "$app") for a standard user"; exit 1; }
+[ "$(group_of "$app")" = "admin" ] || { echo "FAIL: the group did not change for a standard user"; exit 1; }
+
 echo "==> root as the named user changes no owner, and the group still opens"
 app="$workdir/three/KlaayGuard.app"
 new_bundle "$app"
