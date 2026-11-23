@@ -1,0 +1,22 @@
+{
+  "bundle": {
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/share/klaay-guard/package-repo/klaay.asc": "linux/package-repo/klaay.asc",
+          "/usr/share/klaay-guard/package-repo/klaay.gpg": "linux/package-repo/klaay.gpg",
+          "/usr/share/klaay-guard/package-repo/klaay.list": "linux/package-repo/klaay.list",
+          "/usr/share/klaay-guard/package-repo/klaay.repo": "linux/package-repo/klaay.repo"
+        }
+      },
+      "rpm": {
+        "files": {
+          "/usr/share/klaay-guard/package-repo/klaay.asc": "linux/package-repo/klaay.asc",
+          "/usr/share/klaay-guard/package-repo/klaay.gpg": "linux/package-repo/klaay.gpg",
+          "/usr/share/klaay-guard/package-repo/klaay.list": "linux/package-repo/klaay.list",
+          "/usr/share/klaay-guard/package-repo/klaay.repo": "linux/package-repo/klaay.repo"
+        }
+      }
+    }
+  }
+}

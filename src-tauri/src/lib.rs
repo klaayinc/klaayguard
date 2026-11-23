@@ -15,6 +15,9 @@
 
 mod keychain;
 mod sign_in;
+#[cfg(test)]
+mod test_api;
+mod token_renewal;
 // macOS claims its single-instance lock here. `test` is in the gate so the
 // Linux CI runner, which is the only one that runs `cargo test`, exercises it.
 #[cfg(all(unix, any(target_os = "macos", test)))]
@@ -2623,31 +2626,8 @@ fn adopt_token<R: tauri::Runtime>(app: &tauri::AppHandle<R>, state: &Arc<AppStat
         // sign-in still survives a reboot. Tell the user the store is
         // degraded instead of failing silently. The keyring call blocks
         // (D-Bus, Keychain), so it stays off the async workers.
-        let saved = tauri::async_runtime::spawn_blocking(move || keychain::save_token(&tok)).await;
-        match saved {
-            Ok(Ok(keychain::CredentialStore::Keyring)) => {}
-            Ok(Ok(keychain::CredentialStore::File)) => {
-                log::warn!("secure credential store unavailable; saved sign-in to a file");
-                notify_user(
-                    "KlaayGuard",
-                    "No secure credential store found. Your sign-in is saved with reduced \
-                     protection. Install a keyring (gnome-keyring or KWallet) for full \
-                     protection.",
-                );
-                add_breadcrumb("auth", "token_saved_file_fallback", Level::Warning);
-                sentry::capture_message("keychain_token_file_fallback", Level::Warning);
-            }
-            Ok(Err(e)) => {
-                log::error!("keychain: token save failed: {}", e);
-                sentry::capture_message(
-                    &format!("keychain_token_save_failed: {}", e),
-                    Level::Error,
-                );
-            }
-            Err(e) => {
-                log::error!("keychain: token save task failed: {}", e);
-            }
-        }
+        let saved = off_the_workers(move || keychain::save_token(&tok)).await;
+        report_token_save(&saved, true);
         let _ = app.emit("auth:status", json!({ "authenticated": true }));
         add_breadcrumb("auth", "sign_in_token_saved", Level::Info);
         sentry::capture_message("sign_in_token_saved", Level::Info);
@@ -3694,6 +3674,230 @@ async fn collection_tick<R: tauri::Runtime>(
     result
 }
 
+/// Saves a token to the credential store: the keychain in production, a fake
+/// in tests.
+type SaveToken = Arc<dyn Fn(&str) -> Result<keychain::CredentialStore, String> + Send + Sync>;
+
+/// Run a credential-store call off the async workers: it blocks on D-Bus or
+/// the Keychain.
+async fn off_the_workers<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(call)
+        .await
+        .map_err(|e| format!("the store task failed: {e}"))?
+}
+
+/// Report how a token save went. Sign-in and renewal both save the token and
+/// both report a fall-back to the user-only file. Only sign-in tells the
+/// person: they are at the screen then, and a renewal runs unattended every
+/// three months on a machine whose person already saw the notice at sign-in.
+fn report_token_save(outcome: &Result<keychain::CredentialStore, String>, tell_the_person: bool) {
+    match outcome {
+        Ok(keychain::CredentialStore::Keyring) => {}
+        Ok(keychain::CredentialStore::File) => {
+            log::warn!("secure credential store unavailable; saved sign-in to a file");
+            if tell_the_person {
+                notify_user(
+                    "KlaayGuard",
+                    "No secure credential store found. Your sign-in is saved with reduced \
+                     protection. Install a keyring (gnome-keyring or KWallet) for full \
+                     protection.",
+                );
+            }
+            add_breadcrumb("auth", "token_saved_file_fallback", Level::Warning);
+            sentry::capture_message("keychain_token_file_fallback", Level::Warning);
+        }
+        Err(e) => {
+            log::error!("keychain: token save failed: {}", e);
+            sentry::capture_message(&format!("keychain_token_save_failed: {}", e), Level::Error);
+        }
+    }
+}
+
+/// What one renewal check did. Read by the tests; the steps worth knowing
+/// about are logged where they happen.
+#[derive(Debug, PartialEq)]
+enum RenewalStep {
+    /// No token is held: nothing to renew.
+    SignedOut,
+    /// The token's payload could not be read, or carries no `exp`.
+    Unreadable,
+    /// The token has more than the renewal window left.
+    NotDue,
+    /// Due, but the last answered request was too recent.
+    Waiting,
+    /// The server issued a new token, and the agent now holds it.
+    Renewed,
+    /// The request produced no token. The agent keeps the one it has.
+    Failed(token_renewal::Failure),
+    /// A sign-in or a sign-out replaced the token while the request was out.
+    /// The newer session wins and the renewed token is dropped.
+    Superseded,
+}
+
+/// Renew the held token when it is close to expiry (PROD-4397).
+///
+/// It runs on the collection loop, before the cycle, so no request with the
+/// old token is in flight when the server revokes it. Nothing here signs the
+/// agent out: a failed renewal leaves the token where it was, and the cycle's
+/// own 401 handling stays the only way out.
+async fn renew_token_if_due(
+    state: &Arc<AppState>,
+    client: &reqwest::Client,
+    schedule: &mut token_renewal::Schedule,
+    save: &SaveToken,
+    now_unix: i64,
+) -> RenewalStep {
+    take_in_finished_save(schedule, now_unix).await;
+
+    let Some(token) = lock_read(&state.auth_token).clone() else {
+        return RenewalStep::SignedOut;
+    };
+
+    // A renewed token the store refused: store it now. The old one may be
+    // revoked, and a restart would load it.
+    if schedule.unsaved.as_deref() == Some(token.as_str()) && schedule.may_save(now_unix) {
+        start_saving(schedule, save, &token);
+    }
+
+    let Some((current, exp)) =
+        token_renewal::claims(&token).and_then(|c| c.exp.map(|exp| (c, exp)))
+    else {
+        // Such a token is never renewed and signs out when it expires. Say so
+        // once, so the expiry has a trail.
+        if !schedule.warned_unreadable {
+            schedule.warned_unreadable = true;
+            log::warn!("token_renewal_unreadable: the held token has no readable exp");
+            sentry::capture_message("token_renewal_unreadable", Level::Warning);
+        }
+        return RenewalStep::Unreadable;
+    };
+    if !token_renewal::renewal_due(exp, now_unix, schedule.within_secs) {
+        return RenewalStep::NotDue;
+    }
+    if !schedule.may_try(now_unix) {
+        return RenewalStep::Waiting;
+    }
+
+    let days_left = exp.saturating_sub(now_unix) / 86_400;
+    let issued =
+        match token_renewal::request_renewal(client, &state.api_base_url, &token, &current).await {
+            Ok(issued) => {
+                schedule.record_answered(now_unix);
+                issued
+            }
+            Err(failure) => {
+                // The token stays. It works until its `exp`, and the cycle's 401
+                // handling signs the agent out if the server says otherwise. A
+                // request that never reached the server goes again next cycle;
+                // a refusal waits. No Sentry event: a device the server keeps
+                // refusing would send four a day. The log and the breadcrumb
+                // carry it.
+                if matches!(failure, token_renewal::Failure::Network(_)) {
+                    schedule.record_unanswered();
+                } else {
+                    schedule.record_answered(now_unix);
+                }
+                log::warn!("token_renewal_failed days_left={days_left} reason={failure}");
+                add_breadcrumb(
+                    "auth",
+                    &format!("token_renewal_failed: {failure}"),
+                    Level::Warning,
+                );
+                return RenewalStep::Failed(failure);
+            }
+        };
+    let new = issued.token;
+
+    // Take the new token only while the renewed one is still held. A sign-in
+    // or a sign-out that landed while the request was out is newer, and wins.
+    // The person is the same, so the tray keeps its name.
+    {
+        let mut held = lock_write(&state.auth_token);
+        if held.as_deref() != Some(token.as_str()) {
+            log::info!("token_renewal_superseded");
+            return RenewalStep::Superseded;
+        }
+        *held = Some(new.clone());
+    }
+    log::info!("token_renewed days_left={days_left}");
+    add_breadcrumb("auth", "token_renewed", Level::Info);
+    sentry::capture_message("token_renewed", Level::Info);
+    // Taken all the same: the server may have revoked the old token already.
+    if !issued.anomalies.is_empty() {
+        let what = issued.anomalies.join("; ");
+        log::warn!("token_renewal_anomaly: {what}");
+        sentry::capture_message(&format!("token_renewal_anomaly: {what}"), Level::Warning);
+    }
+
+    // One save at a time. With one still running (stuck on a prompt), the new
+    // token waits as unsaved and is saved as soon as that one is taken in.
+    schedule.unsaved = Some(new.clone());
+    schedule.next_save_at = None;
+    if schedule.pending_save.is_none() {
+        start_saving(schedule, save, &new);
+    }
+    RenewalStep::Renewed
+}
+
+/// Save a token beside the collection loop, not in it. A keychain that waits
+/// on an unlock prompt would otherwise stop collection until somebody answers.
+/// A later tick takes in the result (`take_in_finished_save`).
+fn start_saving(schedule: &mut token_renewal::Schedule, save: &SaveToken, token: &str) {
+    let save = save.clone();
+    let token = token.to_string();
+    schedule.pending_save = Some(tauri::async_runtime::spawn(async move {
+        let owned = token.clone();
+        let outcome = off_the_workers(move || save(&owned)).await;
+        token_renewal::SaveResult { token, outcome }
+    }));
+}
+
+/// Take in a save that has finished. A refused save keeps the token in
+/// `schedule.unsaved` and is tried again `retry_after_secs` later, so a person
+/// who clicked Deny on a keychain prompt is not asked every cycle. It is
+/// reported once per token, not once per try.
+async fn take_in_finished_save(schedule: &mut token_renewal::Schedule, now_unix: i64) {
+    let finished = schedule
+        .pending_save
+        .as_ref()
+        .is_some_and(|save| save.inner().is_finished());
+    if !finished {
+        return;
+    }
+    let Some(save) = schedule.pending_save.take() else {
+        return;
+    };
+    let result = match save.await {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!("keychain: renewed token save task failed: {}", e);
+            return;
+        }
+    };
+    // A save of a token the agent has since moved on from settles nothing.
+    if schedule.unsaved.as_deref() != Some(result.token.as_str()) {
+        return;
+    }
+    match result.outcome {
+        Ok(_) => {
+            report_token_save(&result.outcome, false);
+            schedule.unsaved = None;
+            schedule.next_save_at = None;
+        }
+        Err(ref e) => {
+            if schedule.next_save_at.is_none() {
+                report_token_save(&result.outcome, false);
+                schedule.save_failures_reported += 1;
+            } else {
+                log::warn!("keychain: renewed token save failed again: {}", e);
+            }
+            schedule.record_refused_save(now_unix);
+        }
+    }
+}
+
 fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         // The config GET and data POST are small: give the whole request a
@@ -3718,6 +3922,17 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
         let mut interval = tokio::time::interval(base);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut retry = SignedOutRetry::new(base);
+        let mut renewal = token_renewal::Schedule::new(
+            env_seconds(
+                "KLAAYGUARD_TOKEN_RENEW_WITHIN_SECONDS",
+                token_renewal::RENEW_WITHIN_SECS,
+            ),
+            env_seconds(
+                "KLAAYGUARD_TOKEN_RENEW_RETRY_SECONDS",
+                token_renewal::RETRY_AFTER_SECS,
+            ),
+        );
+        let save_token: SaveToken = Arc::new(keychain::save_token);
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -3725,6 +3940,17 @@ fn spawn_background_loop(app: tauri::AppHandle, state: Arc<AppState>) {
                     interval.reset();
                 }
             }
+            // Before the cycle, never beside it: a renewal revokes the token it
+            // replaces, and a cycle still sending that token would read the 401
+            // as a sign-out.
+            renew_token_if_due(
+                &state,
+                &client,
+                &mut renewal,
+                &save_token,
+                chrono::Utc::now().timestamp(),
+            )
+            .await;
             if let Err(e) = collection_tick(
                 &app,
                 &state,
@@ -3951,6 +4177,19 @@ struct ReleaseAsset {
 struct SelectedUpdate {
     asset_id: String,
     sha256: Option<String>,
+}
+
+/// What one update check found.
+enum UpdateCheck {
+    /// A newer build the agent can install itself.
+    Install(SelectedUpdate),
+    /// Nothing for the agent to do: up to date, or no build for this system.
+    Nothing,
+    /// A newer release exists, but this is a .deb/.rpm install, which the
+    /// package manager updates, not the agent (PROD-7007). Linux only; the
+    /// caller's match arm stays on every platform, so allow it unbuilt there.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    PackageManaged { available: String },
 }
 
 /// Pick the AppImage asset for this architecture. `original_name` is the
@@ -4579,7 +4818,7 @@ fn spawn_tray_clock(app: tauri::AppHandle, state: Arc<AppState>) {
     });
 }
 
-async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpdate>, String> {
+async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, String> {
     let current_version = env!("CARGO_PKG_VERSION");
     log::info!(
         "🔍 Starting update check - current version: {}",
@@ -4677,10 +4916,9 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
             // The file to replace on self-update is our own AppImage; deb and
             // rpm installs update through the package manager.
             if own_appimage().is_none() {
-                log::info!(
-                    "ℹ️  Auto-update on Linux serves AppImage installs only; this is not one"
-                );
-                return Ok(None);
+                return Ok(UpdateCheck::PackageManaged {
+                    available: release.version.clone(),
+                });
             }
             return match select_appimage_asset(&release.assets, std::env::consts::ARCH) {
                 Some(asset) => {
@@ -4689,7 +4927,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                         asset.original_name.as_deref().unwrap_or(&asset.name),
                         asset.id
                     );
-                    Ok(Some(SelectedUpdate {
+                    Ok(UpdateCheck::Install(SelectedUpdate {
                         asset_id: asset.id.to_string(),
                         sha256: asset.sha256.clone(),
                     }))
@@ -4699,7 +4937,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                         "⚠️  No Linux {} AppImage asset in the release",
                         std::env::consts::ARCH
                     );
-                    Ok(None)
+                    Ok(UpdateCheck::Nothing)
                 }
             };
         }
@@ -4713,7 +4951,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                     "ℹ️  Auto-update on Windows has no artifact tag for this architecture ({})",
                     std::env::consts::ARCH
                 );
-                return Ok(None);
+                return Ok(UpdateCheck::Nothing);
             };
             return match select_windows_installer_asset(&release.assets, arch_tag) {
                 Some(asset) => {
@@ -4723,14 +4961,14 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                         asset.original_name.as_deref().unwrap_or(&asset.name),
                         asset.id
                     );
-                    Ok(Some(SelectedUpdate {
+                    Ok(UpdateCheck::Install(SelectedUpdate {
                         asset_id: asset.id.to_string(),
                         sha256: asset.sha256.clone(),
                     }))
                 }
                 None => {
                     log::warn!("⚠️  No Windows {} installer asset in the release", arch_tag);
-                    Ok(None)
+                    Ok(UpdateCheck::Nothing)
                 }
             };
         }
@@ -4745,7 +4983,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 "ℹ️  Auto-update has no macOS artifact for this architecture ({})",
                 std::env::consts::ARCH
             );
-            return Ok(None);
+            return Ok(UpdateCheck::Nothing);
         };
 
         #[cfg(target_os = "macos")]
@@ -4764,7 +5002,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
                 current_version,
                 release.version
             );
-            return Ok(Some(SelectedUpdate {
+            return Ok(UpdateCheck::Install(SelectedUpdate {
                 asset_id: update_asset.id.to_string(),
                 sha256: update_asset.sha256.clone(),
             }));
@@ -4787,7 +5025,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<Option<SelectedUpd
         );
     }
 
-    Ok(None)
+    Ok(UpdateCheck::Nothing)
 }
 
 #[allow(clippy::needless_return)] // the cfg-gated platform blocks need explicit returns
@@ -5595,7 +5833,7 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
         }
     }
     match check_for_updates_internal(api_base).await {
-        Ok(Some(update)) => {
+        Ok(UpdateCheck::Install(update)) => {
             log::info!("🔄 Update available, starting download and install process...");
             if let Err(e) = download_and_install_update_internal(
                 api_base,
@@ -5609,7 +5847,16 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
                 report_update_failure_once(&e);
             }
         }
-        Ok(None) => log::info!("✅ No updates available - app is up to date"),
+        Ok(UpdateCheck::Nothing) => log::info!("✅ No updates available - app is up to date"),
+        // Before PROD-7007 a package install logged "not an AppImage" and then
+        // "up to date", so one 15 releases behind read as current in its own
+        // log. Name the waiting version, and only what is true on every package
+        // install: whether this machine is on pkg.klaay.com depends on the
+        // build and on /etc/klaay/no-repo, so do not promise it.
+        Ok(UpdateCheck::PackageManaged { available }) => log::info!(
+            "📦 {} is available. This is a .deb/.rpm install: the package manager updates it, not the agent",
+            available
+        ),
         Err(e) => log::warn!("update check failed: {}", e),
     }
 }
@@ -6532,45 +6779,18 @@ mod session_label_tests {
 #[cfg(test)]
 mod identity_fetch_tests {
     use super::session_label_tests::state_at;
+    use super::test_api::{api, api_that_is_down, nothing};
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     pub(super) const ALICE: &str = r#"{"data":{"type":"me","id":"1","attributes":{
         "first_name":"Alice","last_name":"Andersen","email":"alice@example.com"}}}"#;
 
-    /// A loopback API that answers its first request with `status` and `body`,
-    /// then closes. Returns the base URL to point the agent at.
+    /// A loopback API that answers with `status` and `body`. Returns the base
+    /// URL to point the agent at.
     async fn api_that_replies(status: u16, body: &'static str) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        api(format!("{status} Reply"), body.to_string(), nothing())
             .await
-            .expect("bind loopback");
-        let base = format!("http://{}", listener.local_addr().expect("local addr"));
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut request = [0u8; 4096];
-            let received = socket.read(&mut request).await.expect("read request");
-            assert!(received > 0, "an empty request");
-            let reply = format!(
-                "HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(reply.as_bytes())
-                .await
-                .expect("write reply");
-            socket.shutdown().await.expect("close");
-        });
-        base
-    }
-
-    /// A base URL nothing listens on: the port was bound, read, and released.
-    async fn api_that_is_down() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        format!("http://{}", listener.local_addr().expect("local addr"))
+            .0
     }
 
     #[tokio::test]
@@ -6686,9 +6906,8 @@ mod identity_fetch_tests {
 mod session_end_tests {
     use super::identity_fetch_tests::{label_once_written, ALICE};
     use super::session_label_tests::state_at;
+    use super::test_api::{api_with, Received};
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     /// A base URL for a state that makes no request of its own.
     const NO_API: &str = "http://127.0.0.1:0";
@@ -6728,32 +6947,16 @@ mod session_end_tests {
     /// A loopback API that answers every request by path until the test ends:
     /// an empty collection config, and a `/me` that names Alice.
     async fn api_that_answers_by_path() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let base = format!("http://{}", listener.local_addr().expect("local addr"));
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut request = [0u8; 4096];
-                    let received = socket.read(&mut request).await.unwrap_or(0);
-                    let head = String::from_utf8_lossy(&request[..received]).into_owned();
-                    let body = if head.contains("GET /me ") {
-                        ALICE
-                    } else {
-                        "{}"
-                    };
-                    let reply = format!(
-                        "HTTP/1.1 200 Reply\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = socket.write_all(reply.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        base
+        api_with(Arc::new(|request: &Received| {
+            let body = if request.request_line.starts_with("GET /me ") {
+                ALICE
+            } else {
+                "{}"
+            };
+            ("200 Reply".to_string(), body.to_string())
+        }))
+        .await
+        .0
     }
 
     // The heal for a `/me` blip at sign-in. The config reply proves the token
@@ -6787,48 +6990,16 @@ mod session_end_tests {
 #[cfg(test)]
 mod signed_out_retry_tests {
     use super::session_label_tests::state_at;
+    use super::test_api::{api, nothing, Seen};
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
     const BASE: Duration = Duration::from_secs(900);
     const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
-    /// The `Authorization` header of each request the API has received.
-    type Seen = Arc<std::sync::Mutex<Vec<String>>>;
-
-    /// A loopback API that answers every request with `status` and records the
-    /// `Authorization` header it carried.
+    /// A loopback API that answers every request with `status` and records
+    /// what it received.
     async fn api_answering(status: &'static str) -> (String, Seen) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let base = format!("http://{}", listener.local_addr().expect("local addr"));
-        let seen: Seen = Arc::default();
-        let recorded = seen.clone();
-        tokio::spawn(async move {
-            while let Ok((mut socket, _)) = listener.accept().await {
-                let recorded = recorded.clone();
-                tokio::spawn(async move {
-                    let mut request = [0u8; 4096];
-                    let received = socket.read(&mut request).await.unwrap_or(0);
-                    let head = String::from_utf8_lossy(&request[..received]).into_owned();
-                    let header = head
-                        .lines()
-                        .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
-                        .unwrap_or("")
-                        .to_string();
-                    recorded.lock().unwrap().push(header);
-                    let reply = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
-                         Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
-                    );
-                    let _ = socket.write_all(reply.as_bytes()).await;
-                    let _ = socket.shutdown().await;
-                });
-            }
-        });
-        (base, seen)
+        api(status, "{}".to_string(), nothing()).await
     }
 
     fn requests(seen: &Seen) -> usize {
@@ -6931,7 +7102,9 @@ mod signed_out_retry_tests {
         .expect("a tick");
 
         assert_eq!(requests(&seen), 1);
-        assert!(seen.lock().unwrap()[0].contains("stale-token"));
+        assert!(seen.lock().unwrap()[0]
+            .authorization
+            .contains("stale-token"));
         // The server said 401 again: signed out, and the wait doubles.
         assert_eq!(*lock_read(&state.auth_token), None);
         assert_eq!(retry.attempts, 2);
@@ -9465,5 +9638,470 @@ mod pkg_update_tests {
         );
         assert!(expand_pkg_app(&pkg, &dir.join("expanded")).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// A device token lasts three months. These tests hold the renewal rules: renew
+// inside the last 14 days, hold and store the new token, and never drop a
+// token the server still accepts because a renewal failed.
+#[cfg(test)]
+mod token_renewal_tests {
+    use super::session_label_tests::state_at;
+    use super::test_api::{api, api_that_is_down, nothing, Seen};
+    use super::token_renewal::tests::{issued, jwt};
+    use super::token_renewal::{Failure, Schedule};
+    use super::*;
+    use std::sync::Mutex;
+
+    const DAY: i64 = 24 * 60 * 60;
+    const NOW: i64 = 1_795_000_000;
+    const RETRY: i64 = 6 * 60 * 60;
+    const CYCLE: i64 = 15 * 60;
+
+    type Saved = Arc<Mutex<Vec<String>>>;
+
+    fn client() -> reqwest::Client {
+        http_client(Some(Duration::from_secs(10)))
+    }
+
+    fn schedule() -> Schedule {
+        Schedule::new(token_renewal::RENEW_WITHIN_SECS, RETRY as u64)
+    }
+
+    /// A credential store that records each token it is given.
+    fn store() -> (SaveToken, Saved) {
+        let saved: Saved = Arc::default();
+        let recorded = saved.clone();
+        let save: SaveToken = Arc::new(move |t: &str| {
+            recorded.lock().unwrap().push(t.to_string());
+            Ok(keychain::CredentialStore::Keyring)
+        });
+        (save, saved)
+    }
+
+    /// A credential store that refuses every write, and counts the tries.
+    fn refusing_store() -> (SaveToken, Arc<Mutex<u32>>) {
+        let tries: Arc<Mutex<u32>> = Arc::default();
+        let counted = tries.clone();
+        let save: SaveToken = Arc::new(move |_: &str| {
+            *counted.lock().unwrap() += 1;
+            Err("the keychain is locked".to_string())
+        });
+        (save, tries)
+    }
+
+    fn expiring_in(days: i64) -> String {
+        jwt(
+            json!({ "user_id": 7, "account_id": 42, "client": "klaayguard", "exp": NOW + days * DAY }),
+        )
+    }
+
+    fn renewed() -> String {
+        jwt(
+            json!({ "user_id": 7, "account_id": 42, "client": "klaayguard", "exp": NOW + 92 * DAY }),
+        )
+    }
+
+    fn signed_in(base: &str, token: &str) -> Arc<AppState> {
+        let state = state_at(base);
+        state.adopt_session(token.to_string(), Some("Alice".into()));
+        state
+    }
+
+    fn held(state: &Arc<AppState>) -> Option<String> {
+        lock_read(&state.auth_token).clone()
+    }
+
+    fn requests(seen: &Seen) -> usize {
+        seen.lock().unwrap().len()
+    }
+
+    fn saved(saved: &Saved) -> Vec<String> {
+        saved.lock().unwrap().clone()
+    }
+
+    /// Wait for a background save to finish, then take it in through the same
+    /// call the next tick makes.
+    async fn settle(schedule: &mut Schedule, now_unix: i64) {
+        // A save that never finishes fails the test rather than hanging it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while schedule
+            .pending_save
+            .as_ref()
+            .is_some_and(|save| !save.inner().is_finished())
+        {
+            assert!(Instant::now() < deadline, "the save never finished");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        take_in_finished_save(schedule, now_unix).await;
+        assert!(schedule.pending_save.is_none(), "the save was taken in");
+    }
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+    type Slot = Arc<Mutex<Option<Arc<AppState>>>>;
+
+    /// A hook that acts on a state the test fills in once it exists.
+    fn on_state(act: fn(&Arc<AppState>)) -> (Hook, Slot) {
+        let slot: Slot = Arc::default();
+        let held = slot.clone();
+        let hook: Hook = Arc::new(move || {
+            if let Some(state) = held.lock().unwrap().as_ref() {
+                act(state);
+            }
+        });
+        (hook, slot)
+    }
+
+    #[tokio::test]
+    async fn a_token_with_weeks_left_is_left_alone() {
+        let (base, seen) = api("201 Created", issued(&renewed()), nothing()).await;
+        let old = expiring_in(30);
+        let state = signed_in(&base, &old);
+        let (save, stored) = store();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule(), &save, NOW).await;
+
+        assert_eq!(step, RenewalStep::NotDue);
+        assert_eq!(requests(&seen), 0);
+        assert_eq!(held(&state), Some(old));
+        assert!(saved(&stored).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_due_token_is_replaced_held_and_stored() {
+        let new = renewed();
+        let (base, seen) = api("201 Created", issued(&new), nothing()).await;
+        let old = expiring_in(13);
+        let state = signed_in(&base, &old);
+        let (save, stored) = store();
+        let mut schedule = schedule();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+        settle(&mut schedule, NOW).await;
+
+        assert_eq!(step, RenewalStep::Renewed);
+        assert_eq!(requests(&seen), 1);
+        assert_eq!(
+            seen.lock().unwrap()[0].authorization,
+            format!("authorization: Bearer {old}")
+        );
+        assert_eq!(held(&state), Some(new.clone()));
+        assert_eq!(saved(&stored), vec![new]);
+        assert_eq!(schedule.unsaved, None);
+        // Same person, same session: the tray keeps its name.
+        assert_eq!(lock_read(&state.user_label).as_deref(), Some("Alice"));
+    }
+
+    // The server revokes the old token when it renews, so a 201 whose token
+    // the agent cannot read must still be taken: dropping it would leave only
+    // a revoked token, and the next cycle would sign out.
+    #[tokio::test]
+    async fn a_201_with_a_token_the_agent_cannot_read_is_still_taken() {
+        let (base, _) = api("201 Created", issued("opaque-token"), nothing()).await;
+        let state = signed_in(&base, &expiring_in(3));
+        let (save, stored) = store();
+        let mut schedule = schedule();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+        settle(&mut schedule, NOW).await;
+
+        assert_eq!(step, RenewalStep::Renewed);
+        assert_eq!(held(&state).as_deref(), Some("opaque-token"));
+        assert_eq!(saved(&stored), vec!["opaque-token".to_string()]);
+    }
+
+    // The SSO accounts answer 403 `sso_required` until kiln exempts their
+    // tokens. The token still works for weeks; the agent keeps it and asks
+    // again later, not on every cycle.
+    #[tokio::test]
+    async fn a_403_keeps_the_token_and_asks_again_six_hours_later() {
+        let (base, seen) = api("403 Forbidden", r#"{"errors":[]}"#.into(), nothing()).await;
+        let old = expiring_in(10);
+        let state = signed_in(&base, &old);
+        let (save, stored) = store();
+        let mut schedule = schedule();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+        assert_eq!(step, RenewalStep::Failed(Failure::Status(403)));
+        assert_eq!(held(&state), Some(old.clone()));
+        assert_eq!(lock_read(&state.user_label).as_deref(), Some("Alice"));
+        assert!(saved(&stored).is_empty());
+
+        // The next 15-minute cycle sends nothing.
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + CYCLE).await;
+        assert_eq!(step, RenewalStep::Waiting);
+        assert_eq!(requests(&seen), 1);
+
+        // Six hours of wall clock on, asleep or not, it asks again.
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + RETRY).await;
+        assert_eq!(step, RenewalStep::Failed(Failure::Status(403)));
+        assert_eq!(requests(&seen), 2);
+        assert_eq!(held(&state), Some(old));
+    }
+
+    // Only the cycle signs the agent out. A 401 on renewal alone says the
+    // server would not renew; the cycle finds out whether the token still works.
+    #[tokio::test]
+    async fn a_401_keeps_the_token() {
+        let (base, _) = api("401 Unauthorized", "{}".into(), nothing()).await;
+        let old = expiring_in(5);
+        let state = signed_in(&base, &old);
+        let (save, _) = store();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule(), &save, NOW).await;
+
+        assert_eq!(step, RenewalStep::Failed(Failure::Status(401)));
+        assert_eq!(held(&state), Some(old));
+    }
+
+    // A laptop that wakes before its network is up gets a network error. That
+    // must not cost it six hours: the next cycle asks again.
+    #[tokio::test]
+    async fn an_unreachable_server_keeps_the_token_and_asks_again_next_cycle() {
+        let old = expiring_in(5);
+        let state = signed_in(&api_that_is_down().await, &old);
+        let (save, _) = store();
+        let mut schedule = schedule();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+        assert!(
+            matches!(step, RenewalStep::Failed(Failure::Network(_))),
+            "{step:?}"
+        );
+        assert_eq!(held(&state), Some(old));
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + CYCLE).await;
+        assert!(
+            matches!(step, RenewalStep::Failed(Failure::Network(_))),
+            "the next cycle asks again: {step:?}"
+        );
+    }
+
+    // A person who signs in again while the renewal is out holds a newer
+    // session. The renewed token must not overwrite it, in memory or in store.
+    #[tokio::test]
+    async fn a_sign_in_during_the_request_wins() {
+        let (hook, slot) = on_state(|state| {
+            state.adopt_session("fresh-sign-in".into(), Some("Bob".into()));
+        });
+        let (base, _) = api("201 Created", issued(&renewed()), hook).await;
+        let state = signed_in(&base, &expiring_in(3));
+        *slot.lock().unwrap() = Some(state.clone());
+        let (save, stored) = store();
+        let mut schedule = schedule();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+
+        assert_eq!(step, RenewalStep::Superseded);
+        assert_eq!(held(&state).as_deref(), Some("fresh-sign-in"));
+        assert_eq!(lock_read(&state.user_label).as_deref(), Some("Bob"));
+        assert!(schedule.pending_save.is_none());
+        assert!(saved(&stored).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sign_out_during_the_request_wins() {
+        let (hook, slot) = on_state(|state| state.clear_session());
+        let (base, _) = api("201 Created", issued(&renewed()), hook).await;
+        let state = signed_in(&base, &expiring_in(3));
+        *slot.lock().unwrap() = Some(state.clone());
+        let (save, stored) = store();
+        let mut schedule = schedule();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+
+        assert_eq!(step, RenewalStep::Superseded);
+        assert_eq!(held(&state), None);
+        assert!(schedule.pending_save.is_none());
+        assert!(saved(&stored).is_empty());
+    }
+
+    // A keychain that waits on an unlock prompt must not stop collection: the
+    // save runs beside the loop, and the renewal returns while it waits.
+    #[tokio::test]
+    async fn a_save_stuck_on_a_prompt_does_not_hold_up_the_loop() {
+        let new = renewed();
+        let (base, _) = api("201 Created", issued(&new), nothing()).await;
+        let state = signed_in(&base, &expiring_in(3));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let stored: Saved = Arc::default();
+        let recorded = stored.clone();
+        let save: SaveToken = Arc::new(move |t: &str| {
+            // The unlock prompt: wait until somebody answers it.
+            let _ = released.lock().unwrap().recv();
+            recorded.lock().unwrap().push(t.to_string());
+            Ok(keychain::CredentialStore::Keyring)
+        });
+        let mut schedule = schedule();
+
+        let step = tokio::time::timeout(
+            Duration::from_secs(5),
+            renew_token_if_due(&state, &client(), &mut schedule, &save, NOW),
+        )
+        .await
+        .expect("the renewal returns while the save waits");
+
+        assert_eq!(step, RenewalStep::Renewed);
+        assert_eq!(held(&state), Some(new.clone()));
+        assert!(saved(&stored).is_empty(), "the save is still waiting");
+
+        // The next cycle does not start a second save beside the stuck one.
+        renew_token_if_due(&state, &client(), &mut schedule, &save, NOW + CYCLE).await;
+        assert!(schedule.pending_save.is_some());
+
+        release.send(()).unwrap();
+        settle(&mut schedule, NOW + CYCLE).await;
+        assert_eq!(saved(&stored), vec![new]);
+        assert_eq!(schedule.unsaved, None);
+    }
+
+    // The server has revoked the old token by the time the save runs, so a
+    // store that refuses the new one must not cost the session. The agent
+    // keeps using the new token and tries the save again later, without
+    // asking the server again.
+    #[tokio::test]
+    async fn a_refused_save_keeps_the_new_token_and_saves_it_later() {
+        let new = renewed();
+        let (base, seen) = api("201 Created", issued(&new), nothing()).await;
+        let state = signed_in(&base, &expiring_in(3));
+        let mut schedule = schedule();
+        let (refusing, _) = refusing_store();
+
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &refusing, NOW).await;
+        settle(&mut schedule, NOW).await;
+        assert_eq!(step, RenewalStep::Renewed);
+        assert_eq!(held(&state), Some(new.clone()));
+        assert_eq!(schedule.unsaved, Some(new.clone()));
+
+        let (save, stored) = store();
+        let later = NOW + RETRY;
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, later).await;
+        settle(&mut schedule, later).await;
+        assert_eq!(step, RenewalStep::NotDue);
+        assert_eq!(saved(&stored), vec![new]);
+        assert_eq!(schedule.unsaved, None);
+        assert_eq!(requests(&seen), 1);
+    }
+
+    // A person who clicks Deny on the keychain prompt is not asked again every
+    // cycle, and Sentry hears about it once, not on every try.
+    #[tokio::test]
+    async fn a_refused_save_is_tried_every_six_hours_and_reported_once() {
+        let new = renewed();
+        let (base, _) = api("201 Created", issued(&new), nothing()).await;
+        let state = signed_in(&base, &expiring_in(3));
+        let mut schedule = schedule();
+        let (refusing, tries) = refusing_store();
+
+        renew_token_if_due(&state, &client(), &mut schedule, &refusing, NOW).await;
+        settle(&mut schedule, NOW).await;
+        // A day of 15-minute cycles.
+        for cycle in 1..=96 {
+            let now = NOW + cycle * CYCLE;
+            renew_token_if_due(&state, &client(), &mut schedule, &refusing, now).await;
+            settle(&mut schedule, now).await;
+        }
+
+        // The first try, then one every six hours.
+        assert_eq!(*tries.lock().unwrap(), 5);
+        assert_eq!(schedule.save_failures_reported, 1);
+        assert_eq!(schedule.unsaved, Some(new));
+    }
+
+    #[tokio::test]
+    async fn no_token_or_an_unreadable_one_sends_nothing() {
+        let (base, seen) = api("201 Created", issued(&renewed()), nothing()).await;
+        let (save, _) = store();
+
+        let state = state_at(&base);
+        let step = renew_token_if_due(&state, &client(), &mut schedule(), &save, NOW).await;
+        assert_eq!(step, RenewalStep::SignedOut);
+
+        let state = signed_in(&base, "opaque-token");
+        let mut schedule = schedule();
+        let step = renew_token_if_due(&state, &client(), &mut schedule, &save, NOW).await;
+        assert_eq!(step, RenewalStep::Unreadable);
+        assert!(schedule.warned_unreadable, "reported once");
+        assert_eq!(held(&state).as_deref(), Some("opaque-token"));
+
+        assert_eq!(requests(&seen), 0);
+    }
+
+    /// The renewal against a real kiln, through the code the agent runs.
+    ///
+    /// `KLAAYGUARD_E2E_TOKENS` names a JSON file of `{"case": "<token>"}`;
+    /// `KLAAYGUARD_E2E_API` defaults to staging. It refuses production. Each
+    /// token is treated as due (the clock is set a day before its `exp`), and
+    /// `GET /klaayguard/config` is asked with the old and the new token
+    /// afterwards. Tokens are never printed.
+    ///
+    /// cargo test --lib staging_renewal -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "needs KLAAYGUARD_E2E_TOKENS and a kiln to talk to"]
+    async fn staging_renewal() {
+        let api = std::env::var("KLAAYGUARD_E2E_API").unwrap_or("https://api.klaay.dev".into());
+        assert!(
+            !keychain::is_production_target(&api),
+            "refusing to renew against production: {api}"
+        );
+        let path = std::env::var("KLAAYGUARD_E2E_TOKENS").expect("KLAAYGUARD_E2E_TOKENS");
+        let tokens: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("tokens file"))
+                .expect("tokens JSON");
+
+        let payload = |t: &str| token_renewal::payload(t).unwrap_or(Value::Null);
+        // `/me` answers 200 for some tokens the data endpoints refuse. The
+        // agent signs out on `GET /klaayguard/config`, so ask that instead.
+        let config_status = |token: String| {
+            let api = api.clone();
+            async move {
+                match client()
+                    .get(format!("{api}/klaayguard/config"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                {
+                    Ok(r) => r.status().as_u16().to_string(),
+                    Err(_) => "network error".to_string(),
+                }
+            }
+        };
+
+        for (case, old) in tokens {
+            let state = signed_in(&api, &old);
+            let (save, stored) = store();
+            let exp = token_renewal::claims(&old)
+                .and_then(|c| c.exp)
+                .expect("exp");
+            let mut schedule = schedule();
+            let step = renew_token_if_due(&state, &client(), &mut schedule, &save, exp - DAY).await;
+            settle(&mut schedule, exp - DAY).await;
+            let new = held(&state).unwrap_or_default();
+            let renewed = new != old;
+            let (o, n) = (payload(&old), payload(&new));
+            let stored = saved(&stored).len();
+            let config_old = config_status(old.clone()).await;
+            let config_new = if renewed {
+                config_status(new.clone()).await
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "{case}: step={step:?} stored={} | old account_id={} accounts={} \
+                 | new account_id={} accounts={} client={} exp_days={} jti_changed={} \
+                 | GET /klaayguard/config old={} new={}",
+                stored,
+                o["account_id"],
+                o["accounts"],
+                n["account_id"],
+                n["accounts"],
+                n["client"],
+                (n["exp"].as_i64().unwrap_or(0) - chrono::Utc::now().timestamp()) / DAY,
+                o["jti"] != n["jti"],
+                config_old,
+                config_new,
+            );
+        }
     }
 }
