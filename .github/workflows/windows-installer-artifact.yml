@@ -342,7 +342,7 @@ jobs:
 
       - name: Install Tauri system dependencies
         timeout-minutes: 15
-        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
       - name: Fetch osquery sidecar
         env:
@@ -364,7 +364,13 @@ jobs:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
           VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
           VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
-        run: cargo tauri build --bundles deb rpm appimage
+        # As in release-linux.yml: only production carries the package
+        # repository, so a test install of this artifact behaves like the
+        # release it stands in for (PROD-7007).
+        run: |
+          extra=()
+          [ "${{ matrix.build }}" = production ] && extra=(--config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json")
+          cargo tauri build --bundles deb rpm appimage "${extra[@]}"
 
       - name: Validate and collect
         shell: bash
@@ -375,7 +381,11 @@ jobs:
           APPIMAGE=$(find "$BASE_DIR/appimage" -type f -name "*.AppImage" | head -n1); test -n "$APPIMAGE"
           DEB=$(find "$BASE_DIR/deb" -type f -name "*.deb" | head -n1); test -n "$DEB"
           RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1); test -n "$RPM"
-          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          # Same rule as release-linux.yml: production carries the package
+          # repository and nothing else does, in both formats.
+          if [ "${{ matrix.build }}" = production ]; then expect=1; else expect=0; fi
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-deb.sh "$DEB"
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-rpm.sh "$RPM"
           mkdir -p out
           cp "$APPIMAGE" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.AppImage"
           cp "$DEB" "out/KlaayGuard_${V}_Linux_x86_64_${{ matrix.build }}.deb"
