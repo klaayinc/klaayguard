@@ -160,7 +160,11 @@ make_bundle_updatable() {
   [ -d "$app" ] || return 1
   /usr/bin/chgrp -hR admin "$app" || return 1
   /bin/chmod -R g+w "$app" || return 1
-  if [ -n "$user" ] && [ "$user" != "root" ] && [ "$user" != "loginwindow" ]; then
+  # Only an admin gets the bundle. A standard user cannot rename anything in
+  # /Applications (root:admin 775), so ownership would not let them update. It
+  # would only let them write the agent's files.
+  if [ -n "$user" ] && [ "$user" != "root" ] && [ "$user" != "loginwindow" ] \
+    && /usr/sbin/dseditgroup -o checkmember -m "$user" admin >/dev/null 2>&1; then
     /usr/sbin/chown -hR "$user" "$app" || return 1
   fi
 }
