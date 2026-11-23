@@ -7,7 +7,7 @@ on:
         description: "Release tag to use for uploads"
         value: ${{ jobs.prepare.outputs.tag }}
       version:
-        description: "Version read from VERSION file"
+        description: "Next version, one patch above the latest published release tag"
         value: ${{ jobs.prepare.outputs.version }}
 
 jobs:
@@ -27,18 +27,19 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           # Auto-bump: patch of the latest PUBLISHED release (non-draft/non-prerelease,
-          # which is what /releases/latest and the download endpoints serve). Falls back
-          # to the VERSION file if there is no published release yet. So every merge to
-          # main produces a new, higher version.
+          # which is what /releases/latest and the download endpoints serve). Starts
+          # from 0.0.0 if there is no published release yet. So every merge to
+          # main produces a new, higher version. The release tag is the only source
+          # of the version; no file in the tree holds a copy.
           LATEST_TAG=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
           BASE="${LATEST_TAG##*v}"           # handles both v1.2.3 and app-v1.2.3
-          if [ -z "$BASE" ]; then BASE=$(cat VERSION); fi
+          if [ -z "$BASE" ]; then BASE="0.0.0"; fi
           IFS=. read -r MAJOR MINOR PATCH <<< "$BASE"
           VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
           TAG="v${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "Next version ${VERSION} (tag ${TAG}) — bumped from ${LATEST_TAG:-VERSION file}"
+          echo "Next version ${VERSION} (tag ${TAG}) — bumped from ${LATEST_TAG:-no release}"
       - name: Create draft release if missing
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

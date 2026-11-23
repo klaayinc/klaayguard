@@ -39,6 +39,11 @@ sequenceDiagram
 
     %% Collection loop
     loop Every 15 minutes
+        opt Token has fewer than 14 days left
+            Agent->>API: POST /authenticate (Bearer token, upgrade mode)
+            API-->>Agent: new 3-month token
+            Agent->>Agent: Hold and store the new token
+        end
         Agent->>API: GET /klaayguard/config (Bearer token)
         API-->>Agent: Query set (id + optional SQL)
         Agent->>Osquery: Run each read-only query (--json)
@@ -55,8 +60,25 @@ Key properties:
 - **No local database.** Rows go directly from osquery to the POST. Nothing
   is buffered on disk.
 - **Retries:** on `429`, `5xx`, or network errors the agent retries after
-  60 s, then 120 s. A `401`/`403` clears the in-memory token and prompts
-  sign-in instead.
+  60 s, then 120 s. A `401`/`403` clears the in-memory token and opens
+  sign-in instead. The agent then tries again with the stored token. The first
+  try comes one collection interval later. Each wait doubles, up to 24 hours.
+  Each `401`/`403` opens sign-in again. With no stored token, the agent sends
+  nothing and opens nothing.
+- **Token renewal:** a token lasts three months. Once fewer than 14 days are
+  left, the agent asks `POST /authenticate` for a new one before the next
+  cycle. It names the token's own account when the token names one, then
+  holds and stores the new token. It takes any token a `201` carries, because
+  the server may already have revoked the old one; anything odd about it goes to
+  the log and Sentry. A renewal that fails (network, `401`, `403`, `429`, `5xx`)
+  keeps the current token. After a network error the agent asks again next
+  cycle; after a refusal, 6 hours later by the wall clock, sleep included. Only
+  the collection cycle signs the agent out. One case the agent cannot tell from
+  a network error: the server renewed and revoked the old token, but its reply
+  never arrived. The next cycle then gets a `401` and opens sign-in. The new
+  token is saved beside the loop, so a keychain waiting on an unlock prompt does
+  not hold up collection. A save the keychain refuses is tried again 6 hours
+  later, not every cycle.
 - **osquery is bundled.** It ships as a Tauri sidecar named
   `klaayguard-osqueryi`, so it never collides with a system osquery install.
   The agent needs no admin rights to run.
@@ -158,7 +180,7 @@ job fails. Build one locally with:
 # after `cargo tauri build` has produced KlaayGuard.app
 INSTALLER_SIGNING_IDENTITY="Developer ID Installer: …" \
   src-tauri/scripts/build-macos-pkg.sh \
-  src-tauri/target/release/bundle/macos/KlaayGuard.app "$(cat VERSION)" KlaayGuard.pkg
+  src-tauri/target/release/bundle/macos/KlaayGuard.app 1.2.3 KlaayGuard.pkg
 ```
 
 ## Configuration
@@ -188,8 +210,10 @@ All variables are optional.
 | `VITE_FRONTEND_URL` | per environment | Klaay Frontend URL for sign-in and Employee Hub |
 | `VITE_SENTRY_DSN` | empty (Sentry off) | Sentry DSN; CI injects it for releases |
 | `KLAAYGUARD_COLLECTION_INTERVAL_SECONDS` | `900` | Collection loop interval |
-| `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS, Windows, Linux AppImage) |
+| `KLAAYGUARD_UPDATE_INTERVAL_SECONDS` | `21600` | Update check interval (macOS, Windows, Linux AppImage; `.deb` and `.rpm` update through the package repository) |
 | `KLAAYGUARD_FAILURE_FOCUS_DEBOUNCE_SECONDS` | `60` | Minimum gap between sign-in nudges |
+| `KLAAYGUARD_TOKEN_RENEW_WITHIN_SECONDS` | `1209600` | Renew the token once it has less than this left (14 days) |
+| `KLAAYGUARD_TOKEN_RENEW_RETRY_SECONDS` | `21600` | Least wall-clock time between two renewal requests the server answered |
 
 ### API endpoints
 
@@ -198,6 +222,7 @@ All variables are optional.
 | `POST /cli_auth_requests` | Register the loopback sign-in | none |
 | `POST /cli_auth_requests/claim` | Exchange the one-time code for a token | none |
 | `GET /me` | Validate the token and name the signed-in person | Bearer |
+| `POST /authenticate` | Renew the token in its last 14 days (upgrade mode) | Bearer |
 | `GET /klaayguard/config` | Fetch the query set | Bearer |
 | `POST /klaayguard/data` | Send collected rows | Bearer |
 | `GET /klaayguard/updates/latest` | Update manifest | none |
@@ -336,16 +361,62 @@ If any check fails, the running agent stays untouched. On success:
 - Windows runs the new installer with `/S /R`. The installer stops the old
   agent, installs over it, and starts the new one.
 
+### Linux `.deb` and `.rpm`
+
+The agent does not update a package install itself; the package manager does.
+The production `.deb` and `.rpm` add Klaay's package repository at install, so
+each new release arrives when the machine's user or admin updates it: `apt
+upgrade`, `dnf upgrade`, or the desktop software updater (Ubuntu's Software
+Updater, GNOME Software). On rpm the first update asks once to trust the Klaay
+key.
+
+Unattended updaters do not install it on their own. `unattended-upgrades`
+takes only the origins it is configured for, and `dnf-automatic` cannot answer
+the one-time key prompt (a package scriptlet cannot import the key itself: rpm
+holds its database lock for the whole transaction). Silent upgrades were left
+out of PROD-7007 on purpose.
+
+- Repository: `https://pkg.klaay.com` (GitHub Pages on this repository). apt:
+  `deb [arch=amd64 signed-by=/usr/share/keyrings/klaay.gpg] https://pkg.klaay.com/apt stable main`.
+  rpm: `https://pkg.klaay.com/rpm/` with `gpgcheck=1`, `repo_gpgcheck=1` and
+  `skip_if_unavailable=1`. apt fetches indexes by hash (`Acquire-By-Hash`), and
+  each deploy keeps the previous indexes, so a CDN-cached file never mismatches.
+- `linux/postinst.sh` (`register_package_repo`) writes the source and the key;
+  `linux/postrm.sh` removes them on uninstall. `/etc/klaay/no-repo` opts a
+  machine out.
+- Only the production build carries the repository files
+  (`linux/package-repo/`, added by `linux/package-repo.conf.json` in
+  `release-linux.yml`). Development and staging packages stay off the
+  repository, because the production build of the same package name would
+  replace them. One exception: rpm runs the new postinstall before it removes
+  the old files, so a staging rpm installed *over* a production one keeps the
+  registration (see `linux/postrm.sh` for why it is left).
+- After each `publish` run on `main`, `publish-package-repos.yml` checks
+  whether the latest release is on `pkg.klaay.com`; if not, it rebuilds both
+  repositories from the newest five published releases, signs them with the
+  package key and deploys them. The signing waits for a reviewer in the
+  `release` environment, which alone holds the key (besides 1Password). It is
+  its own run, not a job in `release.yml`, so the next push to `main` cannot
+  cancel it while it waits.
+- `src-tauri/scripts/test-package-repo.sh` proves install, upgrade, a
+  tampered index, uninstall and the opt-out on Ubuntu, Debian, Fedora and Rocky
+  Linux in containers; CI runs it on every pull request.
+- A `.deb` or `.rpm` installed before the repository existed (v0.1.72 and
+  earlier) never joins it on its own: install the current package once by hand.
+
 Updates never change the data-collection scope; the server config governs
 that.
 
 ## Version management and releases
 
 - CI computes the next version by bumping the patch of the latest published
-  release tag (`.github/workflows/_prepare-release.yml`). The `VERSION` file
-  is the baseline only when no release exists yet.
-- The release workflow writes the version into `src-tauri/tauri.conf.json`
-  and `src-tauri/Cargo.toml` before building.
+  release tag (`.github/workflows/_prepare-release.yml`). The release tag is
+  the only source of the version. The repository has no `VERSION` file, and
+  `src-tauri/tauri.conf.json` has no version.
+- The release workflow writes the version into `src-tauri/Cargo.toml` before
+  building. Tauri reads it from there. The checked-in value is the `0.0.0`
+  placeholder, so a build from the tree reports `0.0.0`.
+  `.github/scripts/test-single-version-source.sh` enforces this in CI.
 - Every push to `main` or `dev` builds all variants and uploads them to a
   draft release. On `main`, the draft is published and marked latest after
   all platform builds succeed. The update endpoint serves the latest release.

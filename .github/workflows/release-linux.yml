@@ -59,7 +59,8 @@ jobs:
 
       - name: (Ubuntu) install dependencies
         timeout-minutes: 15
-        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils
+        # rpm: validate-linux-rpm.sh reads the built rpm's files and scriptlets.
+        run: ./.github/scripts/apt-install.sh libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf ruby ruby-rake desktop-file-utils rpm
 
       - name: Setup osquery binaries (Linux)
         env:
@@ -77,7 +78,6 @@ jobs:
       - name: Set bundle version from release
         run: |
           V="${{ inputs.version }}"; V="${V#v}"
-          sed -i -E "s/\"version\": \"[^\"]*\"/\"version\": \"$V\"/" src-tauri/tauri.conf.json
           sed -i -E "s/^version = \"[^\"]*\"/version = \"$V\"/" src-tauri/Cargo.toml
 
       - name: Build Tauri (Linux x86_64)
@@ -86,8 +86,14 @@ jobs:
           VITE_API_BASE_URL: ${{ matrix.api_url }}
           VITE_FRONTEND_URL: ${{ matrix.frontend_url }}
           VITE_SENTRY_DSN: ${{ secrets.VITE_SENTRY_DSN }}
+        # Only the production build ships the package-repository files, so only
+        # it points apt and dnf at https://pkg.klaay.com. A staging or
+        # development package pointed there would be replaced by the production
+        # build of the same name on the next upgrade (PROD-7007).
         run: |
-          cargo tauri build --bundles deb rpm appimage
+          extra=()
+          [ "${{ matrix.build }}" = production ] && extra=(--config "$GITHUB_WORKSPACE/src-tauri/linux/package-repo.conf.json")
+          cargo tauri build --bundles deb rpm appimage "${extra[@]}"
 
       - name: Rename and upload artifacts (Linux x86_64)
         env:
@@ -116,7 +122,13 @@ jobs:
           RPM=$(find "$BASE_DIR/rpm" -type f -name "*.rpm" | head -n1)
           test -n "$RPM" || { echo "rpm missing" >&2; exit 1; }
 
-          ./.github/scripts/validate-linux-deb.sh "$DEB"
+          # Production must carry the package-repository files and every other
+          # build must not: the postinstall reads their absence as "take this
+          # machine off the repository". Both formats, because a production
+          # rpm without them would strand every rpm install.
+          if [ "${{ matrix.build }}" = production ]; then expect=1; else expect=0; fi
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-deb.sh "$DEB"
+          EXPECT_PACKAGE_REPO=$expect ./.github/scripts/validate-linux-rpm.sh "$RPM"
 
           RENAMED_APPIMAGE="KlaayGuard_${VERSION}_Linux_x86_64_${{ matrix.build }}.AppImage"
           cp "$APPIMAGE" "$RENAMED_APPIMAGE"

@@ -4,6 +4,7 @@
 set -euo pipefail
 
 DEB="$(realpath "$1")"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
@@ -139,6 +140,30 @@ if objdump -p data/usr/bin/KlaayGuard | grep -qE 'NEEDED.*(libssl|libcrypto)'; t
 else
   pass "no OpenSSL link"
 fi
+
+# Package repository (PROD-7007). The maintainer scripts always carry the
+# steps; only the production build carries the files they install, which is
+# what decides whether a machine joins https://pkg.klaay.com.
+# EXPECT_PACKAGE_REPO=1 for the production build, 0 for every other; unset
+# skips the file checks.
+grep -q register_package_repo control/postinst \
+  && pass "postinst registers the package repository" \
+  || fail "postinst has no register_package_repo step; .deb installs never update"
+grep -q remove_package_repo control/postrm \
+  && pass "postrm removes the package repository" \
+  || fail "postrm has no remove_package_repo step; an uninstall leaves Klaay's repository behind"
+
+REPO_FILES="data/usr/share/klaay-guard/package-repo"
+case "${EXPECT_PACKAGE_REPO:-}" in
+  1)
+    "$HERE/check-package-repo-files.sh" "$REPO_FILES" \
+      || fail "the production package-repository files are wrong (see above)"
+    ;;
+  0)
+    test -e "$REPO_FILES" && fail "a non-production build ships $REPO_FILES; it would join the production repository" \
+      || pass "non-production build ships no package repository"
+    ;;
+esac
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2

@@ -1,0 +1,16 @@
+# KlaayGuard updates. Written by the klaay-guard package and removed when it is
+# uninstalled. To keep this machine off the repository, create /etc/klaay/no-repo
+# and reinstall the package.
+#
+# skip_if_unavailable=1: if pkg.klaay.com is down or serves anything that fails
+# its signature, dnf skips this repository and carries on. RHEL and dnf5 default
+# to 0, which would make every dnf command on the machine fail, OS security
+# updates included, because of a KlaayGuard repository problem.
+[klaay]
+name=Klaay (KlaayGuard)
+baseurl=https://pkg.klaay.com/rpm/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+skip_if_unavailable=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-klaay
