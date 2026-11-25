@@ -12,7 +12,9 @@ Read this before you source or run `postinstall` or `preinstall`.
 script's own name. The last lines are `case "${0##*/}" in postinstall) main ;; esac`. A test
 sources the file to call one function, and `$0` then names the test.
 
-- In bash, `$0` stays `bash` when you source a file. The guard holds, and `main` does not run.
+- In bash, `$0` keeps the caller's name when you source a file: `bash` in `bash -c`, or the test
+  script's own name. The guard holds, and `main` does not run. Never name a caller `postinstall`
+  or `preinstall`.
 - In zsh, `$0` becomes the name of the sourced file. The guard fires, and `main` runs against the
   real machine. For `postinstall` this stops the installed agent and starts the install.
 - Both scripts start with `#!/bin/bash`. The `src-tauri/scripts/test-*.sh` files run under bash and are safe.
