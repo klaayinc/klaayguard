@@ -2816,13 +2816,162 @@ struct JsonApiPayload {
     jsonapi: Option<serde_json::Value>,
 }
 
+/// How much of a failed update's text one check-in carries. Kiln stores 500
+/// characters and drops a longer report whole.
+const UPDATE_ERROR_MAX_CHARS: usize = 500;
+
+/// How the agent's last update attempt ended. Kiln knows these four words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateResult {
+    Updated,
+    Failed,
+    Skipped,
+    NoUpdate,
+}
+
+impl UpdateResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Updated => "updated",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+            Self::NoUpdate => "no_update",
+        }
+    }
+}
+
+/// One finished update attempt. Only a failed or a skipped one has a text.
+struct UpdateRecord {
+    result: UpdateResult,
+    error: Option<String>,
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The agent's last update attempt, which every check-in carries.
+#[derive(Default)]
+struct UpdateStatus {
+    last: std::sync::Mutex<Option<UpdateRecord>>,
+}
+
+static UPDATE_STATUS: UpdateStatus = UpdateStatus {
+    last: std::sync::Mutex::new(None),
+};
+
+impl UpdateStatus {
+    fn record_failure(&self, text: &str, home: Option<&str>, at: chrono::DateTime<chrono::Utc>) {
+        self.record(UpdateResult::Failed, Some((text, home)), at);
+    }
+
+    fn record_skip(&self, reason: &str, home: Option<&str>, at: chrono::DateTime<chrono::Utc>) {
+        let text = format!("update check skipped: {}", reason);
+        self.record(UpdateResult::Skipped, Some((&text, home)), at);
+    }
+
+    fn record_updated(&self, at: chrono::DateTime<chrono::Utc>) {
+        self.record(UpdateResult::Updated, None, at);
+    }
+
+    /// The first check after an update finds nothing, often before the first
+    /// check-in, so it keeps an update that happened.
+    fn record_no_update(&self, at: chrono::DateTime<chrono::Utc>) {
+        let updated = matches!(self.lock().as_ref(), Some(r) if r.result == UpdateResult::Updated);
+        if !updated {
+            self.record(UpdateResult::NoUpdate, None, at);
+        }
+    }
+
+    fn record(
+        &self,
+        result: UpdateResult,
+        error: Option<(&str, Option<&str>)>,
+        at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let error = error.map(|(text, home)| {
+            redact_home(text, home)
+                .chars()
+                .take(UPDATE_ERROR_MAX_CHARS)
+                .collect()
+        });
+        *self.lock() = Some(UpdateRecord { result, error, at });
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<UpdateRecord>> {
+        self.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The file that holds the version of the last start. Each API target has its
+/// own, so a developer build never writes the installed agent's file.
+fn last_run_file_name(api_base_url: &str) -> String {
+    match keychain::target_suffix(api_base_url) {
+        None => "last-run-version".to_string(),
+        Some(suffix) => format!("last-run-version-{suffix}"),
+    }
+}
+
+/// An update restarts the agent, so only the next start can see that it
+/// happened. `last_run` holds the version of the last start.
+fn note_start(
+    status: &UpdateStatus,
+    last_run: &std::path::Path,
+    current: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    let version = |text: &str| semver::Version::parse(text.trim()).ok();
+    let earlier = std::fs::read_to_string(last_run).ok();
+    if matches!(
+        (earlier.as_deref().and_then(version), version(current)),
+        (Some(earlier), Some(current)) if current > earlier
+    ) {
+        status.record_updated(at);
+    }
+    let written = last_run
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(last_run, current));
+    if let Err(e) = written {
+        log::warn!("update: could not keep the last run version: {}", e);
+    }
+}
+
+/// `text` with the user's home folder written as `~`, because an error path can
+/// name the user. A home of `/` or an empty one would rewrite every path, so it
+/// changes nothing.
+fn redact_home(text: &str, home: Option<&str>) -> String {
+    match home
+        .map(|h| h.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+    {
+        Some(home) => text.replace(home, "~"),
+        None => text.to_string(),
+    }
+}
+
 /// The check-in `meta`: the device identity plus the agent version, so the
 /// backend can record which build sent each check-in.
 fn checkin_meta(device_uuid: &str) -> serde_json::Value {
-    json!({
+    checkin_meta_with(device_uuid, &UPDATE_STATUS)
+}
+
+/// The check-in `meta` with the last update attempt, when there is one, so the
+/// backend can show why a device stays on an old build.
+fn checkin_meta_with(device_uuid: &str, status: &UpdateStatus) -> serde_json::Value {
+    let mut meta = json!({
         "device_uuid": device_uuid,
         "app_version": env!("CARGO_PKG_VERSION"),
-    })
+    });
+    if let Some(record) = status.lock().as_ref() {
+        let at = record.at.to_rfc3339();
+        meta["update_result"] = json!(record.result.as_str());
+        meta["update_result_at"] = json!(at);
+        if let Some(text) = &record.error {
+            meta["update_error"] = json!(text);
+            meta["update_error_at"] = json!(at);
+        }
+    }
+    meta
 }
 
 /// Pull the hardware serial from osquery `system_info` rows. Do not fall back
@@ -3328,6 +3477,36 @@ async fn get_device_identity_internal<R: tauri::Runtime>(
     Ok(identity)
 }
 
+/// The config request names the platform and, once the agent has one, the
+/// device, so the backend can keep the version of an agent that sends no
+/// check-in. The User-Agent header already carries the version.
+fn config_request(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    device: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client
+        .get(format!("{}/klaayguard/config", base))
+        .bearer_auth(token)
+        .header("X-KlaayGuard-Platform", std::env::consts::OS);
+    match device
+        .filter(|d| !d.is_empty())
+        .and_then(|d| reqwest::header::HeaderValue::from_str(d).ok())
+    {
+        Some(device) => request.header("X-KlaayGuard-Device", device),
+        None => request,
+    }
+}
+
+/// The device identity the agent already holds. It asks osquery nothing: the
+/// first check-in of a new device has no identity yet.
+fn known_device_identity(state: &AppState) -> Option<String> {
+    lock_read(&state.device_identity)
+        .clone()
+        .or_else(|| keychain::load_device_identity().ok().flatten())
+}
+
 /// Send a request, retrying transient failures (network errors, 429, 5xx)
 /// with the fixed delay ladder. Returns the last response, or the network
 /// error once the ladder is exhausted. The builder must be cloneable (a bytes
@@ -3407,10 +3586,9 @@ async fn run_cycle<R: tauri::Runtime>(
 
     // 1) GET /klaayguard/config
     add_breadcrumb("collection", "config_fetch_start", Level::Info);
+    let device = known_device_identity(state);
     let cfg_resp = match send_with_retry(
-        client
-            .get(format!("{}/klaayguard/config", base))
-            .bearer_auth(&token),
+        config_request(client, base, &token, device.as_deref()),
         "config",
     )
     .await
@@ -4190,6 +4368,10 @@ enum UpdateCheck {
     /// caller's match arm stays on every platform, so allow it unbuilt there.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PackageManaged { available: String },
+    /// The agent will not or cannot install, for the reason it holds.
+    Skipped(String),
+    /// The update server gave no answer, so the check found nothing out.
+    Unreachable,
 }
 
 /// Pick the AppImage asset for this architecture. `original_name` is the
@@ -4835,11 +5017,14 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
     let response = client
         .get(format!("{}/klaayguard/updates/latest", api_base))
         .send()
-        .await
-        .map_err(|e| {
-            log::error!("❌ Failed to check for updates: {}", e);
-            format!("Failed to check for updates: {}", e)
-        })?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            log::warn!("❌ Failed to check for updates: {}", e);
+            return Ok(UpdateCheck::Unreachable);
+        }
+    };
 
     log::info!("📡 API response status: {}", response.status());
 
@@ -4932,13 +5117,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
                         sha256: asset.sha256.clone(),
                     }))
                 }
-                None => {
-                    log::warn!(
-                        "⚠️  No Linux {} AppImage asset in the release",
-                        std::env::consts::ARCH
-                    );
-                    Ok(UpdateCheck::Nothing)
-                }
+                None => Ok(no_installer(&release.version)),
             };
         }
 
@@ -4947,11 +5126,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
         #[cfg(target_os = "windows")]
         {
             let Some(arch_tag) = windows_arch_tag(std::env::consts::ARCH) else {
-                log::info!(
-                    "ℹ️  Auto-update on Windows has no artifact tag for this architecture ({})",
-                    std::env::consts::ARCH
-                );
-                return Ok(UpdateCheck::Nothing);
+                return Ok(no_installer(&release.version));
             };
             return match select_windows_installer_asset(&release.assets, arch_tag) {
                 Some(asset) => {
@@ -4966,10 +5141,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
                         sha256: asset.sha256.clone(),
                     }))
                 }
-                None => {
-                    log::warn!("⚠️  No Windows {} installer asset in the release", arch_tag);
-                    Ok(UpdateCheck::Nothing)
-                }
+                None => Ok(no_installer(&release.version)),
             };
         }
 
@@ -4979,11 +5151,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
         // arch would install an app the arch-mismatch gate then refuses to launch.
         #[cfg(target_os = "macos")]
         let Some((arch_tag, arch_label)) = host_arch_tags() else {
-            log::info!(
-                "ℹ️  Auto-update has no macOS artifact for this architecture ({})",
-                std::env::consts::ARCH
-            );
-            return Ok(UpdateCheck::Nothing);
+            return Ok(no_installer(&release.version));
         };
 
         #[cfg(target_os = "macos")]
@@ -5007,10 +5175,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
                 sha256: update_asset.sha256.clone(),
             }));
         } else {
-            log::warn!(
-                "⚠️  No {} .pkg or DMG asset found in release assets",
-                arch_tag
-            );
+            return Ok(no_installer(&release.version));
         }
     } else if release_semver < current_semver {
         log::info!(
@@ -5026,6 +5191,16 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
     }
 
     Ok(UpdateCheck::Nothing)
+}
+
+/// A newer release this device cannot install, so the device stays behind.
+fn no_installer(version: &str) -> UpdateCheck {
+    UpdateCheck::Skipped(format!(
+        "release {} has no installer for this system ({} {})",
+        version,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ))
 }
 
 #[allow(clippy::needless_return)] // the cfg-gated platform blocks need explicit returns
@@ -5810,29 +5985,61 @@ fn report_update_failure_once(msg: &str) {
     }
 }
 
+/// What one finished check means for the result the next check-in carries. An
+/// install leaves it to the install's own result. A check nobody answered is no
+/// attempt.
+fn note_update_check(
+    status: &UpdateStatus,
+    check: &Result<UpdateCheck, String>,
+    home: Option<&str>,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    match check {
+        Ok(UpdateCheck::Nothing) => status.record_no_update(at),
+        Ok(UpdateCheck::PackageManaged { available }) => status.record_skip(
+            &format!("the package manager installs {}", available),
+            home,
+            at,
+        ),
+        Ok(UpdateCheck::Skipped(reason)) => status.record_skip(reason, home, at),
+        Err(e) => status.record_failure(e, home, at),
+        Ok(UpdateCheck::Install(_) | UpdateCheck::Unreachable) => {}
+    }
+}
+
+/// Why this process must not run the updater, if it must not.
+#[cfg(target_os = "macos")]
+fn update_skip_reason() -> Option<String> {
+    // The install swaps /Applications/KlaayGuard.app. A build that runs from
+    // anywhere else would replace the installed app with a release.
+    let installed_bundle = std::path::Path::new("/Applications/KlaayGuard.app");
+    match std::env::current_exe() {
+        Ok(current_exe) => {
+            not_the_installed_app(&current_exe, installed_bundle, installed_bundle.exists())
+        }
+        Err(e) => Some(format!("no executable path: {}", e)),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn update_skip_reason() -> Option<String> {
+    None
+}
+
 /// One update check: if a newer build is offered, download + verify + install it
 /// (which restarts the app). No-op if already current.
 async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
-    // The install swaps /Applications/KlaayGuard.app. A build that runs from
-    // anywhere else would replace the installed app with a release.
-    #[cfg(target_os = "macos")]
-    {
-        let installed_bundle = std::path::Path::new("/Applications/KlaayGuard.app");
-        let current_exe = match std::env::current_exe() {
-            Ok(path) => path,
-            Err(e) => {
-                log::warn!("⏭️  Skipping the update check: no executable path: {}", e);
-                return;
-            }
-        };
-        if let Some(reason) =
-            not_the_installed_app(&current_exe, installed_bundle, installed_bundle.exists())
-        {
-            log::info!("⏭️  Skipping the update check: {}", reason);
-            return;
-        }
-    }
-    match check_for_updates_internal(api_base).await {
+    let check = match update_skip_reason() {
+        Some(reason) => Ok(UpdateCheck::Skipped(reason)),
+        None => check_for_updates_internal(api_base).await,
+    };
+    note_update_check(
+        &UPDATE_STATUS,
+        &check,
+        home_dir().as_deref(),
+        chrono::Utc::now(),
+    );
+    match check {
         Ok(UpdateCheck::Install(update)) => {
             log::info!("🔄 Update available, starting download and install process...");
             if let Err(e) = download_and_install_update_internal(
@@ -5845,6 +6052,7 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
             {
                 log::error!("💥 Auto-update failed: {}", e);
                 report_update_failure_once(&e);
+                UPDATE_STATUS.record_failure(&e, home_dir().as_deref(), chrono::Utc::now());
             }
         }
         Ok(UpdateCheck::Nothing) => log::info!("✅ No updates available - app is up to date"),
@@ -5857,8 +6065,18 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
             "📦 {} is available. This is a .deb/.rpm install: the package manager updates it, not the agent",
             available
         ),
+        Ok(UpdateCheck::Skipped(reason)) => {
+            log::info!("⏭️  Skipping the update check: {}", reason)
+        }
+        // The check function logs why.
+        Ok(UpdateCheck::Unreachable) => {}
         Err(e) => log::warn!("update check failed: {}", e),
     }
+}
+
+/// The home folder the update error hides.
+fn home_dir() -> Option<String> {
+    dirs::home_dir().map(|h| h.to_string_lossy().into_owned())
 }
 
 /// How often the update loop wakes to ask whether a check is due. Far shorter
@@ -5967,10 +6185,6 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
 /// one prefers the runtime `VITE_API_BASE_URL`, which the LaunchAgent plist
 /// injects, and any build can rewrite that plist. Two production agents reading
 /// two different injected values would take two different locks and both run.
-///
-/// `plist_api_base` calls this under `any(macos, test)`, so it is used on the
-/// Linux CI runner too and no dead-code warning fires there.
-#[cfg(any(target_os = "macos", test))]
 fn compiled_api_base_url() -> &'static str {
     option_env!("APP_DEFAULT_API_BASE_URL").unwrap_or("https://api.klaay.com")
 }
@@ -6326,6 +6540,18 @@ pub fn run() {
             }
             #[cfg(not(target_os = "linux"))]
             drop(tray_built);
+
+            // Before the first update check and check-in, say whether an update
+            // started this process.
+            match app.path().app_data_dir() {
+                Ok(dir) => note_start(
+                    &UPDATE_STATUS,
+                    &dir.join(last_run_file_name(compiled_api_base_url())),
+                    env!("CARGO_PKG_VERSION"),
+                    chrono::Utc::now(),
+                ),
+                Err(e) => log::warn!("update: no app data folder for the last run version: {}", e),
+            }
 
             // Check for updates on startup AND on a recurring interval, so an
             // always-on agent self-updates in place without waiting for a restart.
@@ -9496,6 +9722,312 @@ listener {
         assert_eq!(m["device_uuid"], "device-abc");
         assert_eq!(m["app_version"], env!("CARGO_PKG_VERSION"));
         assert!(!m["app_version"].as_str().unwrap().is_empty());
+    }
+
+    fn at(hour: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(2026, 11, 17, hour, 0, 0)
+            .unwrap()
+    }
+
+    // A check-in after a failed update must tell the backend what failed and when,
+    // so the fleet page can show why a Mac stays on an old build.
+    #[test]
+    fn checkin_meta_carries_the_last_update_error_and_its_time() {
+        let status = UpdateStatus::default();
+        status.record_failure(
+            "Failed to move old app aside: Permission denied (os error 13)",
+            None,
+            at(9),
+        );
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(
+            m["update_error"],
+            "Failed to move old app aside: Permission denied (os error 13)"
+        );
+        assert_eq!(m["update_error_at"], "2026-11-17T09:00:00+00:00");
+        assert_eq!(m["device_uuid"], "device-abc");
+    }
+
+    // Before the first check ends, the agent has no result to report.
+    #[test]
+    fn checkin_meta_has_no_update_result_before_a_check() {
+        let m = checkin_meta_with("device-abc", &UpdateStatus::default());
+        for key in [
+            "update_result",
+            "update_result_at",
+            "update_error",
+            "update_error_at",
+        ] {
+            assert!(m.get(key).is_none(), "{key}");
+        }
+    }
+
+    // The next good check replaces a failure, so a fixed Mac stops showing an error.
+    #[test]
+    fn a_good_update_check_clears_the_update_error() {
+        let status = UpdateStatus::default();
+        status.record_failure("boom", None, at(9));
+        status.record_no_update(at(15));
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_result"], "no_update");
+        assert_eq!(m["update_result_at"], "2026-11-17T15:00:00+00:00");
+        assert!(m.get("update_error").is_none());
+        assert!(m.get("update_error_at").is_none());
+    }
+
+    // A second failure replaces the first: the report names the latest one.
+    #[test]
+    fn the_latest_failure_replaces_the_earlier_one() {
+        let status = UpdateStatus::default();
+        status.record_failure("first", None, at(9));
+        status.record_failure("second", None, at(15));
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_error"], "second");
+        assert_eq!(m["update_error_at"], "2026-11-17T15:00:00+00:00");
+    }
+
+    // Kiln stores 500 characters and refuses more, so the agent cuts the text itself.
+    // The text holds two-byte characters to show the cut counts characters, not bytes.
+    #[test]
+    fn the_update_error_is_cut_to_500_characters() {
+        let status = UpdateStatus::default();
+        status.record_failure(&"é".repeat(600), None, at(9));
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_error"].as_str().unwrap().chars().count(), 500);
+    }
+
+    // The error text can hold a path in the user's home folder, which names the user.
+    #[test]
+    fn the_update_error_hides_the_home_folder() {
+        let status = UpdateStatus::default();
+        status.record_failure(
+            "Failed to read /Users/alex/Library/Logs/x: denied",
+            Some("/Users/alex"),
+            at(9),
+        );
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_error"], "Failed to read ~/Library/Logs/x: denied");
+    }
+
+    // A home folder of "/" or "" would rewrite every path in the text.
+    #[test]
+    fn a_root_or_empty_home_folder_changes_nothing() {
+        assert_eq!(redact_home("a /b/c", Some("/")), "a /b/c");
+        assert_eq!(redact_home("a /b/c", Some("")), "a /b/c");
+        assert_eq!(redact_home("a /b/c", None), "a /b/c");
+    }
+
+    fn noted(check: Result<UpdateCheck, String>, earlier: Option<&str>) -> serde_json::Value {
+        let status = UpdateStatus::default();
+        if let Some(text) = earlier {
+            status.record_failure(text, None, at(9));
+        }
+        note_update_check(&status, &check, Some("/Users/alex"), at(15));
+        checkin_meta_with("device-abc", &status)
+    }
+
+    // A Mac that runs the app outside /Applications never updates. Staff must see why.
+    #[test]
+    fn a_skipped_check_is_reported_with_its_reason() {
+        let m = noted(
+            Ok(UpdateCheck::Skipped(
+                "this build runs from \"/Users/alex/Downloads\", and the installed app is missing"
+                    .into(),
+            )),
+            None,
+        );
+        assert_eq!(
+            m["update_error"],
+            "update check skipped: this build runs from \"~/Downloads\", and the installed app is missing"
+        );
+        assert_eq!(m["update_error_at"], "2026-11-17T15:00:00+00:00");
+    }
+
+    #[test]
+    fn a_failed_check_is_reported() {
+        let m = noted(Err("Update check failed with status: 500".into()), None);
+        assert_eq!(m["update_error"], "Update check failed with status: 500");
+    }
+
+    // The package manager owns the update on a .deb or .rpm install. The agent
+    // skips it, and the earlier failure no longer holds the device back.
+    #[test]
+    fn a_package_managed_install_is_reported_as_skipped() {
+        let check = Ok(UpdateCheck::PackageManaged {
+            available: "0.1.75".into(),
+        });
+        let m = noted(check, Some("boom"));
+        assert_eq!(m["update_result"], "skipped");
+        assert_eq!(
+            m["update_error"],
+            "update check skipped: the package manager installs 0.1.75"
+        );
+    }
+
+    #[test]
+    fn a_check_that_finds_nothing_is_reported_as_no_update() {
+        let m = noted(Ok(UpdateCheck::Nothing), Some("boom"));
+        assert_eq!(m["update_result"], "no_update");
+        assert_eq!(m["update_result_at"], "2026-11-17T15:00:00+00:00");
+        assert!(m.get("update_error").is_none());
+    }
+
+    #[test]
+    fn a_failed_and_a_skipped_check_name_their_result() {
+        let failed = noted(Err("boom".into()), None);
+        assert_eq!(failed["update_result"], "failed");
+        assert_eq!(failed["update_result_at"], "2026-11-17T15:00:00+00:00");
+        let skipped = noted(Ok(UpdateCheck::Skipped("no path".into())), None);
+        assert_eq!(skipped["update_result"], "skipped");
+    }
+
+    // The first check after an update finds nothing, often before the first
+    // check-in. The check-in must still say that the update happened.
+    #[test]
+    fn a_check_that_finds_nothing_keeps_the_updated_result() {
+        let status = UpdateStatus::default();
+        status.record_updated(at(9));
+        note_update_check(&status, &Ok(UpdateCheck::Nothing), None, at(15));
+        let m = checkin_meta_with("device-abc", &status);
+        assert_eq!(m["update_result"], "updated");
+        assert_eq!(m["update_result_at"], "2026-11-17T09:00:00+00:00");
+    }
+
+    fn started(earlier: Option<&str>, current: &str) -> (serde_json::Value, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "kg-start-test-{}-{:?}-{}-{current}",
+            std::process::id(),
+            std::thread::current().id(),
+            earlier.unwrap_or("none")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("state").join("last-run-version");
+        if let Some(version) = earlier {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, version).unwrap();
+        }
+        let status = UpdateStatus::default();
+        note_start(&status, &file, current, at(9));
+        let stored = std::fs::read_to_string(&file).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        (checkin_meta_with("device-abc", &status), stored)
+    }
+
+    // An update restarts the agent, so only the next start can report it.
+    #[test]
+    fn a_start_on_a_newer_version_is_reported_as_updated() {
+        let (m, stored) = started(Some("0.1.74"), "0.1.75");
+        assert_eq!(m["update_result"], "updated");
+        assert_eq!(m["update_result_at"], "2026-11-17T09:00:00+00:00");
+        assert_eq!(stored, "0.1.75");
+    }
+
+    #[test]
+    fn each_api_target_keeps_its_own_last_run_version() {
+        let prod = last_run_file_name("https://api.klaay.com");
+        assert_eq!(prod, "last-run-version");
+        assert_eq!(prod, last_run_file_name("https://api.klaay.com/"));
+        assert_ne!(prod, last_run_file_name("http://localhost:3000"));
+    }
+
+    #[test]
+    fn a_start_with_no_newer_version_reports_nothing() {
+        for earlier in [None, Some("0.1.75"), Some("0.1.76"), Some("junk")] {
+            let (m, stored) = started(earlier, "0.1.75");
+            assert!(m.get("update_result").is_none(), "{earlier:?}");
+            assert_eq!(stored, "0.1.75");
+        }
+    }
+
+    fn config_headers(device: Option<&str>) -> reqwest::header::HeaderMap {
+        config_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:1",
+            "token",
+            device,
+        )
+        .build()
+        .unwrap()
+        .headers()
+        .clone()
+    }
+
+    // The config call names the platform and the device, so Kiln can store the
+    // version of an agent that sends no check-in.
+    #[test]
+    fn the_config_request_names_the_platform_and_the_device() {
+        let headers = config_headers(Some("device-abc"));
+        assert_eq!(headers["x-klaayguard-platform"], std::env::consts::OS);
+        assert_eq!(headers["x-klaayguard-device"], "device-abc");
+        assert_eq!(headers["authorization"], "Bearer token");
+    }
+
+    // A first run has no stored device id yet. An id that no header can carry
+    // must not stop the config call.
+    #[test]
+    fn the_config_request_leaves_out_a_device_it_cannot_name() {
+        for device in [None, Some(""), Some("line\nbreak")] {
+            let headers = config_headers(device);
+            assert!(headers.get("x-klaayguard-device").is_none(), "{device:?}");
+            assert!(headers.get("x-klaayguard-platform").is_some());
+        }
+    }
+
+    // A laptop that wakes with no network has not failed to update. The last
+    // answered check still holds.
+    #[test]
+    fn an_unanswered_check_changes_nothing() {
+        let m = noted(Ok(UpdateCheck::Unreachable), Some("boom"));
+        assert_eq!(m["update_error"], "boom");
+        let m = noted(Ok(UpdateCheck::Unreachable), None);
+        assert!(m.get("update_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_answer_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let check = check_for_updates_internal(&base).await;
+        assert!(matches!(check, Ok(UpdateCheck::Unreachable)));
+    }
+
+    /// The update check against a server that gives one canned answer.
+    async fn check_answered(status: &str, body: &'static str) -> Result<UpdateCheck, String> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 2048]).unwrap();
+            stream.write_all(reply.as_bytes()).unwrap();
+        });
+        let check = check_for_updates_internal(&base).await;
+        server.join().unwrap();
+        check
+    }
+
+    #[tokio::test]
+    async fn a_server_that_answers_with_an_error_fails_the_check() {
+        let check = check_answered("500 Internal Server Error", "").await;
+        assert!(matches!(check, Err(e) if e.contains("500")));
+    }
+
+    // The device stays behind, so staff must see why. A .deb or .rpm test binary
+    // on Linux counts as package-managed, which has its own answer.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn a_newer_release_with_no_installer_for_this_device_is_skipped() {
+        let check = check_answered("200 OK", r#"{"version":"v999.0.0","assets":[]}"#).await;
+        assert!(matches!(check, Ok(UpdateCheck::Skipped(r)) if r.contains("999.0.0")));
     }
 }
 
