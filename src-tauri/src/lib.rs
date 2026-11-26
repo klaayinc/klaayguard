@@ -6053,9 +6053,11 @@ fn spawn_update_loop(app: tauri::AppHandle, api_base: String) {
             if last.is_some_and(|prev| !update_check_due(forced, prev, now, period)) {
                 continue;
             }
-            last = Some(now);
             log::info!("🚀 Update check against {}", api_base);
             run_update_check(&api_base, &app).await;
+            // Stamped after the check, so a nudge that waited out a slow download
+            // does not download again at once.
+            last = Some(SystemTime::now());
         }
     });
 }
