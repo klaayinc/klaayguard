@@ -128,7 +128,7 @@ jobs:
         run: bash scripts/test-postinstall-stops-agent.sh
 
       # Proves the .pkg leaves the bundle replaceable by the admin who runs the
-      # agent. A root-only bundle made the self-update fail on the swap.
+      # agent. The self-update cannot swap a root-only bundle on macOS 15.
       - name: postinstall opens the bundle to the admin group
         working-directory: src-tauri
         run: bash scripts/test-postinstall-bundle-updatable.sh
@@ -152,6 +152,20 @@ jobs:
       # no workflow that reads or stamps a second copy.
       - name: single version source
         run: bash .github/scripts/test-single-version-source.sh
+
+  # Installs a real .pkg and moves the bundle as the self-update does. Pinned to
+  # macOS 15, which refuses that move for a root:wheel bundle. macOS 26 allows
+  # it, so `macos-latest` cannot show the failure.
+  pkg-install-macos:
+    name: pkg install stays updatable (macOS 15)
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install the .pkg and replace the bundle
+        working-directory: src-tauri
+        run: bash scripts/test-pkg-install-updatable.sh
 
   build:
     name: Build (${{ matrix.target }})

@@ -150,9 +150,9 @@ ensure_agent_running() {
 
 # Let the admin who runs the agent replace the bundle. The installer writes it
 # as root:wheel, and the agent swaps it by rename as that admin (lib.rs
-# `stage_verify_and_swap`); a bundle a .dmg copy made belongs to the user and
-# swaps, a root-only one did not. The admin group covers a Mac with no console
-# user, which an MDM install at the login window is, and a second admin.
+# `stage_verify_and_swap`). macOS 15 refuses that rename without write access to
+# the bundle itself. The admin group covers a Mac with no console user, which an
+# MDM install at the login window is.
 make_bundle_updatable() {
   local app="$1"
   local user="${2:-}"
