@@ -1,7 +1,7 @@
 # KlaayGuard Privacy Datasheet
 
 **Product:** KlaayGuard desktop agent
-**Version of this document:** 2026-11-09
+**Version of this document:** 2026-11-26
 **Audience:** Customer security and privacy reviewers (incl. BYOD deployments)
 
 ## 1. Overview
@@ -35,6 +35,8 @@ The agent runs only the queries the Klaay server instructs it to. The current pr
 | `screenlock_registry` (Windows only) | The raw `ScreenSaveActive`, `ScreenSaverIsSecure`, and `ScreenSaveTimeOut` values under `HKEY_CURRENT_USER\Control Panel\Desktop` | Raw evidence behind the `screenlock` verdict | Auto screen lock (CTRL-097) |
 | `auto_update` (macOS, Linux) | Whether the OS installs updates by itself. macOS: four keys only, `AutomaticCheckEnabled`, `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates` and `CriticalUpdateInstall`, from `com.apple.SoftwareUpdate` in `/Library/Preferences` and `/Library/Managed Preferences`. Linux: an enabled yes / no / unknown, the package manager that answered (apt or dnf), and a one-line reason, read from `apt-config`, `systemctl is-enabled`, `/etc/dnf/automatic.conf` and `/usr/share/dnf5/dnf5-plugins/automatic.conf` | Verify automatic updates are on | Security patches (CTRL-084) |
 | `preferences` (scoped) | Two specific macOS keys only: `askForPassword` and `askForPasswordDelay` under `com.apple.screensaver` | Verify screensaver password requirement | Auto screen lock (CTRL-097) |
+
+After an update fails or the agent skips an update check, each report also carries that event's time and a short error text. The text holds 500 characters at most, and the agent writes the user's home folder as `~`. It can name a folder the app runs from. The next good update check removes both.
 
 No password values, hashes, or password contents of any kind are collected. On Windows the `password_policy` row carries the local policy (lengths, ages, lockout counts), never a password.
 
