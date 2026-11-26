@@ -5546,9 +5546,9 @@ fn swap_staged_in(
     }
     match std::fs::rename(staged, target_app) {
         Ok(()) => {
-            // A bundle installed by the root-run .pkg is root-owned inside, so a
-            // user cannot delete it. The swap already worked; leave the hidden
-            // copy and say so.
+            // A user cannot delete a bundle that is root-owned inside, as an
+            // older .pkg left it. The swap already worked; leave the hidden copy
+            // and say so.
             if let Err(e) = std::fs::remove_dir_all(backup) {
                 log::warn!("⚠️  Could not remove the old app {:?}: {}", backup, e);
             }
