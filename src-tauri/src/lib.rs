@@ -6000,10 +6000,16 @@ fn check_due(last: SystemTime, now: SystemTime, period: Duration) -> bool {
     }
 }
 
-/// Whether the update loop runs a check now: a nudge from the config call forces
-/// one inside the period, and the period alone decides otherwise.
+/// Whether the update loop runs a check now. A nudge from the config call cuts
+/// the period to one poll: a check that just ran already saw the release, and a
+/// second one would download a failed update again.
 fn update_check_due(forced: bool, last: SystemTime, now: SystemTime, period: Duration) -> bool {
-    forced || check_due(last, now, period)
+    let period = if forced {
+        period.min(Duration::from_secs(UPDATE_POLL_SECONDS))
+    } else {
+        period
+    };
+    check_due(last, now, period)
 }
 
 /// Wakes the update loop when the config call names a newer release.
@@ -9928,11 +9934,21 @@ mod update_nudge_tests {
     #[test]
     fn a_nudged_check_is_due_inside_the_period() {
         let last = SystemTime::UNIX_EPOCH;
-        let now = last + Duration::from_secs(60);
+        let now = last + Duration::from_secs(10 * 60);
         let period = Duration::from_secs(6 * 60 * 60);
         assert!(!update_check_due(false, last, now, period));
         assert!(update_check_due(true, last, now, period));
         assert!(update_check_due(false, last, last + period, period));
+    }
+
+    // The first config call arrives during the startup check. A second check at
+    // once would download a failed update again.
+    #[test]
+    fn a_nudge_just_after_a_check_runs_none() {
+        let last = SystemTime::UNIX_EPOCH;
+        let period = Duration::from_secs(6 * 60 * 60);
+        let soon = last + Duration::from_secs(60);
+        assert!(!update_check_due(true, last, soon, period));
     }
 }
 
