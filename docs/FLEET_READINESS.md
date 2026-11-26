@@ -49,17 +49,20 @@ It could be a Mac, so it counts against readiness until it reports.
 
 ### Fix a root-owned bundle without a new .pkg
 
-A `.pkg` before this change installs the bundle as `root:wheel`. On macOS 15 the
-agent could not move it aside, and its log says "Failed to move old app aside:
-Permission denied". The `.pkg` now gives the bundle to the `admin` group and to
-the logged-in user. For an agent installed before that, one command from an
-admin account does the same. The agent then updates itself at its next 6-hour
-check:
+An older `.pkg` installs the bundle as `root:wheel`. On macOS 15 the agent
+cannot move that bundle aside, and its log says "Failed to move old app aside:
+Permission denied". A current `.pkg` gives the bundle to the `admin` group, and
+to the logged-in user when that user is an admin. For an older install, run two
+commands from an admin account. They give the bundle to the `admin` group only.
+An agent that runs as an admin then updates itself at its next 6-hour check:
 
 ```bash
-sudo chown -R "$(stat -f %Su /dev/console)":admin /Applications/KlaayGuard.app
+sudo chgrp -R admin /Applications/KlaayGuard.app
 sudo chmod -R g+w /Applications/KlaayGuard.app
 ```
+
+An agent that runs as a standard user cannot update itself. Only an admin can
+move anything in `/Applications`.
 
 ## Ready rule
 

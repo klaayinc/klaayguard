@@ -4,13 +4,12 @@
 #
 # The installer runs as root, so the bundle lands owned by root:wheel. The agent
 # runs as the logged-in user and swaps the bundle by rename (stage_verify_and_swap
-# in lib.rs). On the Macs that never updated, that rename failed with "Permission
-# denied". A bundle the .dmg put there belongs to the user and updates.
+# in lib.rs). macOS 15 refuses that rename with "Permission denied" for a bundle
+# the user cannot write. test-pkg-install-updatable.sh proves it on a real
+# install.
 #
 # The script drives `make_bundle_updatable` against a fake bundle in a temp
 # directory. It never touches /Applications and never runs the install.
-#
-# RED (before the function exists): the guard below reports it and exits 1.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
@@ -96,7 +95,7 @@ fi
 
 echo "==> main must call it before the console-user early exit, so an MDM install with no user still gets the group"
 call_line=$(grep -n '^[[:space:]]*make_bundle_updatable ' "$POSTINSTALL" | head -1 | cut -d: -f1)
-exit_line=$(grep -n 'no console user' "$POSTINSTALL" | head -1 | cut -d: -f1)
+exit_line=$(grep -n 'log "postinstall: no console user' "$POSTINSTALL" | head -1 | cut -d: -f1)
 [ -n "$call_line" ] || { echo "FAIL: main never calls make_bundle_updatable"; exit 1; }
 [ "$call_line" -lt "$exit_line" ] || { echo "FAIL: the call (line $call_line) comes after the no-console-user exit (line $exit_line)"; exit 1; }
 
