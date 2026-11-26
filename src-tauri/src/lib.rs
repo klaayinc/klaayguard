@@ -2820,8 +2820,8 @@ struct JsonApiPayload {
 /// characters and drops a longer report whole.
 const UPDATE_ERROR_MAX_CHARS: usize = 500;
 
-/// The text and time of the agent's last failed update. The next good update
-/// check clears it, so a device that recovered stops reporting an error.
+/// The text and time of the agent's last failed or skipped update. The next
+/// good update check clears it, so a device that recovered stops reporting an error.
 #[derive(Default)]
 struct UpdateStatus {
     last_failure: std::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>,
@@ -4257,6 +4257,11 @@ enum UpdateCheck {
     /// caller's match arm stays on every platform, so allow it unbuilt there.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PackageManaged { available: String },
+    /// The agent did not check, for the reason it holds. Only macOS skips.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Skipped(String),
+    /// The update server gave no answer, so the check found nothing out.
+    Unreachable,
 }
 
 /// Pick the AppImage asset for this architecture. `original_name` is the
@@ -4902,11 +4907,14 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
     let response = client
         .get(format!("{}/klaayguard/updates/latest", api_base))
         .send()
-        .await
-        .map_err(|e| {
-            log::error!("❌ Failed to check for updates: {}", e);
-            format!("Failed to check for updates: {}", e)
-        })?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            log::warn!("❌ Failed to check for updates: {}", e);
+            return Ok(UpdateCheck::Unreachable);
+        }
+    };
 
     log::info!("📡 API response status: {}", response.status());
 
@@ -5877,29 +5885,58 @@ fn report_update_failure_once(msg: &str) {
     }
 }
 
+/// What one finished check means for the status the next check-in carries. A
+/// check that found nothing to install clears it. An install leaves it to the
+/// install's own result.
+fn note_update_check(
+    status: &UpdateStatus,
+    check: &Result<UpdateCheck, String>,
+    home: Option<&str>,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    match check {
+        Ok(UpdateCheck::Nothing | UpdateCheck::PackageManaged { .. }) => status.clear(),
+        Ok(UpdateCheck::Skipped(reason)) => {
+            status.record_failure(&format!("update check skipped: {}", reason), home, at)
+        }
+        Err(e) => status.record_failure(e, home, at),
+        Ok(UpdateCheck::Install(_) | UpdateCheck::Unreachable) => {}
+    }
+}
+
+/// Why this process must not run the updater, if it must not.
+#[cfg(target_os = "macos")]
+fn update_skip_reason() -> Option<String> {
+    // The install swaps /Applications/KlaayGuard.app. A build that runs from
+    // anywhere else would replace the installed app with a release.
+    let installed_bundle = std::path::Path::new("/Applications/KlaayGuard.app");
+    match std::env::current_exe() {
+        Ok(current_exe) => {
+            not_the_installed_app(&current_exe, installed_bundle, installed_bundle.exists())
+        }
+        Err(e) => Some(format!("no executable path: {}", e)),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn update_skip_reason() -> Option<String> {
+    None
+}
+
 /// One update check: if a newer build is offered, download + verify + install it
 /// (which restarts the app). No-op if already current.
 async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
-    // The install swaps /Applications/KlaayGuard.app. A build that runs from
-    // anywhere else would replace the installed app with a release.
-    #[cfg(target_os = "macos")]
-    {
-        let installed_bundle = std::path::Path::new("/Applications/KlaayGuard.app");
-        let current_exe = match std::env::current_exe() {
-            Ok(path) => path,
-            Err(e) => {
-                log::warn!("⏭️  Skipping the update check: no executable path: {}", e);
-                return;
-            }
-        };
-        if let Some(reason) =
-            not_the_installed_app(&current_exe, installed_bundle, installed_bundle.exists())
-        {
-            log::info!("⏭️  Skipping the update check: {}", reason);
-            return;
-        }
-    }
-    match check_for_updates_internal(api_base).await {
+    let check = match update_skip_reason() {
+        Some(reason) => Ok(UpdateCheck::Skipped(reason)),
+        None => check_for_updates_internal(api_base).await,
+    };
+    note_update_check(
+        &UPDATE_STATUS,
+        &check,
+        home_dir().as_deref(),
+        chrono::Utc::now(),
+    );
+    match check {
         Ok(UpdateCheck::Install(update)) => {
             log::info!("🔄 Update available, starting download and install process...");
             if let Err(e) = download_and_install_update_internal(
@@ -5912,13 +5949,10 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
             {
                 log::error!("💥 Auto-update failed: {}", e);
                 report_update_failure_once(&e);
-                record_update_failure(&e);
+                UPDATE_STATUS.record_failure(&e, home_dir().as_deref(), chrono::Utc::now());
             }
         }
-        Ok(UpdateCheck::Nothing) => {
-            log::info!("✅ No updates available - app is up to date");
-            UPDATE_STATUS.clear();
-        }
+        Ok(UpdateCheck::Nothing) => log::info!("✅ No updates available - app is up to date"),
         // Before PROD-7007 a package install logged "not an AppImage" and then
         // "up to date", so one 15 releases behind read as current in its own
         // log. Name the waiting version, and only what is true on every package
@@ -5928,17 +5962,18 @@ async fn run_update_check(api_base: &str, app: &tauri::AppHandle) {
             "📦 {} is available. This is a .deb/.rpm install: the package manager updates it, not the agent",
             available
         ),
-        Err(e) => {
-            log::warn!("update check failed: {}", e);
-            record_update_failure(&e);
+        Ok(UpdateCheck::Skipped(reason)) => {
+            log::info!("⏭️  Skipping the update check: {}", reason)
         }
+        // The check function logs why.
+        Ok(UpdateCheck::Unreachable) => {}
+        Err(e) => log::warn!("update check failed: {}", e),
     }
 }
 
-/// Keep a failed update for the next check-in, with the home folder hidden.
-fn record_update_failure(text: &str) {
-    let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
-    UPDATE_STATUS.record_failure(text, home.as_deref(), chrono::Utc::now());
+/// The home folder the update error hides.
+fn home_dir() -> Option<String> {
+    dirs::home_dir().map(|h| h.to_string_lossy().into_owned())
 }
 
 /// How often the update loop wakes to ask whether a check is due. Far shorter
@@ -9705,6 +9740,91 @@ listener {
         assert_eq!(redact_home("a /b/c", Some("/")), "a /b/c");
         assert_eq!(redact_home("a /b/c", Some("")), "a /b/c");
         assert_eq!(redact_home("a /b/c", None), "a /b/c");
+    }
+
+    fn noted(check: Result<UpdateCheck, String>, earlier: Option<&str>) -> serde_json::Value {
+        let status = UpdateStatus::default();
+        if let Some(text) = earlier {
+            status.record_failure(text, None, at(9));
+        }
+        note_update_check(&status, &check, Some("/Users/alex"), at(15));
+        checkin_meta_with("device-abc", &status)
+    }
+
+    // A Mac that runs the app outside /Applications never updates. Staff must see why.
+    #[test]
+    fn a_skipped_check_is_reported_with_its_reason() {
+        let m = noted(
+            Ok(UpdateCheck::Skipped(
+                "this build runs from \"/Users/alex/Downloads\", and the installed app is missing"
+                    .into(),
+            )),
+            None,
+        );
+        assert_eq!(
+            m["update_error"],
+            "update check skipped: this build runs from \"~/Downloads\", and the installed app is missing"
+        );
+        assert_eq!(m["update_error_at"], "2026-11-17T15:00:00+00:00");
+    }
+
+    #[test]
+    fn a_failed_check_is_reported() {
+        let m = noted(Err("Update check failed with status: 500".into()), None);
+        assert_eq!(m["update_error"], "Update check failed with status: 500");
+    }
+
+    // The package manager owns the update on a .deb or .rpm install, so no
+    // earlier agent failure still holds the device back.
+    #[test]
+    fn a_package_managed_install_clears_the_update_error() {
+        let check = Ok(UpdateCheck::PackageManaged {
+            available: "0.1.75".into(),
+        });
+        let m = noted(check, Some("boom"));
+        assert!(m.get("update_error").is_none());
+    }
+
+    #[test]
+    fn a_check_that_finds_nothing_clears_the_update_error() {
+        let m = noted(Ok(UpdateCheck::Nothing), Some("boom"));
+        assert!(m.get("update_error").is_none());
+    }
+
+    // A laptop that wakes with no network has not failed to update. The last
+    // answered check still holds.
+    #[test]
+    fn an_unanswered_check_changes_nothing() {
+        let m = noted(Ok(UpdateCheck::Unreachable), Some("boom"));
+        assert_eq!(m["update_error"], "boom");
+        let m = noted(Ok(UpdateCheck::Unreachable), None);
+        assert!(m.get("update_error").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_does_not_answer_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let check = check_for_updates_internal(&base).await;
+        assert!(matches!(check, Ok(UpdateCheck::Unreachable)));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_answers_with_an_error_fails_the_check() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = stream.read(&mut [0; 2048]).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let check = check_for_updates_internal(&base).await;
+        server.join().unwrap();
+        assert!(matches!(check, Err(e) if e.contains("500")));
     }
 }
 
