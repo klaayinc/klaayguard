@@ -4257,8 +4257,7 @@ enum UpdateCheck {
     /// caller's match arm stays on every platform, so allow it unbuilt there.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PackageManaged { available: String },
-    /// The agent did not check, for the reason it holds. Only macOS skips.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// The agent will not or cannot install, for the reason it holds.
     Skipped(String),
     /// The update server gave no answer, so the check found nothing out.
     Unreachable,
@@ -5007,13 +5006,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
                         sha256: asset.sha256.clone(),
                     }))
                 }
-                None => {
-                    log::warn!(
-                        "⚠️  No Linux {} AppImage asset in the release",
-                        std::env::consts::ARCH
-                    );
-                    Ok(UpdateCheck::Nothing)
-                }
+                None => Ok(no_installer(&release.version)),
             };
         }
 
@@ -5022,11 +5015,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
         #[cfg(target_os = "windows")]
         {
             let Some(arch_tag) = windows_arch_tag(std::env::consts::ARCH) else {
-                log::info!(
-                    "ℹ️  Auto-update on Windows has no artifact tag for this architecture ({})",
-                    std::env::consts::ARCH
-                );
-                return Ok(UpdateCheck::Nothing);
+                return Ok(no_installer(&release.version));
             };
             return match select_windows_installer_asset(&release.assets, arch_tag) {
                 Some(asset) => {
@@ -5041,10 +5030,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
                         sha256: asset.sha256.clone(),
                     }))
                 }
-                None => {
-                    log::warn!("⚠️  No Windows {} installer asset in the release", arch_tag);
-                    Ok(UpdateCheck::Nothing)
-                }
+                None => Ok(no_installer(&release.version)),
             };
         }
 
@@ -5054,11 +5040,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
         // arch would install an app the arch-mismatch gate then refuses to launch.
         #[cfg(target_os = "macos")]
         let Some((arch_tag, arch_label)) = host_arch_tags() else {
-            log::info!(
-                "ℹ️  Auto-update has no macOS artifact for this architecture ({})",
-                std::env::consts::ARCH
-            );
-            return Ok(UpdateCheck::Nothing);
+            return Ok(no_installer(&release.version));
         };
 
         #[cfg(target_os = "macos")]
@@ -5082,10 +5064,7 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
                 sha256: update_asset.sha256.clone(),
             }));
         } else {
-            log::warn!(
-                "⚠️  No {} .pkg or DMG asset found in release assets",
-                arch_tag
-            );
+            return Ok(no_installer(&release.version));
         }
     } else if release_semver < current_semver {
         log::info!(
@@ -5101,6 +5080,16 @@ async fn check_for_updates_internal(api_base: &str) -> Result<UpdateCheck, Strin
     }
 
     Ok(UpdateCheck::Nothing)
+}
+
+/// A newer release this device cannot install, so the device stays behind.
+fn no_installer(version: &str) -> UpdateCheck {
+    UpdateCheck::Skipped(format!(
+        "release {} has no installer for this system ({} {})",
+        version,
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ))
 }
 
 #[allow(clippy::needless_return)] // the cfg-gated platform blocks need explicit returns
@@ -9816,21 +9805,40 @@ listener {
         assert!(matches!(check, Ok(UpdateCheck::Unreachable)));
     }
 
-    #[tokio::test]
-    async fn a_server_that_answers_with_an_error_fails_the_check() {
+    /// The update check against a server that gives one canned answer.
+    async fn check_answered(status: &str, body: &'static str) -> Result<UpdateCheck, String> {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let reply = format!(
+            "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            status,
+            body.len(),
+            body
+        );
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let _ = stream.read(&mut [0; 2048]).unwrap();
-            stream
-                .write_all(b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                .unwrap();
+            stream.write_all(reply.as_bytes()).unwrap();
         });
         let check = check_for_updates_internal(&base).await;
         server.join().unwrap();
+        check
+    }
+
+    #[tokio::test]
+    async fn a_server_that_answers_with_an_error_fails_the_check() {
+        let check = check_answered("500 Internal Server Error", "").await;
         assert!(matches!(check, Err(e) if e.contains("500")));
+    }
+
+    // The device stays behind, so staff must see why. A .deb or .rpm test binary
+    // on Linux counts as package-managed, which has its own answer.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn a_newer_release_with_no_installer_for_this_device_is_skipped() {
+        let check = check_answered("200 OK", r#"{"version":"v999.0.0","assets":[]}"#).await;
+        assert!(matches!(check, Ok(UpdateCheck::Skipped(r)) if r.contains("999.0.0")));
     }
 }
 
