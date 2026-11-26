@@ -5495,9 +5495,7 @@ fn stage_verify_and_swap(
         .unwrap_or_else(|| "KlaayGuard.app".to_string());
     let backup = target_app.with_file_name(format!(".{}.old-{}", base, pid));
 
-    // Clear leftovers from any earlier crashed update.
-    let _ = std::fs::remove_dir_all(&staged);
-    let _ = std::fs::remove_dir_all(&backup);
+    sweep_stale_update_copies(target_app, pid);
 
     // 1) Copy the new bundle next to the target. `ditto` is Apple's tool for
     //    copying an `.app`: it preserves symlinks, extended attributes, and the
@@ -5523,19 +5521,35 @@ fn stage_verify_and_swap(
         return Err(format!("Refusing unverified update: {}", e));
     }
 
-    // 3) Swap with renames on one filesystem. Move the old app aside, move the
-    //    new one in, then delete the old. If the second rename fails, roll the
-    //    old app back so the agent keeps a working install.
+    swap_staged_in(&staged, target_app, &backup)
+}
+
+/// Swap with renames on one filesystem. Move the old app aside, move the new
+/// one in, then delete the old. If the second rename fails, roll the old app
+/// back so the agent keeps a working install. Every exit removes the staged
+/// copy.
+#[cfg(target_os = "macos")]
+fn swap_staged_in(
+    staged: &std::path::Path,
+    target_app: &std::path::Path,
+    backup: &std::path::Path,
+) -> Result<(), String> {
+    let _staged = StagedCopy(staged);
     if target_app.exists() {
-        std::fs::rename(target_app, &backup)
-            .map_err(|e| format!("Failed to move old app aside: {}", e))?;
+        std::fs::rename(target_app, backup).map_err(|e| {
+            format!(
+                "Failed to move old app aside: {} ({})",
+                e,
+                rename_failure_detail(target_app)
+            )
+        })?;
     }
-    match std::fs::rename(&staged, target_app) {
+    match std::fs::rename(staged, target_app) {
         Ok(()) => {
-            // A bundle installed by the root-run .pkg is root-owned inside, so a
-            // user cannot delete it. The swap already worked; leave the hidden
-            // copy and say so.
-            if let Err(e) = std::fs::remove_dir_all(&backup) {
+            // A user cannot delete a bundle that is root-owned inside, as an
+            // older .pkg left it. The swap already worked; leave the hidden copy
+            // and say so.
+            if let Err(e) = std::fs::remove_dir_all(backup) {
                 log::warn!("⚠️  Could not remove the old app {:?}: {}", backup, e);
             }
             log::info!("✅ New app swapped into place");
@@ -5543,11 +5557,88 @@ fn stage_verify_and_swap(
         }
         Err(e) => {
             if backup.exists() {
-                let _ = std::fs::rename(&backup, target_app);
+                let _ = std::fs::rename(backup, target_app);
             }
-            let _ = std::fs::remove_dir_all(&staged);
             Err(format!("Failed to swap new app into place: {}", e))
         }
+    }
+}
+
+/// Removes the staged copy when it goes out of scope, so no exit path leaves it
+/// behind. After a good swap the path is gone and the removal does nothing.
+#[cfg(target_os = "macos")]
+struct StagedCopy<'a>(&'a std::path::Path);
+
+#[cfg(target_os = "macos")]
+impl Drop for StagedCopy<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_alive(pid: u32) -> bool {
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    !matches!(kill(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
+}
+
+/// Remove the staged and moved-aside copies an earlier update left beside the
+/// target. A process that died mid-update, or a failed rename, leaves a copy
+/// named for its own pid, which a later process never clears by its own pid.
+/// A copy of a live process stays: that process may still use it. A moved-aside
+/// copy stays while the target is missing, because it may be the only app left.
+#[cfg(target_os = "macos")]
+fn sweep_stale_update_copies(target: &std::path::Path, own_pid: u32) {
+    let Some(dir) = target.parent() else { return };
+    let Some(base) = target.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let staged_prefix = format!(".{}.update-", base);
+    let backup_prefix = format!(".{}.old-", base);
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let (pid, is_backup) = match (
+            name.strip_prefix(&staged_prefix),
+            name.strip_prefix(&backup_prefix),
+        ) {
+            (Some(pid), _) => (pid, false),
+            (_, Some(pid)) => (pid, true),
+            _ => continue,
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if (pid != own_pid && process_alive(pid)) || (is_backup && !target.exists()) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// What a person needs to read when the old app cannot move aside: who owns the
+/// bundle, its mode, who runs the agent, and the macOS version.
+#[cfg(target_os = "macos")]
+fn rename_failure_detail(target_app: &std::path::Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    let running = nix::unistd::getuid().as_raw();
+    let os = std::process::Command::new("/usr/bin/sw_vers")
+        .arg("-productVersion")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    match std::fs::metadata(target_app) {
+        Ok(m) => format!(
+            "bundle owner uid {} gid {} mode {:o}, running as uid {}, macOS {}",
+            m.uid(),
+            m.gid(),
+            m.mode() & 0o7777,
+            running,
+            os
+        ),
+        Err(e) => format!(
+            "bundle unreadable: {}, running as uid {}, macOS {}",
+            e, running, os
+        ),
     }
 }
 
@@ -9637,6 +9728,143 @@ mod pkg_update_tests {
             &pkg,
         );
         assert!(expand_pkg_app(&pkg, &dir.join("expanded")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod swap_cleanup_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kg-swap-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn bundle(path: &std::path::Path, marker: &str) {
+        std::fs::create_dir_all(path.join("Contents")).unwrap();
+        std::fs::write(path.join("Contents/marker"), marker).unwrap();
+    }
+
+    /// A pid that belonged to a process which has already exited.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn a_failed_move_aside_leaves_no_staged_copy_and_keeps_the_old_app() {
+        let dir = scratch("fail");
+        let target = dir.join("KlaayGuard.app");
+        let staged = dir.join(".KlaayGuard.app.update-1");
+        let backup = dir.join(".KlaayGuard.app.old-1");
+        bundle(&target, "old");
+        bundle(&staged, "new");
+        // A non-empty directory at the backup path makes the first rename fail.
+        bundle(&backup, "in the way");
+
+        let err = swap_staged_in(&staged, &target, &backup).unwrap_err();
+
+        assert!(
+            err.starts_with("Failed to move old app aside"),
+            "got: {err}"
+        );
+        assert!(!staged.exists(), "the staged copy was left behind");
+        assert_eq!(
+            std::fs::read_to_string(target.join("Contents/marker")).unwrap(),
+            "old"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_good_swap_puts_the_new_app_in_place_and_drops_the_old_copy() {
+        let dir = scratch("ok");
+        let target = dir.join("KlaayGuard.app");
+        let staged = dir.join(".KlaayGuard.app.update-1");
+        let backup = dir.join(".KlaayGuard.app.old-1");
+        bundle(&target, "old");
+        bundle(&staged, "new");
+
+        swap_staged_in(&staged, &target, &backup).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(target.join("Contents/marker")).unwrap(),
+            "new"
+        );
+        assert!(!staged.exists());
+        assert!(!backup.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_removes_copies_of_dead_processes_and_spares_live_ones() {
+        let dir = scratch("sweep");
+        let target = dir.join("KlaayGuard.app");
+        bundle(&target, "old");
+        let dead = dead_pid();
+        let live = std::os::unix::process::parent_id();
+        let own = std::process::id();
+        for name in [
+            format!(".KlaayGuard.app.update-{dead}"),
+            format!(".KlaayGuard.app.old-{dead}"),
+            format!(".KlaayGuard.app.update-{own}"),
+            format!(".KlaayGuard.app.update-{live}"),
+            ".Other.app.update-1".to_string(),
+            ".KlaayGuard.app.update-notapid".to_string(),
+        ] {
+            bundle(&dir.join(name), "x");
+        }
+
+        sweep_stale_update_copies(&target, own);
+
+        assert!(!dir.join(format!(".KlaayGuard.app.update-{dead}")).exists());
+        assert!(!dir.join(format!(".KlaayGuard.app.old-{dead}")).exists());
+        assert!(!dir.join(format!(".KlaayGuard.app.update-{own}")).exists());
+        assert!(dir.join(format!(".KlaayGuard.app.update-{live}")).exists());
+        assert!(dir.join(".Other.app.update-1").exists());
+        assert!(dir.join(".KlaayGuard.app.update-notapid").exists());
+        assert!(target.join("Contents/marker").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_keeps_a_moved_aside_copy_when_the_app_is_missing() {
+        let dir = scratch("missing");
+        let target = dir.join("KlaayGuard.app");
+        let backup = dir.join(format!(".KlaayGuard.app.old-{}", dead_pid()));
+        bundle(&backup, "the only copy");
+
+        sweep_stale_update_copies(&target, std::process::id());
+
+        assert!(backup.join("Contents/marker").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_failure_detail_names_the_owner_and_mode_of_the_bundle() {
+        let dir = scratch("detail");
+        let target = dir.join("KlaayGuard.app");
+        bundle(&target, "old");
+        std::fs::set_permissions(&target, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let detail = rename_failure_detail(&target);
+
+        let uid = nix::unistd::getuid().as_raw();
+        assert!(
+            detail.contains(&format!("bundle owner uid {uid}")),
+            "got: {detail}"
+        );
+        assert!(detail.contains("mode 755"), "got: {detail}");
+        assert!(
+            detail.contains(&format!("running as uid {uid}")),
+            "got: {detail}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
