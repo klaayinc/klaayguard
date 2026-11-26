@@ -148,6 +148,27 @@ ensure_agent_running() {
   return 1
 }
 
+# Let the admin who runs the agent replace the bundle. The installer writes it
+# as root:wheel, and the agent swaps it by rename as that admin (lib.rs
+# `stage_verify_and_swap`). macOS 15 refuses that rename without write access to
+# the bundle itself. The admin group covers a Mac with no console user, which an
+# MDM install at the login window is.
+make_bundle_updatable() {
+  local app="$1"
+  local user="${2:-}"
+
+  [ -d "$app" ] || return 1
+  /usr/bin/chgrp -hR admin "$app" || return 1
+  /bin/chmod -R g+w "$app" || return 1
+  # Only an admin gets the bundle. A standard user cannot rename anything in
+  # /Applications (root:admin 775), so ownership would not let them update. It
+  # would only let them write the agent's files.
+  if [ -n "$user" ] && [ "$user" != "root" ] && [ "$user" != "loginwindow" ] \
+    && /usr/sbin/dseditgroup -o checkmember -m "$user" admin >/dev/null 2>&1; then
+    /usr/sbin/chown -hR "$user" "$app" || return 1
+  fi
+}
+
 main() {
   if [ ! -x "$BIN" ]; then
     log "postinstall: ERROR no KlaayGuard binary at $BIN; the install left no app and no agent"
@@ -156,6 +177,11 @@ main() {
 
   # The human at the GUI, not the installer's root context.
   CONSOLE_USER=$(/usr/bin/stat -f "%Su" /dev/console 2>/dev/null || true)
+  # A failure here must not fail the install: the agent still runs, and only its
+  # self-update is at risk.
+  make_bundle_updatable "$APP" "$CONSOLE_USER" \
+    || log "postinstall: could not open the bundle to the admin group; the agent cannot update itself"
+
   if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ] || [ "$CONSOLE_USER" = "loginwindow" ]; then
     # No GUI user (e.g. an MDM install at the login window). The plist's RunAtLoad
     # and the app's first-launch self-install both cover this case.
