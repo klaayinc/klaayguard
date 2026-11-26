@@ -36,8 +36,8 @@ AGENT_WAIT_SECONDS="${AGENT_WAIT_SECONDS:-10}"
 # so the kill lands on the wrapper and the old binary keeps running. The
 # wrapper's replacement then finds that live instance and reactivates it instead
 # of launching the new bundle: the Mac reports posture from the old build until
-# the user logs out. The .dmg self-update path does not need this — there the
-# app exits itself (`update_relaunch` in lib.rs).
+# the user logs out. Self-update does not need this — there the app exits
+# itself (`relaunch_after_update` in lib.rs).
 #
 # The pattern anchors on the installed executable's path, never the process
 # name. A developer build runs from another path with its own single-instance

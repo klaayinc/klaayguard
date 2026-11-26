@@ -107,7 +107,7 @@ Klaay distributes installers from the
 You can also build the agent from source. See the [README](../README.md).
 The macOS installers are signed and notarized. The Linux packages and the
 Windows installer are not signed yet.
-macOS installs use a `.pkg` or `.dmg` file. Linux installs use a `.deb`
+macOS installs use a `.pkg` file. Linux installs use a `.deb`
 (Ubuntu, Debian), an `.rpm` (Fedora, RHEL), or an `.AppImage` (any
 distribution). Windows installs use an `.exe` installer, x64 only.
 

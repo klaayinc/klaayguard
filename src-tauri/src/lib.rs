@@ -7364,6 +7364,16 @@ mod update_selection_tests {
     }
 
     #[test]
+    fn a_release_with_only_the_pkg_still_updates_every_mac() {
+        let mut assets = manifest_with_universal_pkg();
+        assets.retain(|a| !a.original_name.as_deref().unwrap().ends_with(".dmg"));
+        for (tag, label) in [("macOS_arm64", "Apple silicon"), ("macOS_x64", "Intel")] {
+            let sel = select_macos_asset(&assets, tag, label).unwrap();
+            assert_eq!(sel.id, 5, "{tag} must pick the universal .pkg");
+        }
+    }
+
+    #[test]
     fn falls_back_to_the_dmg_when_the_release_has_no_pkg() {
         let assets = manifest();
         assert_eq!(
