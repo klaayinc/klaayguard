@@ -6243,10 +6243,6 @@ fn startup_blocking_work(app: tauri::AppHandle, state: Arc<AppState>) {
 /// one prefers the runtime `VITE_API_BASE_URL`, which the LaunchAgent plist
 /// injects, and any build can rewrite that plist. Two production agents reading
 /// two different injected values would take two different locks and both run.
-///
-/// `plist_api_base` calls this under `any(macos, test)`, so it is used on the
-/// Linux CI runner too and no dead-code warning fires there.
-#[cfg(any(target_os = "macos", test))]
 fn compiled_api_base_url() -> &'static str {
     option_env!("APP_DEFAULT_API_BASE_URL").unwrap_or("https://api.klaay.com")
 }
