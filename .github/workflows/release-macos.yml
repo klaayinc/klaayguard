@@ -33,7 +33,7 @@ jobs:
             frontend_url: "https://app.klaay.com"
           - arch: universal
             target: universal-apple-darwin
-            dmg_dir: src-tauri/target/universal-apple-darwin
+            bundle_dir: src-tauri/target/universal-apple-darwin
             artifact_suffix: macOS_universal
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -148,9 +148,9 @@ jobs:
             exit 1
           fi
 
-          APP_PATH=$(find ${{ matrix.dmg_dir }} -path "*/bundle/macos/KlaayGuard.app" -type d | head -n1 || true)
+          APP_PATH=$(find ${{ matrix.bundle_dir }} -path "*/bundle/macos/KlaayGuard.app" -type d | head -n1 || true)
           if [ -z "${APP_PATH:-}" ]; then
-            echo "::error::Built KlaayGuard.app not found under ${{ matrix.dmg_dir }}; cannot build .pkg"
+            echo "::error::Built KlaayGuard.app not found under ${{ matrix.bundle_dir }}; cannot build .pkg"
             exit 1
           fi
 

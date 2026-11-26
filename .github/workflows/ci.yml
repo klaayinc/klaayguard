@@ -141,6 +141,11 @@ jobs:
         working-directory: src-tauri
         run: bash scripts/test-pkg-structure.sh
 
+      # Proves a macOS release uploads only the .pkg, and fails when it cannot
+      # build that file.
+      - name: macOS ships only the .pkg
+        run: bash .github/scripts/test-macos-ships-only-pkg.sh
+
       # Proves the release tag is the only source of the version: no VERSION
       # file, no version in tauri.conf.json, a placeholder in Cargo.toml, and
       # no workflow that reads or stamps a second copy.
